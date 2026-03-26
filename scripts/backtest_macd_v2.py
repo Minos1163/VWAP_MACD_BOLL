@@ -399,6 +399,8 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
     filter_cfg = v2_cfg.get("entry_filters", {}) if isinstance(v2_cfg.get("entry_filters"), dict) else {}
     penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
     default_signal_threshold = float(thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score", 0.850)))
+    backtest_cfg = ff_cfg.get("backtest", {}) if isinstance(ff_cfg.get("backtest"), dict) else {}
+    disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
 
     return MACDStrategyV2Config(
         macd_1h_fast=int(macd_cfg.get("macd_1h_fast", 12)),
@@ -440,9 +442,15 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         flip_bullish_min_vwap_score=float(filter_cfg.get("flip_bullish_min_vwap_score", 0.12)),
         flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
         flip_bullish_require_15m_growing=bool(filter_cfg.get("flip_bullish_require_15m_growing", True)),
-        enable_flip_bullish_cvd_context_filter=bool(filter_cfg.get("enable_flip_bullish_cvd_context_filter", False)),
-        flip_bullish_max_cvd_upper_wick_ratio=float(filter_cfg.get("flip_bullish_max_cvd_upper_wick_ratio", 0.0)),
-        flip_bullish_min_cvd_1h_delta_ratio=float(filter_cfg.get("flip_bullish_min_cvd_1h_delta_ratio", 0.0)),
+        enable_flip_bullish_cvd_context_filter=(
+            False if disable_cvd_decision_logic else bool(filter_cfg.get("enable_flip_bullish_cvd_context_filter", False))
+        ),
+        flip_bullish_max_cvd_upper_wick_ratio=(
+            0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_max_cvd_upper_wick_ratio", 0.0))
+        ),
+        flip_bullish_min_cvd_1h_delta_ratio=(
+            0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_min_cvd_1h_delta_ratio", 0.0))
+        ),
         flip_bearish_min_ema_multiplier=float(filter_cfg.get("flip_bearish_min_boll_multiplier", filter_cfg.get("flip_bearish_min_ema_multiplier", 0.0))),
         flip_bearish_normal_ema_min_signal_score=float(filter_cfg.get("flip_bearish_normal_boll_min_signal_score", filter_cfg.get("flip_bearish_normal_ema_min_signal_score", 0.0))),
         flip_bearish_normal_ema_max_leverage=int(float(filter_cfg.get("flip_bearish_normal_boll_max_leverage", filter_cfg.get("flip_bearish_normal_ema_max_leverage", 0.0)))),
@@ -503,7 +511,7 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         symbol_risk_watchlist_session_scale_multiplier=float(symbol_risk_cfg.get("watchlist_session_scale_multiplier", 0.80)),
         dual_pressure_target_portion_bonus=float(leverage_cfg.get("dual_pressure_target_portion_bonus", 0.0)),
         dual_pressure_max_symbol_position_portion=float(leverage_cfg.get("dual_pressure_max_symbol_position_portion", 0.0)),
-        use_cvd_bonus_filter=bool(leverage_cfg.get("use_cvd_bonus_filter", False)),
+        use_cvd_bonus_filter=False if disable_cvd_decision_logic else bool(leverage_cfg.get("use_cvd_bonus_filter", False)),
         cvd_1h_slope_lookback=int(float(leverage_cfg.get("cvd_1h_slope_lookback", 3))),
         cvd_15m_slope_lookback=int(float(leverage_cfg.get("cvd_15m_slope_lookback", 3))),
         cvd_positive_delta_ratio_threshold=float(leverage_cfg.get("cvd_positive_delta_ratio_threshold", 0.05)),
@@ -511,7 +519,7 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         cvd_bullish_bonus_multiplier=float(leverage_cfg.get("cvd_bullish_bonus_multiplier", 0.0)),
         cvd_neutral_bonus_multiplier=float(leverage_cfg.get("cvd_neutral_bonus_multiplier", 0.7)),
         cvd_bearish_bonus_multiplier=float(leverage_cfg.get("cvd_bearish_bonus_multiplier", 1.0)),
-        use_cvd_veto_filter=bool(cvd_filter_cfg.get("enabled", False)),
+        use_cvd_veto_filter=False if disable_cvd_decision_logic else bool(cvd_filter_cfg.get("enabled", False)),
         cvd_veto_session_reset=str(cvd_filter_cfg.get("session_reset", "daily_utc0")),
         cvd_veto_lookback_15m=int(float(cvd_filter_cfg.get("lookback_15m", 3))),
         cvd_veto_positive_delta_ratio_threshold=float(cvd_filter_cfg.get("positive_delta_ratio_threshold", 0.10)),
@@ -852,6 +860,9 @@ class BacktestEngine:
         self.strategy_config = strategy_config
         self.strategy_engine = MACDStrategyV2Engine(strategy_config)
         self.runtime_config = runtime_config
+        ff_cfg = runtime_config.get("fund_flow", {}) if isinstance(runtime_config.get("fund_flow"), dict) else {}
+        backtest_cfg = ff_cfg.get("backtest", {}) if isinstance(ff_cfg.get("backtest"), dict) else {}
+        self.disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
         self.signal_override_registry = create_override_registry(runtime_config)
         self.time_window_filter = TimeWindowFilter(
             TimeWindowFilterConfig.from_dict(
@@ -876,6 +887,34 @@ class BacktestEngine:
         self._consecutive_losses: int = 0
         self._loss_streak_date_utc: str = ""
         self._entry_cooldown_until: Optional[pd.Timestamp] = None
+
+    @staticmethod
+    def _inactive_cvd_veto_context() -> dict:
+        return {
+            'cvd_veto_state': 'inactive',
+            'cvd_veto_triggered': False,
+            'cvd_veto_reason': '',
+            'cvd_delta_ratio': 0.0,
+            'cvd_pressure': 0.0,
+            'cvd_session_ratio': 0.0,
+            'cvd_session_pressure': 0.0,
+            'cvd_session_ratio_change': 0.0,
+            'session_price_change': 0.0,
+            'close_pos': 0.0,
+            'upper_wick_ratio': 0.0,
+            'structure_gap': 0.0,
+        }
+
+    @staticmethod
+    def _inactive_cvd_bonus_context() -> dict:
+        return {
+            'cvd_bonus_state': 'inactive',
+            'cvd_bonus_multiplier': 1.0,
+            'cvd_1h_delta_ratio': 0.0,
+            'cvd_1h_pressure': 0.0,
+            'cvd_15m_delta_ratio': 0.0,
+            'cvd_15m_pressure': 0.0,
+        }
 
     def _strategy_engine_for_symbol(self, symbol: str) -> MACDStrategyV2Engine:
         override = self.signal_override_registry.get_override(symbol)
@@ -1210,6 +1249,12 @@ class BacktestEngine:
         strategy_engine = self._strategy_engine_for_symbol(symbol)
         
         # 调用V2.0策略
+        cvd_upper_wick_ratio = None
+        cvd_1h_delta_ratio = None
+        if not self.disable_cvd_decision_logic:
+            cvd_upper_wick_ratio = float(row_15m['upper_wick_ratio']) if 'upper_wick_ratio' in row_15m.index else None
+            cvd_1h_delta_ratio = float(row_1h['cvd_delta_ratio']) if 'cvd_delta_ratio' in row_1h.index else None
+
         signal = strategy_engine.analyze(
             macd_hist_15m=macd_hist_15m,
             macd_hist_1h=macd_hist_1h,
@@ -1238,39 +1283,43 @@ class BacktestEngine:
             if 'structural_vwap' in tf_1h.columns else None,
             adx_1h=float(row_1h['adx']) if 'adx' in row_1h.index else 0.0,
             adx_4h=float(row_4h['adx']) if 'adx' in row_4h.index else 0.0,
-            cvd_upper_wick_ratio=float(row_15m['upper_wick_ratio']) if 'upper_wick_ratio' in row_15m.index else None,
-            cvd_1h_delta_ratio=float(row_1h['cvd_delta_ratio']) if 'cvd_delta_ratio' in row_1h.index else None,
+            cvd_upper_wick_ratio=cvd_upper_wick_ratio,
+            cvd_1h_delta_ratio=cvd_1h_delta_ratio,
             atr_1h=row_1h['atr'],
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
         )
-        cvd_veto_context = self.build_cvd_veto_context(signal, row_1h, row_15m)
-        if cvd_veto_context.get('cvd_veto_triggered'):
-            veto_details = dict(signal.details or {})
-            veto_details.update(cvd_veto_context)
-            signal = strategy_engine._neutral_signal(
-                reason='cvd_v71_veto',
-                score=float(signal.signal_score),
-                details=veto_details,
-                veto_type=VetoType.CVD_CONTINUATION_RISK,
-                veto_reason=str(cvd_veto_context.get('cvd_veto_reason', '')),
-                signal_type_1h=signal.signal_type_1h,
-                entry_type_15m=signal.entry_type_15m,
-                entry_score_15m=signal.entry_score_15m,
-                vwap_score=signal.vwap_score,
-                vwap_deviation=signal.vwap_deviation,
-                vwap_state=signal.vwap_state,
-                vwap_location_score=signal.vwap_location_score,
-                ema_multiplier=signal.ema_multiplier,
-                ema_structure_status=signal.ema_structure_status,
-                enhancement_score=signal.enhancement_score,
-                is_4h_enhanced=signal.is_4h_enhanced,
-            )
+        if self.disable_cvd_decision_logic:
+            cvd_veto_context = self._inactive_cvd_veto_context()
+            cvd_context = self._inactive_cvd_bonus_context()
         else:
-            signal.details = dict(signal.details or {})
-            signal.details.update(cvd_veto_context)
+            cvd_veto_context = self.build_cvd_veto_context(signal, row_1h, row_15m)
+            if cvd_veto_context.get('cvd_veto_triggered'):
+                veto_details = dict(signal.details or {})
+                veto_details.update(cvd_veto_context)
+                signal = strategy_engine._neutral_signal(
+                    reason='cvd_v71_veto',
+                    score=float(signal.signal_score),
+                    details=veto_details,
+                    veto_type=VetoType.CVD_CONTINUATION_RISK,
+                    veto_reason=str(cvd_veto_context.get('cvd_veto_reason', '')),
+                    signal_type_1h=signal.signal_type_1h,
+                    entry_type_15m=signal.entry_type_15m,
+                    entry_score_15m=signal.entry_score_15m,
+                    vwap_score=signal.vwap_score,
+                    vwap_deviation=signal.vwap_deviation,
+                    vwap_state=signal.vwap_state,
+                    vwap_location_score=signal.vwap_location_score,
+                    ema_multiplier=signal.ema_multiplier,
+                    ema_structure_status=signal.ema_structure_status,
+                    enhancement_score=signal.enhancement_score,
+                    is_4h_enhanced=signal.is_4h_enhanced,
+                )
+            else:
+                signal.details = dict(signal.details or {})
+                signal.details.update(cvd_veto_context)
 
-        cvd_context = self.build_cvd_bonus_context(signal, row_1h, row_15m)
+            cvd_context = self.build_cvd_bonus_context(signal, row_1h, row_15m)
         
         return {
             'signal': signal,
@@ -1341,8 +1390,12 @@ class BacktestEngine:
         signal = analysis['signal']
         price = analysis['price']
         time = analysis['time']
-        cvd_veto_context = analysis.get('cvd_veto_context') or {}
-        cvd_context = analysis.get('cvd_context') or {}
+        if self.disable_cvd_decision_logic:
+            cvd_veto_context = self._inactive_cvd_veto_context()
+            cvd_context = self._inactive_cvd_bonus_context()
+        else:
+            cvd_veto_context = analysis.get('cvd_veto_context') or {}
+            cvd_context = analysis.get('cvd_context') or {}
         
         # 无信号或信号分数不足
         if signal.direction == 'neutral':
@@ -1381,7 +1434,7 @@ class BacktestEngine:
             signal_type_1h=signal.signal_type_1h,
             vwap_score=signal.vwap_score,
             vwap_state=signal.vwap_state,
-            bonus_multiplier=float(cvd_context.get('cvd_bonus_multiplier', 1.0)),
+            bonus_multiplier=1.0 if self.disable_cvd_decision_logic else float(cvd_context.get('cvd_bonus_multiplier', 1.0)),
             is_trial_entry=bool(signal.is_trial_entry),
             entry_scale=float(signal.entry_scale or 1.0),
             session_scale=session_position_scale,
