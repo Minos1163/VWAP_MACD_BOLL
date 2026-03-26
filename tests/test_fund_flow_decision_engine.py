@@ -41,6 +41,15 @@ def _trend_context(
     return {"timeframes": {"15m": tf_15m, "5m": dict(tf_ctx)}}
 
 
+def test_macd_mtf_default_4h_enhancement_weight_is_aligned_to_v2_default():
+    cfg = _cfg()
+    cfg["fund_flow"]["macd_mtf_strategy"] = {}
+
+    engine = FundFlowDecisionEngine(cfg)
+
+    assert engine.macd_mtf_strategy_config.weight_4h_enhancement == 0.10
+
+
 def test_decide_hold_when_long_score_lacks_breakout_or_pullback():
     engine = FundFlowDecisionEngine(_cfg())
     decision = engine.decide(

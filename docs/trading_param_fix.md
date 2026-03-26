@@ -3,6 +3,39 @@
 > 目标：提升信号质量，胜率从 66.7% → 70%+，盈利因子从 2.97 → 4.0+  
 > 执行顺序：先改配置 → 再改代码 → 回测验证 → 上实盘
 
+> 2026-03-25 同步说明：当前实盘继续使用 `config/trading_config_fund_flow.json`。
+> 这份文档原本是旧的参数修正提案，下面未特别标注的“修改前/后”代码块不再作为 live 真值。
+> 当前 live 口径以 `4H` 为主方向、`15m` 为软确认、`VWAP >= 0.12`、默认分值门槛 `0.85` 为准。
+
+## 0. 当前 Live 参数基线
+
+```json
+"scoring_weights": {
+  "weight_1h_direction": 0.00,
+  "weight_4h_direction": 0.55,
+  "weight_vwap": 0.20,
+  "weight_15m_entry": 0.05,
+  "weight_volume": 0.20
+},
+"entry_thresholds": {
+  "default": 0.850,
+  "red_bar_growing": 0.850,
+  "flip_bearish": 0.840,
+  "flip_bullish": 0.840,
+  "min_entry_score": 0.25
+},
+"entry_filters": {
+  "primary_direction_timeframe": "4h",
+  "require_1h_confirmation_when_4h_primary": true,
+  "allow_neutral_1h_confirmation": true,
+  "light_1h_confirmation_when_4h_primary": true,
+  "enable_soft_15m_confirmation_when_4h_primary": true,
+  "soft_15m_entry_score": 0.28,
+  "min_signal_score": 0.850,
+  "min_vwap_score_for_entry": 0.12
+}
+```
+
 ---
 
 ## 1. 配置文件修改 `trading_config_fund_flow.json`

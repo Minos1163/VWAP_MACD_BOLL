@@ -14,11 +14,12 @@
 
 当前有效结构是：
 
-1. `1H MACD` 定方向
-2. `1H/4H BOLL` 给结构强弱修正
-3. `session VWAP + structural VWAP` 做位置过滤
-4. `15M MACD + 15M BOLL` 做入场精化
-5. `short_dual_pressure` 使用温和仓位弹性
+1. `4H MACD` 定主方向
+2. `1H MACD` 做方向确认，允许 `neutral/light confirmation`
+3. `1H/4H BOLL` 给结构强弱修正
+4. `session VWAP + structural VWAP` 做位置过滤
+5. `15M MACD + 15M BOLL` 做入场精化；在 `4H` 主导时允许 `soft 15m confirmation`
+6. `short_dual_pressure` 使用温和仓位弹性
 
 ### 1.2 当前真实交易状态
 
@@ -107,11 +108,12 @@
 
 | 参数 | 数值 |
 | --- | --- |
-| weight_1h_direction | `0.50` |
+| weight_1h_direction | `0.00` |
+| weight_4h_direction | `0.55` |
 | weight_4h_enhancement | `0.00` |
 | weight_vwap | `0.20` |
-| weight_15m_entry | `0.15` |
-| weight_volume | `0.15` |
+| weight_15m_entry | `0.05` |
+| weight_volume | `0.20` |
 
 ### 3.5 入场阈值
 
@@ -119,11 +121,23 @@
 | --- | --- |
 | default min_signal_score | `0.850` |
 | min_entry_score | `0.25` |
+| red_bar_growing threshold | `0.850` |
 | flip_bearish threshold | `0.840` |
 | flip_bullish threshold | `0.840` |
 | min_vwap_score_for_entry | `0.12` |
 
-### 3.6 A2 关键过滤参数
+### 3.6 当前 4H 主导入场过滤
+
+| 参数 | 数值 |
+| --- | --- |
+| primary_direction_timeframe | `4h` |
+| require_1h_confirmation_when_4h_primary | `true` |
+| allow_neutral_1h_confirmation | `true` |
+| light_1h_confirmation_when_4h_primary | `true` |
+| enable_soft_15m_confirmation_when_4h_primary | `true` |
+| soft_15m_entry_score | `0.28` |
+
+### 3.7 A2 关键过滤参数
 
 | 参数 | 数值 |
 | --- | --- |
@@ -134,7 +148,7 @@
 | bb_slope_lookback_1h | `3` |
 | bb_slope_lookback_4h | `2` |
 
-### 3.7 风控参数
+### 3.8 风控参数
 
 | 参数 | 数值 |
 | --- | --- |
@@ -143,14 +157,14 @@
 | max_stop_loss_pct | `0.025` |
 | vwap_alert_deviation | `0.005` |
 
-### 3.8 当前 D 参数（温和版）
+### 3.9 当前 D 参数（温和版）
 
 | 参数 | 数值 |
 | --- | --- |
 | dual_pressure_target_portion_bonus | `0.08` |
 | dual_pressure_max_symbol_position_portion | `0.68` |
 
-### 3.9 组合与执行参数
+### 3.10 组合与执行参数
 
 | 参数 | 数值 |
 | --- | --- |

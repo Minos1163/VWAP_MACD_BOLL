@@ -296,6 +296,64 @@ def test_neutral_signal_carries_4h_shrink_exit_metadata() -> None:
     assert signal.details["shrink_exit_ready"] is True
 
 
+def test_soft_15m_confirmation_allows_4h_primary_entry() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            weight_1h_direction=0.0,
+            weight_4h_direction=0.55,
+            weight_4h_enhancement=0.0,
+            weight_vwap=0.20,
+            weight_15m_entry=0.05,
+            weight_volume=0.20,
+            min_signal_score=0.85,
+            min_entry_score=0.1,
+            min_vwap_score_for_entry=0.12,
+            overheat_growing_penalty=0.0,
+            enable_flip_bullish_strict_filter=False,
+            disable_flip_bullish_entries=False,
+            disable_green_bar_growing_entries=False,
+            primary_direction_timeframe="4h",
+            require_1h_confirmation_when_4h_primary=True,
+            allow_neutral_1h_confirmation=True,
+            light_1h_confirmation_when_4h_primary=True,
+            enable_soft_15m_confirmation_when_4h_primary=True,
+            soft_15m_entry_score=0.28,
+        )
+    )
+
+    signal = engine.analyze(
+        macd_hist_15m=np.array([-0.00040, -0.00025, -0.00018, -0.00010]),
+        macd_hist_1h=np.array([-0.20, -0.10, 0.05, 0.10]),
+        macd_hist_4h=np.array([-0.30, -0.15, -0.05, 0.20]),
+        idx_15m=3,
+        idx_1h=3,
+        idx_4h=3,
+        volume_ratio=2.0,
+        vwap=100.0,
+        structural_vwap=99.6,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        bb_upper_1h=110.0,
+        bb_lower_1h=90.0,
+        bb_middle_4h=99.0,
+        bb_upper_4h=109.0,
+        bb_lower_4h=89.0,
+        bb_middle_15m=100.0,
+        bb_upper_15m=103.0,
+        bb_lower_15m=97.0,
+        close_15m=100.8,
+        adx_1h=20.0,
+        adx_4h=22.0,
+        atr_1h=1.0,
+    )
+
+    assert signal.direction == "long"
+    assert signal.signal_score >= 0.85
+    assert signal.details["entry_score_15m"] == pytest.approx(0.28, rel=1e-6)
+    assert signal.details["vwap_score"] >= 0.12
+    assert str(signal.details["entry_type_15m"]).startswith("soft_long_")
+
+
 def test_green_bar_growing_short_adx_range_filter_blocks_full_size() -> None:
     base_kwargs = dict(
         weight_1h_direction=0.5,

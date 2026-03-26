@@ -4,11 +4,11 @@ MACD多时间框架交易策略模块 V2.0 - VWAP + BOLL 增强版
 策略架构：
 - BOLL结构层（4H + 1H）→ 过滤逆势交易，确认价格在布林带中的位置
 - MACD_1H 定方向 → 负责执行方向与过滤
-- MACD_4H 主评分（权重55%）→ 负责主趋势打分，降低噪音
+- MACD_4H 主评分（权重50%）→ 负责主趋势打分，降低噪音
 - MACD_4H 确认增强（默认关闭）→ 预留附加趋势验证
-- VWAP 价值中枢层（权重20%）→ 判断多空偏向，偏离过滤
-- MACD_15M 软确认（权重5%）→ 仅用于入场微调，不再作为 4H 主周期下的硬门槛
-- 成交量确认（权重20%）→ 入场质量验证
+- VWAP 价值中枢层（权重15%）→ 判断多空偏向，偏离过滤
+- MACD_15M 跟随入场（权重20%）→ 入场时机
+- 成交量确认（权重15%）→ 入场质量验证
 
 扫描周期：每15分钟
 """
@@ -72,17 +72,17 @@ class MACDStrategyV2Config:
     vwap_retest_tolerance: float = 0.003
     
     # 评分权重
-    weight_1h_direction: float = 0.00  # 兼容旧配置键：未显式提供 weight_4h_direction 时作为回退
-    weight_4h_direction: float = 0.55  # 4H主趋势评分权重
+    weight_1h_direction: float = 0.35  # 兼容旧配置键：未显式提供 weight_4h_direction 时作为回退
+    weight_4h_direction: float = 0.35  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
-    weight_vwap: float = 0.20  # VWAP评分权重
-    weight_15m_entry: float = 0.05  # 15M入场时机评分权重（软确认）
-    weight_volume: float = 0.20  # 成交量确认评分权重
+    weight_vwap: float = 0.15  # VWAP评分权重
+    weight_15m_entry: float = 0.10  # 15M入场时机评分权重
+    weight_volume: float = 0.15  # 成交量确认评分权重
     
     # 入场阈值
     min_entry_score: float = 0.25
     min_signal_score: float = 0.850
-    red_bar_growing_min_signal_score: float = 0.850
+    red_bar_growing_min_signal_score: float = 0.870
     flip_bearish_min_signal_score: float = 0.840
     flip_bullish_min_signal_score: float = 0.840
 
@@ -108,14 +108,10 @@ class MACDStrategyV2Config:
     disable_green_bar_growing_entries: bool = True
     disable_green_bar_shrinking_short_dual_pressure_entries: bool = True
     disable_red_bar_shrinking_long_dual_support_entries: bool = True
-    primary_direction_timeframe: str = "4h"  # 默认使用4H主趋势，兼容旧配置时可显式切回1h
+    primary_direction_timeframe: str = "1h"  # 1h=兼容旧逻辑, 4h=纯4H主趋势
     require_1h_confirmation_when_4h_primary: bool = False
     allow_neutral_1h_confirmation: bool = False
     light_1h_confirmation_when_4h_primary: bool = False
-    enable_soft_15m_confirmation_when_4h_primary: bool = True
-    soft_15m_entry_score: float = 0.28
-    soft_15m_neutral_hist_multiple: float = 3.0
-    soft_15m_max_adverse_hist_multiple: float = 8.0
     enable_green_bar_growing_short_adx_1h_range_filter: bool = False
     green_bar_growing_short_min_adx_1h: float = 0.0
     green_bar_growing_short_max_adx_1h: float = 0.0
@@ -165,7 +161,7 @@ class MACDStrategyV2Config:
     overheat_growing_penalty: float = 0.12
     overheat_ema_multiplier_threshold: float = 1.2
     overheat_vwap_score_threshold: float = 0.10
-    min_vwap_score_for_entry: float = 0.12  # VWAP全局过滤
+    min_vwap_score_for_entry: float = 0.0  # VWAP全局过滤，0=禁用
     
     # 止损配置
     use_dynamic_stop: bool = True
@@ -1142,7 +1138,7 @@ class MACDStrategyV2Engine:
         details_4h: Dict[str, Any],
     ) -> Tuple[Optional[str], Optional[str], Dict[str, Any]]:
         """根据配置决定交易主方向，并在 4H 主方向模式下检查 1H 辅助确认。"""
-        mode = str(self.config.primary_direction_timeframe or "4h").strip().lower()
+        mode = str(self.config.primary_direction_timeframe or "1h").strip().lower()
         debug: Dict[str, Any] = {
             "primary_direction_timeframe": mode,
             "direction_1h": direction_1h or "neutral",
@@ -1180,55 +1176,8 @@ class MACDStrategyV2Engine:
         return direction_4h, None, debug
 
     def use_light_1h_confirmation(self) -> bool:
-        mode = str(self.config.primary_direction_timeframe or "4h").strip().lower()
+        mode = str(self.config.primary_direction_timeframe or "1h").strip().lower()
         return mode == "4h" and bool(self.config.light_1h_confirmation_when_4h_primary)
-
-    def use_soft_15m_confirmation(self) -> bool:
-        mode = str(self.config.primary_direction_timeframe or "4h").strip().lower()
-        return mode == "4h" and bool(self.config.enable_soft_15m_confirmation_when_4h_primary)
-
-    def soften_15m_entry_when_4h_primary(
-        self,
-        can_enter: bool,
-        entry_score_15m: float,
-        details_15m: Dict[str, Any],
-        direction: str,
-    ) -> Tuple[bool, float, Dict[str, Any]]:
-        """4H 主周期下放宽 15m 准入，只保留弱逆势和近零轴容忍。"""
-        if can_enter or not self.use_soft_15m_confirmation():
-            return can_enter, entry_score_15m, details_15m
-
-        details = dict(details_15m or {})
-        hist_0 = float(details.get("hist_current", 0.0) or 0.0)
-        hist_1 = float(details.get("hist_prev", hist_0) or hist_0)
-        neutral_band = max(
-            abs(self.config.macd_threshold) * max(float(self.config.soft_15m_neutral_hist_multiple), 1.0),
-            1e-9,
-        )
-        max_adverse = neutral_band * max(float(self.config.soft_15m_max_adverse_hist_multiple), 1.0)
-        soft_score = max(entry_score_15m, float(self.config.soft_15m_entry_score))
-
-        if direction == "long":
-            near_neutral = hist_0 >= -neutral_band
-            recovering = hist_0 > hist_1 and hist_0 >= -max_adverse
-            if near_neutral or recovering:
-                details["soft_15m_confirmation"] = True
-                details["soft_15m_confirmation_reason"] = "near_neutral" if near_neutral else "recovering"
-                details["entry_type"] = "soft_long_neutral" if near_neutral else "soft_long_recovery"
-                details["base_entry_score"] = soft_score
-                return True, soft_score, details
-
-        elif direction == "short":
-            near_neutral = hist_0 <= neutral_band
-            recovering = hist_0 < hist_1 and hist_0 <= max_adverse
-            if near_neutral or recovering:
-                details["soft_15m_confirmation"] = True
-                details["soft_15m_confirmation_reason"] = "near_neutral" if near_neutral else "recovering"
-                details["entry_type"] = "soft_short_neutral" if near_neutral else "soft_short_recovery"
-                details["base_entry_score"] = soft_score
-                return True, soft_score, details
-
-        return can_enter, entry_score_15m, details
     
     # ==================== MACD_4H 确认增强 ====================
     
@@ -1998,7 +1947,7 @@ class MACDStrategyV2Engine:
             bb_upper_4h = float(upper_4h[-1])
             bb_lower_4h = float(lower_4h[-1])
 
-        primary_mode = str(self.config.primary_direction_timeframe or "4h").strip().lower()
+        primary_mode = str(self.config.primary_direction_timeframe or "1h").strip().lower()
         light_1h_confirmation = self.use_light_1h_confirmation()
 
         # ========== Step 1: MACD_1H 辅助方向状态 ==========
@@ -2383,12 +2332,6 @@ class MACDStrategyV2Engine:
             bb_upper_15m=bb_upper_15m,
             bb_lower_15m=bb_lower_15m,
             close_15m=close_15m
-        )
-        can_enter, entry_score_15m, details_15m = self.soften_15m_entry_when_4h_primary(
-            can_enter=can_enter,
-            entry_score_15m=entry_score_15m,
-            details_15m=details_15m,
-            direction=trade_direction,
         )
         entry_type_15m = details_15m.get('entry_type', '')
         debug_details = self._set_stage(

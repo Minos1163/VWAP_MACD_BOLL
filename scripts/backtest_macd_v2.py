@@ -112,7 +112,11 @@ def apply_backtest_profile(runtime_cfg: dict, profile_name: Optional[str] = None
     if not isinstance(backtest_cfg, dict):
         return merged_cfg, ""
 
-    selected_profile = str(profile_name or backtest_cfg.get("default_profile", "") or "").strip()
+    raw_profile_name = str(profile_name or "").strip()
+    if raw_profile_name.lower() in {"none", "off", "null", "disabled", "disable"}:
+        return merged_cfg, ""
+
+    selected_profile = str(raw_profile_name or backtest_cfg.get("default_profile", "") or "").strip()
     if not selected_profile:
         return merged_cfg, ""
 
@@ -394,7 +398,7 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
     macd_cfg = v2_cfg.get("macd_config", {}) if isinstance(v2_cfg.get("macd_config"), dict) else {}
     filter_cfg = v2_cfg.get("entry_filters", {}) if isinstance(v2_cfg.get("entry_filters"), dict) else {}
     penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
-    default_signal_threshold = float(thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score", 0.825)))
+    default_signal_threshold = float(thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score", 0.850)))
 
     return MACDStrategyV2Config(
         macd_1h_fast=int(macd_cfg.get("macd_1h_fast", 12)),
@@ -420,12 +424,12 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_weekly")),
         structural_vwap_rolling_window=int(float(vwap_cfg.get("structural_vwap_rolling_window", 20))),
         vwap_retest_tolerance=float(vwap_cfg.get("vwap_retest_tolerance", 0.003)),
-        weight_1h_direction=float(weights_cfg.get("weight_1h_direction", 0.50)),
-        weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.50))),
+        weight_1h_direction=float(weights_cfg.get("weight_1h_direction", 0.00)),
+        weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.55))),
         weight_4h_enhancement=float(weights_cfg.get("weight_4h_enhancement", 0.10)),
-        weight_vwap=float(weights_cfg.get("weight_vwap", 0.15)),
-        weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.10)),
-        weight_volume=float(weights_cfg.get("weight_volume", 0.15)),
+        weight_vwap=float(weights_cfg.get("weight_vwap", 0.20)),
+        weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.05)),
+        weight_volume=float(weights_cfg.get("weight_volume", 0.20)),
         min_entry_score=float(thresholds_cfg.get("min_entry_score", 0.25)),
         min_signal_score=default_signal_threshold,
         red_bar_growing_min_signal_score=float(thresholds_cfg.get("red_bar_growing", default_signal_threshold)),
@@ -450,10 +454,14 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         ema_slope_lookback_4h=int(float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h", 2)))),
         disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
         disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
-        primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "1h")),
+        primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
         require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
         allow_neutral_1h_confirmation=bool(filter_cfg.get("allow_neutral_1h_confirmation", False)),
         light_1h_confirmation_when_4h_primary=bool(filter_cfg.get("light_1h_confirmation_when_4h_primary", False)),
+        enable_soft_15m_confirmation_when_4h_primary=bool(filter_cfg.get("enable_soft_15m_confirmation_when_4h_primary", True)),
+        soft_15m_entry_score=float(filter_cfg.get("soft_15m_entry_score", 0.28)),
+        soft_15m_neutral_hist_multiple=float(filter_cfg.get("soft_15m_neutral_hist_multiple", 3.0)),
+        soft_15m_max_adverse_hist_multiple=float(filter_cfg.get("soft_15m_max_adverse_hist_multiple", 8.0)),
         enable_green_bar_growing_short_adx_1h_range_filter=bool(filter_cfg.get("enable_green_bar_growing_short_adx_1h_range_filter", False)),
         green_bar_growing_short_min_adx_1h=float(filter_cfg.get("green_bar_growing_short_min_adx_1h", 0.0)),
         green_bar_growing_short_max_adx_1h=float(filter_cfg.get("green_bar_growing_short_max_adx_1h", 0.0)),
@@ -467,7 +475,7 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         overheat_growing_penalty=float(penalty_cfg.get("overheat_growing_penalty", 0.12)),
         overheat_ema_multiplier_threshold=float(penalty_cfg.get("overheat_boll_multiplier_threshold", penalty_cfg.get("overheat_ema_multiplier_threshold", 1.2))),
         overheat_vwap_score_threshold=float(penalty_cfg.get("overheat_vwap_score_threshold", 0.10)),
-        min_vwap_score_for_entry=float(filter_cfg.get("min_vwap_score_for_entry", penalty_cfg.get("min_vwap_score_for_entry", 0.0))),
+        min_vwap_score_for_entry=float(filter_cfg.get("min_vwap_score_for_entry", penalty_cfg.get("min_vwap_score_for_entry", 0.12))),
         use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
         ema_stop_atr_multiplier=float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier", 0.5))),
         max_stop_loss_pct=float(stop_cfg.get("max_stop_loss_pct", 0.025)),
@@ -751,8 +759,27 @@ def load_symbol_data(
         if not matching_files:
             print(f"  [WARN] No data for {symbol} {tf}")
             return None
-        
-        filepath = os.path.join(data_dir, matching_files[0])
+
+        # 按文件内最新时间戳选缓存，避免被 60d_旧日期 文件名误导。
+        selected_file = matching_files[0]
+        selected_max_ts = pd.Timestamp.min
+        for filename in matching_files:
+            candidate_path = os.path.join(data_dir, filename)
+            try:
+                ts_df = pd.read_parquet(candidate_path, columns=["timestamp"])
+                if ts_df.empty:
+                    continue
+                ts_series = pd.to_datetime(ts_df["timestamp"], errors="coerce")
+                candidate_max_ts = ts_series.max()
+                if pd.isna(candidate_max_ts):
+                    continue
+                if candidate_max_ts > selected_max_ts:
+                    selected_file = filename
+                    selected_max_ts = candidate_max_ts
+            except Exception:
+                continue
+
+        filepath = os.path.join(data_dir, selected_file)
         df = pd.read_parquet(filepath)
         
         # 准备指标

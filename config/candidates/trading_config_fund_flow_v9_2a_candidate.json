@@ -226,6 +226,11 @@
       1.0
     ],
     "allowed_entry_hours_utc": [],
+    "stable_continuation_signal_pool": {
+      "enabled": true,
+      "mode": "retrigger",
+      "force_retrigger_after_seconds": 3600
+    },
     "winner_pyramiding": {
       "enabled": false,
       "min_unrealized_pnl_ratio": 0.003,
@@ -369,6 +374,8 @@
         "default": 0.85,
         "min_entry_score": 0.25,
         "min_signal_score": 0.85,
+        "stable_bear_continuation_min_signal_score": 0.82,
+        "stable_bull_continuation_min_signal_score": 0.82,
         "red_bar_growing": 0.87,
         "flip_bearish": 0.84,
         "flip_bullish": 0.84
@@ -388,6 +395,14 @@
         "preflip_trial_min_vwap_score": 0.06,
         "preflip_trial_entry_scale": 0.35,
         "preflip_trial_max_leverage": 2,
+        "enable_stable_bear_continuation": true,
+        "stable_bear_continuation_min_vwap_score": 0.1,
+        "stable_bear_continuation_min_adx_1h": 20.0,
+        "stable_bear_continuation_min_4h_bars": 2,
+        "enable_stable_bull_continuation": false,
+        "stable_bull_continuation_min_vwap_score": 0.1,
+        "stable_bull_continuation_min_adx_1h": 20.0,
+        "stable_bull_continuation_min_4h_bars": 2,
         "enable_flip_bullish_strict_filter": true,
         "disable_flip_bullish_entries": true,
         "flip_bullish_min_vwap_score": 0.12,
@@ -425,7 +440,10 @@
         "enable_4h_shrink_exit": true,
         "exit_4h_shrink_bars": 2,
         "exit_4h_min_shrink_pct": 0.2,
-        "exit_4h_require_profit": true
+        "exit_4h_require_profit": true,
+        "enable_stable_continuation_slow_4h_shrink_exit": true,
+        "stable_continuation_exit_4h_shrink_bars": 3,
+        "stable_continuation_exit_4h_min_shrink_pct": 0.35
       },
       "short_quality_filter": {
         "enabled": false,

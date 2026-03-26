@@ -193,6 +193,7 @@ class TriggerEngine:
         condition_met: bool,
         now: Optional[datetime] = None,
         cooldown_seconds: int = 0,
+        force_retrigger_after_seconds: int = 0,
     ) -> Dict[str, Any]:
         now = now or self._now()
         state = self._condition_state.get(key)
@@ -223,6 +224,16 @@ class TriggerEngine:
             return {"triggered": False, "reason": "falling_edge", "active": False}
 
         if state.active:
+            if force_retrigger_after_seconds > 0 and state.last_triggered_at is not None:
+                elapsed = (now - state.last_triggered_at).total_seconds()
+                if elapsed >= force_retrigger_after_seconds:
+                    state.last_triggered_at = now
+                    return {
+                        "triggered": True,
+                        "reason": "steady_true_force_retrigger",
+                        "active": True,
+                        "elapsed_since_last_trigger": int(elapsed),
+                    }
             return {"triggered": False, "reason": "steady_true", "active": True}
         return {"triggered": False, "reason": "steady_false", "active": False}
 
@@ -377,6 +388,10 @@ class TriggerEngine:
 
         edge_enabled = self._to_bool(cfg.get("edge_trigger_enabled", True), True)
         edge_cd = max(0, int(self._to_float(cfg.get("edge_cooldown_seconds", 0), 0.0)))
+        force_retrigger_after_seconds = max(
+            0,
+            int(self._to_float(cfg.get("edge_force_retrigger_after_seconds", 0), 0.0)),
+        )
         edge_info: Dict[str, Any] = {"triggered": passed, "reason": "edge_disabled", "active": bool(passed)}
         final_passed = passed
         if edge_enabled:
@@ -386,6 +401,7 @@ class TriggerEngine:
                 key=edge_key,
                 condition_met=passed,
                 cooldown_seconds=edge_cd,
+                force_retrigger_after_seconds=force_retrigger_after_seconds,
             )
             final_passed = bool(edge_info.get("triggered", False))
 

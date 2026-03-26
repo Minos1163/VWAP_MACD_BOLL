@@ -243,3 +243,33 @@ def test_pretrade_risk_gate_marks_passive_only_entry_execution_policy(monkeypatc
     assert gated.metadata["disable_market_fallback"] is True
     assert gate_meta["entry_execution_policy"] == "PASSIVE_ONLY"
     assert "EXECUTION_1M_PASSIVE" in gated.reason
+
+
+def test_pretrade_risk_gate_disabled_bypasses_all_entry_blocks():
+    bot = _make_bot(enabled=False)
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=3,
+        reason="base",
+        metadata={},
+    )
+
+    gated, gate_meta = bot._apply_pretrade_risk_gate(
+        symbol="BTCUSDT",
+        decision=decision,
+        position=None,
+        flow_context={
+            "execution_quality_1m": {
+                "mode": "BLOCK",
+                "block_entry": True,
+                "reason": "should_be_ignored",
+            }
+        },
+        current_price=100.0,
+        account_summary={"equity": 1000.0, "max_leverage": 10.0},
+    )
+
+    assert gated is decision
+    assert gate_meta == {"enabled": False, "action": "BYPASS"}

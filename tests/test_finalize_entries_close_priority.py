@@ -129,6 +129,7 @@ def test_finalize_entries_keeps_close_when_protection_gap_blocks_new_entries():
 
 def test_finalize_entries_ai_review_rejects_weak_trend_candidate_without_structure():
     bot = _make_bot(active_symbols={})
+    bot.position_data = SimpleNamespace(get_all_positions=lambda: {})
     bot._ai_review_mode_supports_flat_candidates = lambda _mode: True
     bot.fund_flow_decision_engine = SimpleNamespace(
         decide=lambda **kwargs: _decision_with_md(

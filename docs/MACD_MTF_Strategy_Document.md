@@ -429,7 +429,7 @@ MACD_15M (跟随入场):
 ```json
 {
   "strategy_mode": "macd_mtf_strategy",
-  "macd_mtf_strategy": {
+  "macd_mtf_strategy_v2": {
     "enabled": true,
     "macd_1h_fast": 12,
     "macd_1h_slow": 26,
@@ -440,12 +440,30 @@ MACD_15M (跟随入场):
     "macd_15m_fast": 12,
     "macd_15m_slow": 26,
     "macd_15m_signal": 9,
-    "min_entry_score": 0.3,
-    "min_signal_score": 0.45,
-    "weight_1h_direction": 0.40,
-    "weight_4h_enhancement": 0.20,
-    "weight_15m_entry": 0.25,
-    "weight_volume": 0.15
+    "scoring_weights": {
+      "weight_1h_direction": 0.00,
+      "weight_4h_direction": 0.55,
+      "weight_vwap": 0.20,
+      "weight_15m_entry": 0.05,
+      "weight_volume": 0.20
+    },
+    "entry_thresholds": {
+      "default": 0.850,
+      "red_bar_growing": 0.850,
+      "flip_bearish": 0.840,
+      "flip_bullish": 0.840,
+      "min_entry_score": 0.25
+    },
+    "entry_filters": {
+      "primary_direction_timeframe": "4h",
+      "require_1h_confirmation_when_4h_primary": true,
+      "allow_neutral_1h_confirmation": true,
+      "light_1h_confirmation_when_4h_primary": true,
+      "enable_soft_15m_confirmation_when_4h_primary": true,
+      "soft_15m_entry_score": 0.28,
+      "min_signal_score": 0.850,
+      "min_vwap_score_for_entry": 0.12
+    }
   }
 }
 ```
