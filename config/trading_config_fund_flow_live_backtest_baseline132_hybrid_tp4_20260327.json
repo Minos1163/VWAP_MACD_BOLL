@@ -192,21 +192,21 @@
         "vwap_deviation_hard_block": 0.03
       },
       "scoring_weights": {
-        "weight_1h_direction": 0.00,
+        "weight_1h_direction": 0.0,
         "weight_4h_direction": 0.55,
-        "weight_vwap": 0.20,
+        "weight_vwap": 0.2,
         "weight_15m_entry": 0.05,
-        "weight_volume": 0.20
+        "weight_volume": 0.2
       },
       "entry_thresholds": {
-        "default": 0.850,
+        "default": 0.85,
         "min_entry_score": 0.25,
-        "min_signal_score": 0.850,
-        "stable_bear_continuation_min_signal_score": 0.820,
-        "stable_bull_continuation_min_signal_score": 0.820,
+        "min_signal_score": 0.85,
+        "stable_bear_continuation_min_signal_score": 0.82,
+        "stable_bull_continuation_min_signal_score": 0.82,
         "red_bar_growing": 0.86,
-        "flip_bearish": 0.840,
-        "flip_bullish": 0.840
+        "flip_bearish": 0.84,
+        "flip_bullish": 0.84
       },
       "entry_filters": {
         "primary_direction_timeframe": "4h",
@@ -218,7 +218,7 @@
         "green_bar_growing_short_max_adx_1h": 45.0,
         "enable_4h_preflip_trial_entries": true,
         "preflip_trial_min_shrink_pct_long": 0.6,
-        "preflip_trial_min_shrink_pct_short": 0.30,
+        "preflip_trial_min_shrink_pct_short": 0.3,
         "preflip_trial_min_signal_score": 0.75,
         "preflip_trial_min_vwap_score": 0.06,
         "preflip_trial_entry_scale": 0.35,
@@ -227,14 +227,14 @@
         "trial_short_below_structure_promotion_min_signal_score": 0.79,
         "trial_short_below_structure_promotion_min_vwap_score": 0.075,
         "trial_short_below_structure_promotion_min_adx_1h": 30.0,
-        "trial_short_below_structure_promotion_min_4h_shrink_pct": 0.80,
+        "trial_short_below_structure_promotion_min_4h_shrink_pct": 0.8,
         "trial_short_below_structure_promotion_min_4h_shrink_bars": 6,
         "enable_stable_bear_continuation": true,
-        "stable_bear_continuation_min_vwap_score": 0.10,
+        "stable_bear_continuation_min_vwap_score": 0.1,
         "stable_bear_continuation_min_adx_1h": 30.0,
         "stable_bear_continuation_min_4h_bars": 2,
         "enable_stable_bull_continuation": false,
-        "stable_bull_continuation_min_vwap_score": 0.10,
+        "stable_bull_continuation_min_vwap_score": 0.1,
         "stable_bull_continuation_min_adx_1h": 30.0,
         "stable_bull_continuation_min_4h_bars": 2,
         "enable_flip_bullish_strict_filter": true,
@@ -243,7 +243,7 @@
         "flip_bullish_require_pullback_bounce": true,
         "flip_bullish_require_15m_growing": true,
         "enable_flip_bullish_cvd_context_filter": false,
-        "flip_bullish_max_cvd_upper_wick_ratio": 0.20,
+        "flip_bullish_max_cvd_upper_wick_ratio": 0.2,
         "flip_bullish_min_cvd_1h_delta_ratio": 0.03,
         "flip_bearish_min_boll_multiplier": 0.0,
         "flip_bearish_normal_boll_min_signal_score": 0.0,
@@ -258,7 +258,7 @@
         "disable_green_bar_growing_entries": false,
         "disable_green_bar_shrinking_short_dual_pressure_entries": true,
         "disable_red_bar_shrinking_long_dual_support_entries": true,
-        "min_signal_score": 0.850,
+        "min_signal_score": 0.85,
         "min_vwap_score_for_entry": 0.14,
         "symbol_signal_overrides": [],
         "soft_15m_entry_score": 0.3
@@ -309,7 +309,7 @@
         "enabled": false,
         "session_reset": "daily_utc0",
         "lookback_15m": 3,
-        "positive_delta_ratio_threshold": 0.10,
+        "positive_delta_ratio_threshold": 0.1,
         "positive_pressure_threshold": 0.0,
         "session_ratio_change_threshold": -0.003,
         "session_price_change_threshold": -0.005,
@@ -336,35 +336,35 @@
             "position_scale": 0.55
           }
         ],
-          "apply_to_states": [
-            "short_dual_pressure",
-            "flip_bullish",
-            "long_dual_support"
-          ]
-        },
-        "vwap_score_position_tiers": {
-          "apply_to_states": [
-            "long_dual_support"
-          ],
-          "tiers": [
-            {
-              "min": 0.12,
-              "max": 0.2,
-              "position_mult": 0.75
-            },
-            {
-              "min": 0.2,
-              "max": 0.3,
-              "position_mult": 0.95
-            },
-            {
-              "min": 0.3,
-              "max": 1.0,
-              "position_mult": 1.05
-            }
-          ]
-        }
+        "apply_to_states": [
+          "short_dual_pressure",
+          "flip_bullish",
+          "long_dual_support"
+        ]
+      },
+      "vwap_score_position_tiers": {
+        "apply_to_states": [
+          "long_dual_support"
+        ],
+        "tiers": [
+          {
+            "min": 0.12,
+            "max": 0.2,
+            "position_mult": 0.75
+          },
+          {
+            "min": 0.2,
+            "max": 0.3,
+            "position_mult": 0.95
+          },
+          {
+            "min": 0.3,
+            "max": 1.0,
+            "position_mult": 1.05
+          }
+        ]
       }
+    }
   },
   "schedule": {
     "enabled": true,
@@ -403,9 +403,9 @@
     "real_time_monitoring": true
   },
   "_metadata": {
-    "version": "3.1_macd_v2_baseline132_hybrid_live_tp4_20260327",
+    "version": "3.1_macd_v2_live_backtest_baseline132_hybrid_tp4_20260327",
     "created_at": "2026-03-23T11:30:00Z",
-    "description": "实盘部署配置 - 当前 live 框架下回填 baseline_132 的有效策略参数，并将止盈改为4%、止损保持2%",
+    "description": "当前实盘收敛配置为底，回填 baseline_132 的策略层有效参数，并将止盈改为4%、止损保持2%的30天回测候选配置",
     "key_changes": [
       "策略段对齐到 2026-03-23 验证通过的 MACD V2 基线配置",
       "新增 shrinking-state 亏损口袋过滤: 禁做 green_bar_shrinking+short_dual_pressure",
@@ -436,6 +436,15 @@
         "consecutive_loss_pause": "2 losses",
         "stop_loss_buffer": "0.8-1.0% (tighter initial)"
       }
-    }
+    },
+    "hybrid_source": {
+      "base_strategy": "config/trading_config_fund_flow.json",
+      "live_base": "config/trading_config_fund_flow_live_backtest_converged_20260327.json"
+    },
+    "hybrid_overrides": [
+      "fund_flow.take_profit_pct = 0.04",
+      "fund_flow.stop_loss_pct = 0.02",
+      "restore baseline strategy-consumed fields: entry_filters / entry_thresholds / scoring_weights / stop_loss_config / session_risk_control / vwap_score_position_tiers"
+    ]
   }
 }

@@ -297,7 +297,7 @@
       "APTUSDT"
     ],
     "skip_unconfigured_positions": true,
-    "take_profit_pct": 0.02,
+    "take_profit_pct": 0.04,
     "breakeven_enabled": true,
     "breakeven_trigger_pnl_ratio": 0.008,
     "breakeven_lock_ratio": 0.002,
@@ -729,7 +729,7 @@
         "long_open_threshold": 0.095,
         "short_open_threshold": 0.09,
         "close_threshold": 0.3,
-        "take_profit_pct": 0.02,
+        "take_profit_pct": 0.04,
         "take_profit_pct_levels": [
           0.02,
           0.035,
@@ -787,7 +787,7 @@
         "long_open_threshold": 0.5,
         "short_open_threshold": 0.42,
         "close_threshold": 0.55,
-        "take_profit_pct": 0.02,
+        "take_profit_pct": 0.04,
         "take_profit_pct_levels": [
           0.02,
           0.04,

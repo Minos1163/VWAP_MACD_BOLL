@@ -262,6 +262,7 @@ class TradingBot:
         self._trade_fill_log_name = "trade_fills_utc.csv"
         self._trade_analysis_log_name = "trade_analysis_utc.csv"
         self._api_cycle_stats_log_name = "api_cycle_stats_utc.jsonl"
+        self._alpha_dilution_log_name = "alpha_dilution_utc.jsonl"
         self._trade_fill_logged_keys: set[str] = set()
         self._consecutive_losses: int = 0
         self._cooldown_expires: Optional[datetime] = None
@@ -293,6 +294,7 @@ class TradingBot:
         self._symbol_rotation_offset: int = 0
         self._last_entry_bucket_id: Optional[int] = None
         self._analysis_bucket_state: Dict[str, int] = {}
+        self._alpha_dilution_buckets: Dict[str, Dict[str, Any]] = {}
         self.fund_flow_storage = None
         
         # 动态止损系统初始化
@@ -615,6 +617,14 @@ class TradingBot:
         os.makedirs(dir_path, exist_ok=True)
         return os.path.join(dir_path, self._api_cycle_stats_log_name)
 
+    def _resolve_alpha_dilution_log_path_utc(self, now_utc: Optional[datetime] = None) -> str:
+        now_utc = now_utc or datetime.now(timezone.utc)
+        month = now_utc.strftime("%Y-%m")
+        date = now_utc.strftime("%Y-%m-%d")
+        dir_path = os.path.join(self.log_root_dir, month, date)
+        os.makedirs(dir_path, exist_ok=True)
+        return os.path.join(dir_path, self._alpha_dilution_log_name)
+
     def _resolve_trade_analysis_log_path_utc(self, now_utc: Optional[datetime] = None) -> str:
         now_utc = now_utc or datetime.now(timezone.utc)
         month = now_utc.strftime("%Y-%m")
@@ -805,6 +815,13 @@ class TradingBot:
         if not isinstance(payload, dict) or not payload:
             return
         log_path = self._resolve_api_cycle_stats_log_path_utc()
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _append_alpha_dilution_log(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        log_path = self._resolve_alpha_dilution_log_path_utc()
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -1137,6 +1154,8 @@ class TradingBot:
         print(f"🧾 成交回报日志(UTC): {self._resolve_trade_fill_log_path_utc()}")
         print(f"📒 交易分析日志(UTC): {self._resolve_trade_analysis_log_path_utc()}")
         print(f"📊 API周期统计日志(UTC): {self._resolve_api_cycle_stats_log_path_utc()}")
+        if self._alpha_dilution_monitor_config().get("enabled", False):
+            print(f"🧪 Alpha稀释监控日志(UTC): {self._resolve_alpha_dilution_log_path_utc()}")
         if equity > 0:
             print(
                 "💰 账户权益: "
@@ -1756,6 +1775,13 @@ class TradingBot:
         force_flatten = bool(ff_cfg.get("protection_sla_force_flatten", True))
         immediate_close_on_repair_fail = bool(ff_cfg.get("protection_immediate_close_on_repair_fail", False))
         alert_cooldown_seconds = max(5, int(ff_cfg.get("protection_sla_alert_cooldown_seconds", 30) or 30))
+        pnl_grace_threshold = self._normalize_percent_to_ratio(
+            ff_cfg.get("protection_sla_pnl_grace_threshold", 0.0),
+            0.0,
+        )
+        if str(ff_cfg.get("protection_sla_pnl_grace_threshold", "")).strip().startswith("-"):
+            pnl_grace_threshold = -abs(pnl_grace_threshold)
+        api_health_check_before_force = bool(ff_cfg.get("protection_sla_api_health_check_before_force", False))
         # 固定强平：保护单修复失败时始终按100%仓位执行减仓/平仓。
         reduce_ratio = 1.0
         return {
@@ -1765,6 +1791,8 @@ class TradingBot:
             "immediate_close_on_repair_fail": immediate_close_on_repair_fail,
             "alert_cooldown_seconds": alert_cooldown_seconds,
             "repair_fail_reduce_ratio": reduce_ratio,
+            "pnl_grace_threshold": pnl_grace_threshold,
+            "api_health_check_before_force": api_health_check_before_force,
         }
 
     def _pretrade_risk_gate_config(self) -> Dict[str, Any]:
@@ -1785,8 +1813,37 @@ class TradingBot:
         entry_block_actions = [str(x).upper() for x in block_actions_raw if str(x).strip()]
         if not entry_block_actions:
             entry_block_actions = ["EXIT", "BLOCK", "AVOID"]
+        atr_ratio_hard_block = max(
+            1e-6,
+            self._normalize_percent_to_ratio(
+                gate_cfg.get(
+                    "atr_ratio_hard_block",
+                    gate_cfg.get("volatility_cap_capture", gate_cfg.get("volatility_cap", 0.01)),
+                ),
+                volatility_cap_capture,
+            ),
+        )
+        equity_usage_block = min(
+            1.0,
+            max(
+                0.01,
+                self._normalize_percent_to_ratio(
+                    gate_cfg.get("equity_usage_block", defaults.max_exposure_per_trade),
+                    defaults.max_exposure_per_trade,
+                ),
+            ),
+        )
+        dd_exit_threshold = max(
+            0.0,
+            self._normalize_percent_to_ratio(
+                gate_cfg.get("dd_exit_threshold", gate_cfg.get("max_drawdown", defaults.max_drawdown)),
+                defaults.max_drawdown,
+            ),
+        )
         return {
             "enabled": bool(gate_cfg.get("enabled", True)),
+            "use_hard_rules_only": bool(gate_cfg.get("use_hard_rules_only", False)),
+            "cvd_veto_enabled": bool(gate_cfg.get("cvd_veto_enabled", True)),
             "force_exit_on_gate": bool(gate_cfg.get("force_exit_on_gate", True)),
             "entry_block_actions": entry_block_actions,
             "entry_hold_portion_scale": min(1.0, max(0.1, self._to_float(gate_cfg.get("entry_hold_portion_scale", 0.6), 0.6))),
@@ -1844,6 +1901,9 @@ class TradingBot:
             "momentum_scale": max(1.0, self._to_float(gate_cfg.get("momentum_scale", 300.0), 300.0)),
             "volatility_cap": volatility_cap,
             "volatility_cap_capture": volatility_cap_capture,
+            "atr_ratio_hard_block": atr_ratio_hard_block,
+            "equity_usage_block": equity_usage_block,
+            "dd_exit_threshold": dd_exit_threshold,
             "max_drawdown": max(
                 0.001,
                 self._normalize_percent_to_ratio(gate_cfg.get("max_drawdown", defaults.max_drawdown), defaults.max_drawdown),
@@ -1876,6 +1936,22 @@ class TradingBot:
             "momentum_weight": self._to_float(gate_cfg.get("momentum_weight", defaults.momentum_weight), defaults.momentum_weight),
             "volatility_weight": self._to_float(gate_cfg.get("volatility_weight", defaults.volatility_weight), defaults.volatility_weight),
             "drawdown_weight": self._to_float(gate_cfg.get("drawdown_weight", defaults.drawdown_weight), defaults.drawdown_weight),
+        }
+
+    def _alpha_dilution_monitor_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) or {}
+        raw = ff_cfg.get("alpha_dilution_monitor", {}) if isinstance(ff_cfg.get("alpha_dilution_monitor"), dict) else {}
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "alert_if_layer_dilution_exceeds": min(
+                0.99,
+                max(0.0, self._to_float(raw.get("alert_if_layer_dilution_exceeds", 0.30), 0.30)),
+            ),
+            "alert_if_daily_signal_count_below": max(
+                0,
+                int(self._to_float(raw.get("alert_if_daily_signal_count_below", 0), 0)),
+            ),
+            "report_interval_hours": max(1, int(self._to_float(raw.get("report_interval_hours", 6), 6))),
         }
 
     def _execution_quality_1m_config(self) -> Dict[str, Any]:
@@ -2185,7 +2261,9 @@ class TradingBot:
 
     def _entry_window_filter_config(self) -> Dict[str, Any]:
         ff_cfg = self.config.get("fund_flow", {}) or {}
-        hours_raw = ff_cfg.get("allowed_entry_hours_utc", [])
+        entry_window_raw = ff_cfg.get("entry_window", {})
+        entry_window_cfg = entry_window_raw if isinstance(entry_window_raw, dict) else {}
+        hours_raw = entry_window_cfg.get("allowed_hours_utc", ff_cfg.get("allowed_entry_hours_utc", []))
         hours: List[int] = []
         if isinstance(hours_raw, list):
             for item in hours_raw:
@@ -2196,8 +2274,12 @@ class TradingBot:
                 if 0 <= hour <= 23 and hour not in hours:
                     hours.append(hour)
         hours.sort()
+        enabled_override = entry_window_cfg.get("enabled")
+        enabled = bool(hours)
+        if isinstance(enabled_override, bool):
+            enabled = bool(enabled_override) and bool(hours)
         return {
-            "enabled": bool(hours),
+            "enabled": enabled,
             "allowed_hours_utc": hours,
         }
 
@@ -2220,6 +2302,160 @@ class TradingBot:
             "current_hour_utc": int(current_utc.hour),
             "allowed_hours_utc": allowed_hours,
             "reason": "allowed" if allowed else "hour_not_allowed",
+        }
+
+    @staticmethod
+    def _alpha_dilution_stage_order() -> List[str]:
+        return [
+            "v2_engine_raw",
+            "after_entry_window",
+            "after_signal_pool",
+            "after_ma10_macd",
+            "after_pretrade_gate",
+            "after_capacity_check",
+            "actually_executed",
+        ]
+
+    def _alpha_dilution_bucket_key(self, now_utc: Optional[datetime] = None) -> str:
+        cfg = self._alpha_dilution_monitor_config()
+        current_utc = now_utc if isinstance(now_utc, datetime) else datetime.now(timezone.utc)
+        interval_hours = max(1, int(cfg.get("report_interval_hours", 6) or 6))
+        bucket_hour = (current_utc.hour // interval_hours) * interval_hours
+        bucket_start = current_utc.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+        return bucket_start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _record_alpha_dilution_stage(
+        self,
+        stage: str,
+        symbol: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        cfg = self._alpha_dilution_monitor_config()
+        if not bool(cfg.get("enabled", False)):
+            return
+        stage_key = str(stage or "").strip()
+        if stage_key not in self._alpha_dilution_stage_order():
+            return
+        bucket_key = self._alpha_dilution_bucket_key()
+        bucket = self._alpha_dilution_buckets.setdefault(
+            bucket_key,
+            {
+                "bucket_start_utc": bucket_key,
+                "stage_counts": {name: 0 for name in self._alpha_dilution_stage_order()},
+                "recent_symbols": {},
+                "last_event_utc": "",
+            },
+        )
+        stage_counts = bucket.get("stage_counts")
+        if not isinstance(stage_counts, dict):
+            stage_counts = {name: 0 for name in self._alpha_dilution_stage_order()}
+            bucket["stage_counts"] = stage_counts
+        stage_counts[stage_key] = int(stage_counts.get(stage_key, 0) or 0) + 1
+        recent_symbols_raw = bucket.get("recent_symbols")
+        recent_symbols = recent_symbols_raw if isinstance(recent_symbols_raw, dict) else {}
+        bucket["recent_symbols"] = recent_symbols
+        symbol_list = recent_symbols.setdefault(stage_key, [])
+        symbol_up = str(symbol or "").upper()
+        if symbol_up and symbol_up not in symbol_list and len(symbol_list) < 20:
+            symbol_list.append(symbol_up)
+        bucket["last_event_utc"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if isinstance(extra, dict) and extra:
+            extra_map_raw = bucket.get("last_extra_by_stage")
+            extra_map = extra_map_raw if isinstance(extra_map_raw, dict) else {}
+            extra_map[stage_key] = extra
+            bucket["last_extra_by_stage"] = extra_map
+
+    def _flush_alpha_dilution_bucket(self, bucket_key: str, bucket: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+        if not isinstance(bucket, dict):
+            return
+        stage_counts_raw = bucket.get("stage_counts")
+        stage_counts = stage_counts_raw if isinstance(stage_counts_raw, dict) else {}
+        payload = {
+            "timestamp_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "bucket_start_utc": str(bucket.get("bucket_start_utc") or bucket_key),
+            "bucket_end_utc": str(bucket.get("last_event_utc") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")),
+            "stage_counts": {name: int(stage_counts.get(name, 0) or 0) for name in self._alpha_dilution_stage_order()},
+            "recent_symbols": bucket.get("recent_symbols", {}),
+        }
+        layer_dilution: Dict[str, float] = {}
+        stage_order = self._alpha_dilution_stage_order()
+        for prev_stage, next_stage in zip(stage_order, stage_order[1:]):
+            prev_count = int(payload["stage_counts"].get(prev_stage, 0) or 0)
+            next_count = int(payload["stage_counts"].get(next_stage, 0) or 0)
+            if prev_count <= 0:
+                layer_dilution[f"{prev_stage}->{next_stage}"] = 0.0
+                continue
+            layer_dilution[f"{prev_stage}->{next_stage}"] = max(0.0, min(1.0, 1.0 - (float(next_count) / float(prev_count))))
+        payload["layer_dilution"] = layer_dilution
+        self._append_alpha_dilution_log(payload)
+
+        alert_threshold = self._to_float(cfg.get("alert_if_layer_dilution_exceeds", 0.30), 0.30)
+        alerts = [name for name, rate in layer_dilution.items() if rate >= alert_threshold]
+        min_daily_signal_count = int(cfg.get("alert_if_daily_signal_count_below", 0) or 0)
+        raw_count = int(payload["stage_counts"].get("v2_engine_raw", 0) or 0)
+        if raw_count > 0 and alerts:
+            print(
+                "⚠️ Alpha稀释告警: "
+                f"bucket={payload['bucket_start_utc']} "
+                + ", ".join(f"{name}={layer_dilution[name]:.1%}" for name in alerts)
+            )
+        if min_daily_signal_count > 0 and raw_count < min_daily_signal_count:
+            print(
+                "⚠️ Alpha稀释告警: "
+                f"raw_signals={raw_count} < threshold={min_daily_signal_count} "
+                f"bucket={payload['bucket_start_utc']}"
+            )
+
+    def _maybe_flush_alpha_dilution_report(self, force: bool = False) -> None:
+        cfg = self._alpha_dilution_monitor_config()
+        if not bool(cfg.get("enabled", False)):
+            self._alpha_dilution_buckets.clear()
+            return
+        current_bucket = self._alpha_dilution_bucket_key()
+        flush_keys = [
+            key for key in list(self._alpha_dilution_buckets.keys())
+            if force or key != current_bucket
+        ]
+        for key in flush_keys:
+            bucket = self._alpha_dilution_buckets.pop(key, None)
+            if isinstance(bucket, dict):
+                self._flush_alpha_dilution_bucket(key, bucket, cfg)
+
+    def _estimate_equity_usage_ratio(
+        self,
+        account_summary: Dict[str, Any],
+        pending_entry_portion: float = 0.0,
+    ) -> float:
+        equity = self._to_float(account_summary.get("equity"), 0.0)
+        available = self._to_float(account_summary.get("available_balance"), 0.0)
+        if equity <= 0:
+            return max(0.0, min(1.0, pending_entry_portion))
+        current_usage = max(0.0, min(1.0, 1.0 - max(0.0, available) / equity))
+        return max(0.0, min(1.0, current_usage + max(0.0, pending_entry_portion)))
+
+    def _protection_api_health_ok(self) -> bool:
+        try:
+            return bool(self.client.test_connection())
+        except Exception:
+            return False
+
+    def _should_force_flatten_for_protection_sla(
+        self,
+        *,
+        position: Dict[str, Any],
+        current_price: float,
+        sla_cfg: Dict[str, Any],
+    ) -> Tuple[bool, Dict[str, Any]]:
+        pnl_ratio = self._position_pnl_ratio(position, current_price) if isinstance(position, dict) else 0.0
+        pnl_grace_threshold = self._to_float(sla_cfg.get("pnl_grace_threshold", 0.0), 0.0)
+        api_health_required = bool(sla_cfg.get("api_health_check_before_force", False))
+        api_health_ok = self._protection_api_health_ok() if api_health_required else True
+        allow_force = pnl_ratio <= pnl_grace_threshold and api_health_ok
+        return allow_force, {
+            "unrealized_pnl_ratio": pnl_ratio,
+            "pnl_grace_threshold": pnl_grace_threshold,
+            "api_health_required": api_health_required,
+            "api_health_ok": api_health_ok,
         }
 
     def _dynamic_max_active_symbols_config(self, engine_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -3240,6 +3476,12 @@ class TradingBot:
                 decision.leverage or 1,
             ),
         )
+        projected_equity_usage = self._estimate_equity_usage_ratio(
+            account_summary,
+            self._to_float(decision.target_portion_of_balance, 0.0)
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL)
+            else 0.0,
+        )
         state = {
             "symbol": symbol,
             "trend": trend_strength,
@@ -3264,6 +3506,7 @@ class TradingBot:
             "action": "HOLD",
             "score": 0.0,
             "execution_quality_1m": execution_quality_1m,
+            "projected_equity_usage": projected_equity_usage,
         }
         if (
             decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL)
@@ -3294,6 +3537,87 @@ class TradingBot:
                 ),
                 gate_meta,
             )
+
+        if bool(cfg.get("use_hard_rules_only", False)):
+            gate_meta["mode"] = "hard_rules_only"
+            gate_meta["action"] = "PASS"
+            gate_meta["score"] = 0.0
+            if isinstance(md, dict) and (not bool(cfg.get("cvd_veto_enabled", True))):
+                gate_meta["cvd_veto_enabled"] = False
+                gate_meta["cvd_strength_reference"] = cvd_momentum
+                md["pretrade_risk_gate"] = gate_meta
+
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                atr_hard_block = max(1e-6, self._to_float(cfg.get("atr_ratio_hard_block"), active_volatility_cap))
+                if atr_pct >= atr_hard_block:
+                    gate_meta["action"] = "BLOCK"
+                    gate_meta["reason"] = "ATR_EXTREME_BLOCK"
+                    gate_meta["atr_ratio_hard_block"] = atr_hard_block
+                    if isinstance(md, dict):
+                        md["pretrade_risk_gate"] = gate_meta
+                    base_reason = str(decision.reason or "").strip()
+                    block_reason = f"PRE_RISK_BLOCK ATR_EXTREME atr={atr_pct:.4f}>={atr_hard_block:.4f}"
+                    return (
+                        FundFlowDecision(
+                            operation=FundFlowOperation.HOLD,
+                            symbol=symbol,
+                            target_portion_of_balance=0.0,
+                            leverage=decision.leverage,
+                            reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                            metadata=md if isinstance(md, dict) else {},
+                        ),
+                        gate_meta,
+                    )
+
+                equity_usage_block = min(1.0, max(0.01, self._to_float(cfg.get("equity_usage_block"), 0.85)))
+                if projected_equity_usage >= equity_usage_block:
+                    gate_meta["action"] = "BLOCK"
+                    gate_meta["reason"] = "EQUITY_USAGE_BLOCK"
+                    gate_meta["equity_usage_block"] = equity_usage_block
+                    if isinstance(md, dict):
+                        md["pretrade_risk_gate"] = gate_meta
+                    base_reason = str(decision.reason or "").strip()
+                    block_reason = (
+                        f"PRE_RISK_BLOCK EQUITY_USAGE projected={projected_equity_usage:.4f}>={equity_usage_block:.4f}"
+                    )
+                    return (
+                        FundFlowDecision(
+                            operation=FundFlowOperation.HOLD,
+                            symbol=symbol,
+                            target_portion_of_balance=0.0,
+                            leverage=decision.leverage,
+                            reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                            metadata=md if isinstance(md, dict) else {},
+                        ),
+                        gate_meta,
+                    )
+
+            if isinstance(position, dict):
+                dd_exit_threshold = max(0.0, self._to_float(cfg.get("dd_exit_threshold"), 0.10))
+                if drawdown >= dd_exit_threshold:
+                    close_ratio = min(1.0, max(0.1, self._to_float(cfg.get("exit_close_ratio"), 1.0)))
+                    gate_meta["action"] = "EXIT"
+                    gate_meta["reason"] = "DRAWDOWN_HARD_EXIT"
+                    gate_meta["dd_exit_threshold"] = dd_exit_threshold
+                    if isinstance(md, dict):
+                        md["pretrade_risk_gate"] = gate_meta
+                    base_reason = str(decision.reason or "").strip()
+                    exit_reason = f"PRE_RISK_EXIT drawdown={drawdown:.4f}>={dd_exit_threshold:.4f}"
+                    return (
+                        FundFlowDecision(
+                            operation=FundFlowOperation.CLOSE,
+                            symbol=symbol,
+                            target_portion_of_balance=close_ratio,
+                            leverage=decision.leverage,
+                            reason=f"{base_reason} | {exit_reason}" if base_reason else exit_reason,
+                            metadata=md if isinstance(md, dict) else {},
+                        ),
+                        gate_meta,
+                    )
+
+            if isinstance(md, dict):
+                md["pretrade_risk_gate"] = gate_meta
+            return decision, gate_meta
 
         try:
             gate_result = gate_trade_decision(
@@ -6071,6 +6395,20 @@ class TradingBot:
                     tp_order_id = str(oid)
                 if "STOP" in order_type:
                     sl_order_id = str(oid)
+        execution_status = str(execution_result.get("status") or "").lower() if isinstance(execution_result, dict) else ""
+        if (
+            decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL)
+            and execution_status in ("success", "pending")
+        ):
+            self._record_alpha_dilution_stage(
+                "actually_executed",
+                symbol,
+                {
+                    "operation": decision.operation.value,
+                    "status": execution_status,
+                    "order_id": order_id,
+                },
+            )
 
         if decision.operation == FundFlowOperation.CLOSE and execution_result.get("status") == "success" and pre_close_side in ("LONG", "SHORT"):
             post_close_side = self._extract_position_side(position_for_log)
@@ -6591,6 +6929,7 @@ class TradingBot:
                 time.sleep(symbols_batch_pause_seconds)
 
         self._finalize_entries(context=context)
+        self._maybe_flush_alpha_dilution_report(force=False)
         elapsed_total = time.time() - cycle_start_ts
         api_stats_after = {}
         if hasattr(self.client, "get_request_stats_snapshot"):
@@ -6966,21 +7305,40 @@ class TradingBot:
                             )
             
                         if bool(sla_cfg.get("force_flatten_on_breach", True)):
-                            close_res = self._emergency_flatten_unprotected(
-                                symbol,
-                                leg_position,
-                                reduce_ratio=repair_fail_reduce_ratio,
+                            should_force, force_meta = self._should_force_flatten_for_protection_sla(
+                                position=leg_position,
+                                current_price=current_price,
+                                sla_cfg=sla_cfg,
                             )
-                            print(
-                                f"   🧯 ({side}) SLA超时强平: status={close_res.get('status')} "
-                                f"detail={close_res.get('message') or close_res.get('order')}"
-                            )
-                            self._emit_protection_sla_alert(
-                                symbol=symbol,
-                                side=side,
-                                detail="protection_sla_force_flatten",
-                                extra={"flatten": close_res},
-                            )
+                            if should_force:
+                                close_res = self._emergency_flatten_unprotected(
+                                    symbol,
+                                    leg_position,
+                                    reduce_ratio=repair_fail_reduce_ratio,
+                                )
+                                print(
+                                    f"   🧯 ({side}) SLA超时强平: status={close_res.get('status')} "
+                                    f"detail={close_res.get('message') or close_res.get('order')}"
+                                )
+                                self._emit_protection_sla_alert(
+                                    symbol=symbol,
+                                    side=side,
+                                    detail="protection_sla_force_flatten",
+                                    extra={"flatten": close_res, "force_meta": force_meta},
+                                )
+                            else:
+                                print(
+                                    f"   🛡️ ({side}) SLA超时但保留仓位: "
+                                    f"pnl={self._to_float(force_meta.get('unrealized_pnl_ratio'), 0.0):+.4f}, "
+                                    f"grace={self._to_float(force_meta.get('pnl_grace_threshold'), 0.0):+.4f}, "
+                                    f"api_ok={1 if bool(force_meta.get('api_health_ok', True)) else 0}"
+                                )
+                                self._emit_protection_sla_alert(
+                                    symbol=symbol,
+                                    side=side,
+                                    detail="protection_sla_grace_hold",
+                                    extra={"force_meta": force_meta},
+                                )
                 continue
             
             side = str(position.get("side", "")).upper()
@@ -7083,21 +7441,40 @@ class TradingBot:
                         )
             
                     if bool(sla_cfg.get("force_flatten_on_breach", True)):
-                        close_res = self._emergency_flatten_unprotected(
-                            symbol,
-                            position,
-                            reduce_ratio=repair_fail_reduce_ratio,
+                        should_force, force_meta = self._should_force_flatten_for_protection_sla(
+                            position=position,
+                            current_price=current_price,
+                            sla_cfg=sla_cfg,
                         )
-                        print(
-                            f"   🧯 SLA超时强平: status={close_res.get('status')} "
-                            f"detail={close_res.get('message') or close_res.get('order')}"
-                        )
-                        self._emit_protection_sla_alert(
-                            symbol=symbol,
-                            side=side,
-                            detail="protection_sla_force_flatten",
-                            extra={"flatten": close_res},
-                        )
+                        if should_force:
+                            close_res = self._emergency_flatten_unprotected(
+                                symbol,
+                                position,
+                                reduce_ratio=repair_fail_reduce_ratio,
+                            )
+                            print(
+                                f"   🧯 SLA超时强平: status={close_res.get('status')} "
+                                f"detail={close_res.get('message') or close_res.get('order')}"
+                            )
+                            self._emit_protection_sla_alert(
+                                symbol=symbol,
+                                side=side,
+                                detail="protection_sla_force_flatten",
+                                extra={"flatten": close_res, "force_meta": force_meta},
+                            )
+                        else:
+                            print(
+                                f"   🛡️ SLA超时但保留仓位: "
+                                f"pnl={self._to_float(force_meta.get('unrealized_pnl_ratio'), 0.0):+.4f}, "
+                                f"grace={self._to_float(force_meta.get('pnl_grace_threshold'), 0.0):+.4f}, "
+                                f"api_ok={1 if bool(force_meta.get('api_health_ok', True)) else 0}"
+                            )
+                            self._emit_protection_sla_alert(
+                                symbol=symbol,
+                                side=side,
+                                detail="protection_sla_grace_hold",
+                                extra={"force_meta": force_meta},
+                            )
                 # 风险修复优先，本轮不再对该 symbol 发起新决策
                 continue
             completed_without_skip = True
@@ -7225,6 +7602,17 @@ class TradingBot:
                 decision = ai_decision
             decision_md_raw = getattr(decision, "metadata", None)
             decision_md: Dict[str, Any] = decision_md_raw if isinstance(decision_md_raw, dict) else {}
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                self._record_alpha_dilution_stage(
+                    "v2_engine_raw",
+                    symbol,
+                    {
+                        "operation": decision.operation.value,
+                        "signal_score": self._to_float(decision_md.get("signal_score"), 0.0),
+                        "vwap_score": self._to_float(decision_md.get("vwap_score"), 0.0),
+                        "engine": str(decision_md.get("engine") or decision_md.get("regime") or ""),
+                    },
+                )
             if (not allow_entry_window) and decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                 if not isinstance(position, dict):
                     window_reason = str(entry_window_state.get("reason") or "entry_window_block")
@@ -7272,6 +7660,15 @@ class TradingBot:
                         }
                     except Exception as e:
                         print(f"⚠️ {symbol} MA10+MACD 共振特征计算失败：{e}")
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                self._record_alpha_dilution_stage(
+                    "after_entry_window",
+                    symbol,
+                    {
+                        "operation": decision.operation.value,
+                        "window_allowed": bool(allow_entry_window),
+                    },
+                )
             engine_override_raw = decision_md.get("params_override")
             engine_override: Dict[str, Any] = (
                 engine_override_raw if isinstance(engine_override_raw, dict) else {}
@@ -7395,11 +7792,28 @@ class TradingBot:
                             f"edge={edge_obj.get('reason')}"
                         )
                         continue
+                    self._record_alpha_dilution_stage(
+                        "after_signal_pool",
+                        symbol,
+                        {
+                            "operation": decision.operation.value,
+                            "pool_id": trigger_context.get("signal_pool_id"),
+                        },
+                    )
             
             decision = self._apply_ma10_macd_entry_filter(symbol, decision)
             decision_md_candidate = getattr(decision, "metadata", None)
             if isinstance(decision_md_candidate, dict):
                 decision_md = decision_md_candidate
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                self._record_alpha_dilution_stage(
+                    "after_ma10_macd",
+                    symbol,
+                    {
+                        "operation": decision.operation.value,
+                        "score_delta": decision_md.get("ma10_macd_score_delta"),
+                    },
+                )
             decision, gate_meta = self._apply_pretrade_risk_gate(
                 symbol=symbol,
                 decision=decision,
@@ -7419,6 +7833,16 @@ class TradingBot:
                     )
                 print(
                     f"🧭 {symbol} 前置风控Gate: action={gate_action}{extra}"
+                )
+            if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                self._record_alpha_dilution_stage(
+                    "after_pretrade_gate",
+                    symbol,
+                    {
+                        "operation": decision.operation.value,
+                        "gate_action": gate_action,
+                        "projected_equity_usage": self._to_float(gate_meta.get("projected_equity_usage"), 0.0),
+                    },
                 )
             if risk_guard_enabled and self._is_cooldown_active() and decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                 print(
@@ -8159,6 +8583,7 @@ class TradingBot:
             
                 if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                     local_entry_score = self._decision_signal_score(decision, flow_context)
+                    ai_review_enforced = bool(ai_review_cfg.get("enabled", True))
                     allow_same_side_add, block_reason = self._ai_entry_guard(
                         decision=decision,
                         local_score=local_entry_score,
@@ -8167,11 +8592,16 @@ class TradingBot:
                         position=position,
                     )
                     if not allow_same_side_add:
+                        if ai_review_enforced:
+                            print(
+                                f"⏭️ {symbol} 同向加仓被拦截: "
+                                f"reason={block_reason}"
+                            )
+                            continue
                         print(
-                            f"⏭️ {symbol} 同向加仓被拦截: "
+                            f"🤖 {symbol} AI终审仅记录(未拦截): "
                             f"reason={block_reason}"
                         )
-                        continue
             
                     remaining = max(0.0, float(local_max_symbol_position_portion) - float(current_portion))
                     if remaining < min_open_portion:
@@ -8420,6 +8850,7 @@ class TradingBot:
         ai_review_mode = str(context.get("ai_review_mode") or "disabled").lower()
         ai_flat_top_n = max(1, int(self._to_float(ai_review_cfg.get("flat_top_n", 2), 2)))
         ai_review_flat_enabled = self._ai_review_mode_supports_flat_candidates(ai_review_mode)
+        ai_review_enforced = bool(ai_review_cfg.get("enabled", True))
 
         def _item_decision(item: Dict[str, Any]) -> Optional[FundFlowDecision]:
             decision_raw = item.get("decision")
@@ -8557,8 +8988,9 @@ class TradingBot:
                         local_md = (
                             decision_i.metadata if isinstance(getattr(decision_i, "metadata", None), dict) else {}
                         )
+                        review_mode = "enforced" if ai_review_enforced else "log_only"
                         local_md["ai_final_review"] = {
-                            "mode": "advisory",
+                            "mode": review_mode,
                             "shortlist_rank": shortlist_rank,
                             "candidate_rank": rank,
                             "local_operation": decision_i.operation.value,
@@ -8570,7 +9002,15 @@ class TradingBot:
                             "ds_confidence": ai_conf,
                         }
                         decision_i.metadata = local_md
-                        if ai_decision.operation != decision_i.operation:
+                        if not ai_review_enforced:
+                            print(
+                                f"🤖 {symbol_i} AI终审仅记录: rank={rank} shortlist={shortlist_rank} "
+                                f"local={decision_i.operation.value.upper()} "
+                                f"ai={ai_decision.operation.value.upper()} "
+                                f"reason={block_reason or '-'} "
+                                f"source={ai_source} conf={ai_conf:.3f}"
+                            )
+                        elif ai_decision.operation != decision_i.operation:
                             print(
                                 f"🤖 {symbol_i} AI终审建议: rank={rank} shortlist={shortlist_rank} "
                                 f"local={decision_i.operation.value.upper()} "
@@ -8597,11 +9037,23 @@ class TradingBot:
                                 f"action={ai_decision.operation.value.upper()} "
                                 f"source={ai_source} conf={ai_conf:.3f}"
                             )
-                    else:
-                        print(
-                            f"🤖 {symbol_i} 未进入AI终审: rank={rank} shortlist={shortlist_rank} "
-                            f"local={decision_i.operation.value.upper()}"
-                        )
+                else:
+                    print(
+                        f"🤖 {symbol_i} 未进入AI终审: rank={rank} shortlist={shortlist_rank} "
+                        f"local={decision_i.operation.value.upper()}"
+                    )
+                if decision_i.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                    self._record_alpha_dilution_stage(
+                        "after_capacity_check",
+                        symbol_i,
+                        {
+                            "operation": decision_i.operation.value,
+                            "candidate_rank": rank,
+                            "shortlist_rank": shortlist_rank,
+                            "active_count": active_count,
+                            "max_active_symbols": item_max_active_symbols,
+                        },
+                    )
                 self._execute_and_log_decision(
                     symbol=symbol_i,
                     decision=decision_i,

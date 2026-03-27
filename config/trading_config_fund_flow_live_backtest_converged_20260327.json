@@ -92,7 +92,7 @@
     "close_threshold": 0.3,
     "entry_slippage": 0.0015,
     "stop_loss_pct": 0.02,
-    "take_profit_pct": 0.04,
+    "take_profit_pct": 0.02,
     "reverse_close_confirm_bars": 2,
     "breakeven_enabled": true,
     "breakeven_trigger_pnl_ratio": 0.008,
@@ -193,9 +193,9 @@
       },
       "scoring_weights": {
         "weight_1h_direction": 0.00,
-        "weight_4h_direction": 0.55,
+        "weight_4h_direction": 0.50,
         "weight_vwap": 0.20,
-        "weight_15m_entry": 0.05,
+        "weight_15m_entry": 0.10,
         "weight_volume": 0.20
       },
       "entry_thresholds": {
@@ -204,7 +204,7 @@
         "min_signal_score": 0.850,
         "stable_bear_continuation_min_signal_score": 0.820,
         "stable_bull_continuation_min_signal_score": 0.820,
-        "red_bar_growing": 0.86,
+        "red_bar_growing": 0.850,
         "flip_bearish": 0.840,
         "flip_bullish": 0.840
       },
@@ -217,9 +217,9 @@
         "green_bar_growing_short_min_adx_1h": 35.0,
         "green_bar_growing_short_max_adx_1h": 45.0,
         "enable_4h_preflip_trial_entries": true,
-        "preflip_trial_min_shrink_pct_long": 0.6,
+        "preflip_trial_min_shrink_pct_long": 0.75,
         "preflip_trial_min_shrink_pct_short": 0.30,
-        "preflip_trial_min_signal_score": 0.75,
+        "preflip_trial_min_signal_score": 0.77,
         "preflip_trial_min_vwap_score": 0.06,
         "preflip_trial_entry_scale": 0.35,
         "preflip_trial_max_leverage": 2,
@@ -238,7 +238,7 @@
         "stable_bull_continuation_min_adx_1h": 30.0,
         "stable_bull_continuation_min_4h_bars": 2,
         "enable_flip_bullish_strict_filter": true,
-        "disable_flip_bullish_entries": false,
+        "disable_flip_bullish_entries": true,
         "flip_bullish_min_vwap_score": 0.12,
         "flip_bullish_require_pullback_bounce": true,
         "flip_bullish_require_15m_growing": true,
@@ -254,14 +254,13 @@
         "flip_bearish_max_bb_middle_slope_4h": 0.0005,
         "bb_slope_lookback_1h": 3,
         "bb_slope_lookback_4h": 2,
-        "disable_red_bar_growing_long_entries": false,
-        "disable_green_bar_growing_entries": false,
+        "disable_red_bar_growing_long_entries": true,
+        "disable_green_bar_growing_entries": true,
         "disable_green_bar_shrinking_short_dual_pressure_entries": true,
         "disable_red_bar_shrinking_long_dual_support_entries": true,
         "min_signal_score": 0.850,
-        "min_vwap_score_for_entry": 0.14,
-        "symbol_signal_overrides": [],
-        "soft_15m_entry_score": 0.3
+        "min_vwap_score_for_entry": 0.1,
+        "symbol_signal_overrides": []
       },
       "penalty_config": {
         "overheat_growing_penalty": 0.12,
@@ -276,8 +275,8 @@
         "vwap_alert_deviation": 0.005,
         "enable_4h_shrink_exit": true,
         "exit_4h_shrink_bars": 2,
-        "exit_4h_min_shrink_pct": 0.15,
-        "exit_4h_require_profit": false,
+        "exit_4h_min_shrink_pct": 0.20,
+        "exit_4h_require_profit": true,
         "enable_stable_continuation_slow_4h_shrink_exit": true,
         "stable_continuation_exit_4h_shrink_bars": 3,
         "stable_continuation_exit_4h_min_shrink_pct": 0.35
@@ -328,43 +327,20 @@
           {
             "utc_start": "03:00",
             "utc_end": "05:30",
-            "position_scale": 0.6
+            "position_scale": 0.70
           },
           {
             "utc_start": "14:30",
             "utc_end": "16:00",
-            "position_scale": 0.55
+            "position_scale": 0.65
           }
         ],
-          "apply_to_states": [
-            "short_dual_pressure",
-            "flip_bullish",
-            "long_dual_support"
-          ]
-        },
-        "vwap_score_position_tiers": {
-          "apply_to_states": [
-            "long_dual_support"
-          ],
-          "tiers": [
-            {
-              "min": 0.12,
-              "max": 0.2,
-              "position_mult": 0.75
-            },
-            {
-              "min": 0.2,
-              "max": 0.3,
-              "position_mult": 0.95
-            },
-            {
-              "min": 0.3,
-              "max": 1.0,
-              "position_mult": 1.05
-            }
-          ]
-        }
+        "apply_to_states": [
+          "short_dual_pressure",
+          "flip_bullish"
+        ]
       }
+    }
   },
   "schedule": {
     "enabled": true,
@@ -403,9 +379,9 @@
     "real_time_monitoring": true
   },
   "_metadata": {
-    "version": "3.1_macd_v2_baseline132_hybrid_live_tp4_20260327",
+    "version": "3.1_macd_v2_baseline_live_backtest_converged_20260327",
     "created_at": "2026-03-23T11:30:00Z",
-    "description": "实盘部署配置 - 当前 live 框架下回填 baseline_132 的有效策略参数，并将止盈改为4%、止损保持2%",
+    "description": "按当前实盘 production 参数复制的 30 天回测配置，用于评估收敛后 live 参数在策略级回测中的表现",
     "key_changes": [
       "策略段对齐到 2026-03-23 验证通过的 MACD V2 基线配置",
       "新增 shrinking-state 亏损口袋过滤: 禁做 green_bar_shrinking+short_dual_pressure",
