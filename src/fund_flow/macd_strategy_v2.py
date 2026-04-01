@@ -56,10 +56,16 @@ def check_pocket_entry_override(
 
     bar_1h_direction = str(bar_1h_direction or "").strip().upper()
     if pocket_cfg.get("require_strict_1h_confirmation", False):
-        allowed = {"BULLISH", "WEAKLY_BULLISH"}
+        strict_direction = str(pocket_cfg.get("strict_1h_direction", "bullish") or "bullish").strip().lower()
+        if strict_direction == "bearish":
+            allowed = {"BEARISH", "WEAKLY_BEARISH"}
+            reason_key = "1H_NOT_BEARISH"
+        else:
+            allowed = {"BULLISH", "WEAKLY_BULLISH"}
+            reason_key = "1H_NOT_BULLISH"
         if bar_1h_direction not in allowed:
             return False, (
-                f"POCKET_GATE[{pocket_key}]:1H_NOT_BULLISH "
+                f"POCKET_GATE[{pocket_key}]:{reason_key} "
                 f"bar_1h_direction={bar_1h_direction} "
                 f"allowed={sorted(allowed)}"
             )

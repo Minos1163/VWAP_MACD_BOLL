@@ -310,3 +310,361 @@ def test_check_stops_applies_partial_4h_shrink_loss_mitigation() -> None:
     assert "SOLUSDT" in engine.positions
     assert engine.positions["SOLUSDT"]["remaining_fraction"] == pytest.approx(0.4, rel=1e-9)
     assert engine.trades[-1]["reason"] == "4h_shrink_reduce"
+
+
+def test_same_bar_tp1_before_stop_mode_realizes_tp1_then_stops_remainder() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        same_bar_tp_priority_mode="tp1_before_stop",
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.positions["SOLUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 2000.0,
+        "position_value": 400.0,
+        "margin": 400.0,
+        "initial_margin": 400.0,
+        "remaining_fraction": 1.0,
+        "leverage": 5,
+        "stop_price": 99.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": False},
+            {"price": 101.2, "reduce_pct": 0.30, "filled": False},
+            {"price": 102.0, "reduce_pct": 0.20, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-01 00:00:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+    }
+    analysis = {
+        "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "row_15m": pd.Series({"open": 100.1, "high": 101.3, "low": 98.9, "close": 99.4}),
+        "price": 99.4,
+        "time": pd.Timestamp("2026-03-01 00:15:00"),
+    }
+
+    closed = engine.check_stops("SOLUSDT", analysis)
+
+    assert closed is True
+    assert "SOLUSDT" not in engine.positions
+    assert len(engine.trades) == 2
+    assert engine.trades[0]["reason"] == "take_profit_level_intrabar"
+    assert engine.trades[0]["pnl_pct"] == pytest.approx(0.8, rel=1e-9)
+    assert engine.trades[1]["reason"] == "stop_loss_intrabar_after_tp1_same_bar"
+
+
+def test_same_bar_stop_first_mode_preserves_existing_behavior() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        same_bar_tp_priority_mode="stop_first",
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.positions["SOLUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 2000.0,
+        "position_value": 400.0,
+        "margin": 400.0,
+        "initial_margin": 400.0,
+        "remaining_fraction": 1.0,
+        "leverage": 5,
+        "stop_price": 99.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": False},
+            {"price": 101.2, "reduce_pct": 0.30, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-01 00:00:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+    }
+    analysis = {
+        "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "row_15m": pd.Series({"open": 100.1, "high": 101.3, "low": 98.9, "close": 99.4}),
+        "price": 99.4,
+        "time": pd.Timestamp("2026-03-01 00:15:00"),
+    }
+
+    closed = engine.check_stops("SOLUSDT", analysis)
+
+    assert closed is True
+    assert "SOLUSDT" not in engine.positions
+    assert len(engine.trades) == 1
+    assert engine.trades[0]["reason"] == "stop_loss_intrabar"
+
+
+def test_partial_aware_breakeven_delays_trigger_before_any_partial() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=True,
+        breakeven_trigger_pnl_ratio=0.012,
+        breakeven_lock_ratio=0.0025,
+        partial_aware_breakeven_enabled=True,
+        partial_aware_no_partial_trigger_pnl_ratio=0.015,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.positions["SOLUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 2000.0,
+        "position_value": 400.0,
+        "margin": 400.0,
+        "initial_margin": 400.0,
+        "remaining_fraction": 1.0,
+        "leverage": 5,
+        "stop_price": 98.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": False},
+            {"price": 101.2, "reduce_pct": 0.30, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-01 00:00:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+        "breakeven_trigger_pnl_ratio": 0.012,
+        "breakeven_lock_ratio": 0.0025,
+    }
+    analysis = {
+        "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "row_15m": pd.Series({"open": 100.2, "high": 101.3, "low": 100.5, "close": 101.0}),
+        "price": 101.0,
+        "time": pd.Timestamp("2026-03-01 00:15:00"),
+    }
+
+    closed = engine.check_stops("SOLUSDT", analysis)
+
+    assert closed is False
+    assert engine.positions["SOLUSDT"]["stop_price"] == pytest.approx(98.0, rel=1e-9)
+
+
+def test_partial_aware_breakeven_reverts_to_base_after_partial() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=True,
+        breakeven_trigger_pnl_ratio=0.012,
+        breakeven_lock_ratio=0.0025,
+        partial_aware_breakeven_enabled=True,
+        partial_aware_no_partial_trigger_pnl_ratio=0.015,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.positions["SOLUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 2000.0,
+        "position_value": 300.0,
+        "margin": 300.0,
+        "initial_margin": 400.0,
+        "remaining_fraction": 0.75,
+        "leverage": 5,
+        "stop_price": 98.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": True},
+            {"price": 101.2, "reduce_pct": 0.30, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-01 00:00:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+        "breakeven_trigger_pnl_ratio": 0.012,
+        "breakeven_lock_ratio": 0.0025,
+    }
+    analysis = {
+        "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "row_15m": pd.Series({"open": 100.2, "high": 101.3, "low": 100.5, "close": 101.0}),
+        "price": 101.0,
+        "time": pd.Timestamp("2026-03-01 00:15:00"),
+    }
+
+    closed = engine.check_stops("SOLUSDT", analysis)
+
+    assert closed is False
+    assert engine.positions["SOLUSDT"]["stop_price"] == pytest.approx(100.25, rel=1e-9)
+
+
+def test_runner_only_trailing_blocks_trailing_before_any_partial() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        trailing_stop_enabled=True,
+        runner_only_trailing_enabled=True,
+        runner_only_trailing_min_completed_levels=1,
+    )
+    runtime_cfg = {
+        "fund_flow": {
+            "trailing_stop_profiles": {
+                "trend": {
+                    "activation_pnl_ratio": 0.006,
+                    "atr_multiplier": 0.5,
+                    "min_distance_pct": 0.004,
+                    "max_distance_pct": 0.008,
+                }
+            },
+            "trailing_stop_profile_map": {
+                "_default": "trend",
+            },
+        }
+    }
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config=runtime_cfg)
+    engine.positions["SOLUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 1600.0,
+        "position_value": 800.0,
+        "margin": 800.0,
+        "initial_margin": 800.0,
+        "remaining_fraction": 1.0,
+        "leverage": 2,
+        "stop_price": 98.8,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-01 00:00:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+    }
+    analysis = {
+        "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "row_15m": pd.Series({"open": 100.3, "high": 100.9, "low": 100.55, "close": 100.7, "atr": 0.2}),
+        "price": 100.7,
+        "time": pd.Timestamp("2026-03-01 00:15:00"),
+    }
+
+    closed = engine.check_stops("SOLUSDT", analysis)
+
+    assert closed is False
+    assert engine.positions["SOLUSDT"]["stop_price"] == pytest.approx(98.8, rel=1e-9)
+    assert not engine.positions["SOLUSDT"].get("trailing_stop")
+
+
+def test_runner_only_trailing_allows_trailing_after_partial() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        trailing_stop_enabled=True,
+        runner_only_trailing_enabled=True,
+        runner_only_trailing_min_completed_levels=1,
+    )
+    runtime_cfg = {
+        "fund_flow": {
+            "trailing_stop_profiles": {
+                "trend": {
+                    "activation_pnl_ratio": 0.006,
+                    "atr_multiplier": 0.5,
+                    "min_distance_pct": 0.004,
+                    "max_distance_pct": 0.008,
+                }
+            },
+            "trailing_stop_profile_map": {
+                "_default": "trend",
+            },
+        }
+    }
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config=runtime_cfg)
+    engine.positions["SOLUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 1200.0,
+        "position_value": 600.0,
+        "margin": 600.0,
+        "initial_margin": 800.0,
+        "remaining_fraction": 0.75,
+        "leverage": 2,
+        "stop_price": 98.8,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": True},
+            {"price": 101.2, "reduce_pct": 0.30, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-01 00:00:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+    }
+    analysis = {
+        "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "row_15m": pd.Series({"open": 100.3, "high": 100.9, "low": 100.55, "close": 100.7, "atr": 0.2}),
+        "price": 100.7,
+        "time": pd.Timestamp("2026-03-01 00:15:00"),
+    }
+
+    closed = engine.check_stops("SOLUSDT", analysis)
+
+    assert closed is False
+    assert engine.positions["SOLUSDT"]["trailing_stop"] == pytest.approx(100.4964, rel=1e-9)
+    assert engine.positions["SOLUSDT"]["stop_price"] == pytest.approx(100.4964, rel=1e-9)

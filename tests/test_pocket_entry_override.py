@@ -22,6 +22,17 @@ E2_VWAP_OVERRIDES = {
     "long_dual_support": {"position_scale_override": 0.80}
 }
 
+BEARISH_OVERRIDES = {
+    "red_bar_growing|short_dual_pressure": {
+        "require_strict_1h_confirmation": True,
+        "strict_1h_direction": "bearish",
+        "min_signal_score": 0.88,
+        "min_vwap_score": 0.155,
+        "require_cvd_ok": True,
+        "require_cvd_momentum_ok": True,
+    }
+}
+
 PASS_KWARGS = dict(
     signal_type="red_bar_growing",
     vwap_state="long_dual_support",
@@ -129,3 +140,37 @@ def test_vwap_structure_scale_long_dual_support():
 def test_vwap_structure_scale_unknown_returns_one():
     scale = get_vwap_structure_position_scale("short_dual_pressure", E2_VWAP_OVERRIDES)
     assert scale == 1.0, f"Expected 1.0, got {scale}"
+
+
+def test_strict_1h_direction_bearish_blocks_bullish_bar():
+    passed, reason = check_pocket_entry_override(
+        signal_type="red_bar_growing",
+        vwap_state="short_dual_pressure",
+        is_trial_entry=False,
+        signal_score=0.90,
+        vwap_score=0.16,
+        entry_score=0.55,
+        bar_1h_direction="BULLISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides=BEARISH_OVERRIDES,
+    )
+    assert not passed
+    assert "1H_NOT_BEARISH" in reason
+
+
+def test_strict_1h_direction_bearish_accepts_bearish_bar():
+    passed, reason = check_pocket_entry_override(
+        signal_type="red_bar_growing",
+        vwap_state="short_dual_pressure",
+        is_trial_entry=False,
+        signal_score=0.90,
+        vwap_score=0.16,
+        entry_score=0.55,
+        bar_1h_direction="BEARISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides=BEARISH_OVERRIDES,
+    )
+    assert passed, reason
+    assert "PASS" in reason

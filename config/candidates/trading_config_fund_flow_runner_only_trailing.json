@@ -551,16 +551,6 @@
             "min_vwap_score": 0.18,
             "require_cvd_ok": true,
             "require_strict_1h_confirmation": true
-          },
-          "red_bar_growing|short_dual_pressure": {
-            "label": "sdp_red_structural_gate",
-            "allow_neutral_1h_confirmation": false,
-            "require_strict_1h_confirmation": true,
-            "strict_1h_direction": "bearish",
-            "min_signal_score": 0.88,
-            "min_vwap_score": 0.155,
-            "require_cvd_ok": true,
-            "require_cvd_momentum_ok": true
           }
         }
       },

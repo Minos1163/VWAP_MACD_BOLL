@@ -84,6 +84,11 @@ class BacktestConfig:
     trailing_stop_atr_multiplier: float = 0.0
     trailing_stop_min_distance: float = 0.0
     trailing_stop_max_distance: float = 0.0
+    same_bar_tp_priority_mode: str = "stop_first"
+    partial_aware_breakeven_enabled: bool = False
+    partial_aware_no_partial_trigger_pnl_ratio: float = 0.0
+    runner_only_trailing_enabled: bool = False
+    runner_only_trailing_min_completed_levels: int = 0
     shrink_exit_loss_mitigation_enabled: bool = False
     shrink_exit_loss_mitigation_pnl_threshold: float = -0.005
     shrink_exit_loss_mitigation_exit_ratio: float = 0.60
@@ -387,6 +392,34 @@ def build_backtest_config(
         trailing_stop_atr_multiplier=float(fund_flow_cfg.get("trailing_stop_atr_multiplier", 0.0) or 0.0),
         trailing_stop_min_distance=float(fund_flow_cfg.get("trailing_stop_min_distance", 0.0) or 0.0),
         trailing_stop_max_distance=float(fund_flow_cfg.get("trailing_stop_max_distance", 0.0) or 0.0),
+        same_bar_tp_priority_mode=str(
+            ((fund_flow_cfg.get("backtest", {}) or {}).get("same_bar_tp_priority_mode", "stop_first"))
+            if isinstance(fund_flow_cfg.get("backtest"), dict)
+            else "stop_first"
+        ).strip().lower() or "stop_first",
+        partial_aware_breakeven_enabled=bool(
+            ((fund_flow_cfg.get("backtest", {}) or {}).get("partial_aware_breakeven_enabled", False))
+            if isinstance(fund_flow_cfg.get("backtest"), dict)
+            else False
+        ),
+        partial_aware_no_partial_trigger_pnl_ratio=float(
+            ((fund_flow_cfg.get("backtest", {}) or {}).get("partial_aware_no_partial_trigger_pnl_ratio", 0.0))
+            if isinstance(fund_flow_cfg.get("backtest"), dict)
+            else 0.0
+        ),
+        runner_only_trailing_enabled=bool(
+            ((fund_flow_cfg.get("backtest", {}) or {}).get("runner_only_trailing_enabled", False))
+            if isinstance(fund_flow_cfg.get("backtest"), dict)
+            else False
+        ),
+        runner_only_trailing_min_completed_levels=max(
+            0,
+            int(
+                ((fund_flow_cfg.get("backtest", {}) or {}).get("runner_only_trailing_min_completed_levels", 0))
+                if isinstance(fund_flow_cfg.get("backtest"), dict)
+                else 0
+            ),
+        ),
         entry_slippage=float(fund_flow_cfg.get("entry_slippage", 0.0015)),
         entry_time_in_force=str(fund_flow_cfg.get("backtest_entry_time_in_force", "IOC")).upper(),
         gtc_expire_bars=max(0, int(fund_flow_cfg.get("backtest_gtc_expire_bars", 0) or 0)),
@@ -1897,6 +1930,41 @@ class BacktestEngine:
             elif self.config.gtc_expire_bars > 0 and int(order['bars_waited']) >= self.config.gtc_expire_bars:
                 self._cancel_pending_order(symbol, reason="gtc_timeout")
         return filled_symbols
+
+    def _resolve_effective_breakeven_trigger(self, pos: dict) -> float:
+        base_trigger = float(pos.get('breakeven_trigger_pnl_ratio', self.config.breakeven_trigger_pnl_ratio) or 0.0)
+        if not bool(getattr(self.config, "partial_aware_breakeven_enabled", False)):
+            return base_trigger
+        no_partial_trigger = float(getattr(self.config, "partial_aware_no_partial_trigger_pnl_ratio", 0.0) or 0.0)
+        if no_partial_trigger <= 0:
+            return base_trigger
+        levels = pos.get('take_profit_levels') or []
+        if not levels:
+            return base_trigger
+        has_completed_partial = any(
+            bool(level.get('filled'))
+            for level in levels
+            if isinstance(level, dict)
+        )
+        if has_completed_partial:
+            return base_trigger
+        return max(base_trigger, no_partial_trigger)
+
+    def _runner_only_trailing_ready(self, pos: dict) -> bool:
+        if not bool(getattr(self.config, "runner_only_trailing_enabled", False)):
+            return True
+        required_levels = max(0, int(getattr(self.config, "runner_only_trailing_min_completed_levels", 0) or 0))
+        if required_levels <= 0:
+            return True
+        levels = pos.get('take_profit_levels') or []
+        if not levels:
+            return True
+        completed_levels = sum(
+            1
+            for level in levels
+            if isinstance(level, dict) and bool(level.get('filled'))
+        )
+        return completed_levels >= required_levels
     
     def check_stops(self, symbol: str, analysis: dict) -> bool:
         """用同一根15m的OHLC近似 intrabar 触发，返回是否已平仓"""
@@ -1919,7 +1987,7 @@ class BacktestEngine:
         
         # 保本止损：与实盘配置对齐
         if self.config.breakeven_enabled:
-            breakeven_trigger = float(pos.get('breakeven_trigger_pnl_ratio', self.config.breakeven_trigger_pnl_ratio))
+            breakeven_trigger = self._resolve_effective_breakeven_trigger(pos)
             breakeven_lock = float(pos.get('breakeven_lock_ratio', self.config.breakeven_lock_ratio))
             if pos['side'] == 'long':
                 best_pnl_pct = (high_price - pos['entry_price']) / pos['entry_price']
@@ -1938,7 +2006,7 @@ class BacktestEngine:
 
         trailing_profile = self._resolve_trailing_profile(pos)
         activation_pnl_ratio = float(trailing_profile.get("activation_pnl_ratio", 0.0) or 0.0)
-        if activation_pnl_ratio > 0:
+        if activation_pnl_ratio > 0 and self._runner_only_trailing_ready(pos):
             if pos['side'] == 'long':
                 best_pnl_pct = (high_price - pos['entry_price']) / pos['entry_price']
             else:
@@ -1973,18 +2041,10 @@ class BacktestEngine:
         else:
             stop_hit = high_price >= pos['stop_price']
             target_hit = pos['take_profit'] is not None and low_price <= pos['take_profit']
-        
-        if stop_hit:
-            exit_price = self._stop_fill_price(pos, row, pos['stop_price'])
-            reason = "stop_loss_intrabar"
-            if target_hit:
-                reason = "stop_loss_intrabar_both_hit"
-            self.close_position(symbol, exit_price, time, reason)
-            return True
 
         tp_levels = pos.get('take_profit_levels') or []
+        hit_levels: List[dict] = []
         if tp_levels:
-            hit_levels: List[dict] = []
             for level in tp_levels:
                 if not isinstance(level, dict) or bool(level.get('filled')):
                     continue
@@ -2000,23 +2060,58 @@ class BacktestEngine:
                     hit_levels.sort(key=lambda item: float(item.get('price', 0.0)))
                 else:
                     hit_levels.sort(key=lambda item: float(item.get('price', 0.0)), reverse=True)
-                for level in hit_levels:
-                    if symbol not in self.positions:
-                        break
-                    level_price = float(level.get('price', 0.0) or 0.0)
-                    reduce_pct_original = max(0.0, min(1.0, float(level.get('reduce_pct', 0.0) or 0.0)))
-                    if reduce_pct_original <= 0:
-                        continue
-                    exit_price = self._target_fill_price(self.positions[symbol], row, level_price)
-                    self.close_position(
-                        symbol,
-                        exit_price,
-                        time,
-                        "take_profit_level_intrabar",
-                        reduce_pct_original=reduce_pct_original,
-                    )
-                    level['filled'] = True
-                return symbol not in self.positions
+
+        same_bar_tp_priority_mode = str(getattr(self.config, "same_bar_tp_priority_mode", "stop_first") or "stop_first").lower()
+        if stop_hit and hit_levels and same_bar_tp_priority_mode == "tp1_before_stop":
+            first_level = hit_levels[0]
+            reduce_pct_original = max(0.0, min(1.0, float(first_level.get('reduce_pct', 0.0) or 0.0)))
+            if reduce_pct_original > 0:
+                level_price = float(first_level.get('price', 0.0) or 0.0)
+                exit_price = self._target_fill_price(pos, row, level_price)
+                self.close_position(
+                    symbol,
+                    exit_price,
+                    time,
+                    "take_profit_level_intrabar",
+                    reduce_pct_original=reduce_pct_original,
+                )
+                first_level['filled'] = True
+                if symbol not in self.positions:
+                    return True
+                pos = self.positions[symbol]
+                stop_exit_price = self._stop_fill_price(pos, row, pos['stop_price'])
+                stop_reason = "stop_loss_intrabar_after_tp1_same_bar"
+                if target_hit:
+                    stop_reason = "stop_loss_intrabar_both_hit_after_tp1_same_bar"
+                self.close_position(symbol, stop_exit_price, time, stop_reason)
+                return True
+        
+        if stop_hit:
+            exit_price = self._stop_fill_price(pos, row, pos['stop_price'])
+            reason = "stop_loss_intrabar"
+            if target_hit:
+                reason = "stop_loss_intrabar_both_hit"
+            self.close_position(symbol, exit_price, time, reason)
+            return True
+
+        if hit_levels:
+            for level in hit_levels:
+                if symbol not in self.positions:
+                    break
+                level_price = float(level.get('price', 0.0) or 0.0)
+                reduce_pct_original = max(0.0, min(1.0, float(level.get('reduce_pct', 0.0) or 0.0)))
+                if reduce_pct_original <= 0:
+                    continue
+                exit_price = self._target_fill_price(self.positions[symbol], row, level_price)
+                self.close_position(
+                    symbol,
+                    exit_price,
+                    time,
+                    "take_profit_level_intrabar",
+                    reduce_pct_original=reduce_pct_original,
+                )
+                level['filled'] = True
+            return symbol not in self.positions
 
         if target_hit:
             exit_price = self._target_fill_price(pos, row, float(pos['take_profit']))

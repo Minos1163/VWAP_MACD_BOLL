@@ -251,7 +251,7 @@
     ],
     "reverse_close_confirm_bars": 2,
     "breakeven_enabled": true,
-    "breakeven_trigger_pnl_ratio": 0.012,
+    "breakeven_trigger_pnl_ratio": 0.015,
     "breakeven_lock_ratio": 0.0025,
     "fast_exit_enabled": true,
     "fast_exit_direction_lock_bars": 2,
@@ -551,16 +551,6 @@
             "min_vwap_score": 0.18,
             "require_cvd_ok": true,
             "require_strict_1h_confirmation": true
-          },
-          "red_bar_growing|short_dual_pressure": {
-            "label": "sdp_red_structural_gate",
-            "allow_neutral_1h_confirmation": false,
-            "require_strict_1h_confirmation": true,
-            "strict_1h_direction": "bearish",
-            "min_signal_score": 0.88,
-            "min_vwap_score": 0.155,
-            "require_cvd_ok": true,
-            "require_cvd_momentum_ok": true
           }
         }
       },
@@ -674,11 +664,6 @@
       "long_dual_support": {
         "position_scale_override": 0.8
       }
-    },
-    "backtest": {
-      "same_bar_tp_priority_mode": "tp1_before_stop",
-      "runner_only_trailing_enabled": true,
-      "runner_only_trailing_min_completed_levels": 1
     }
   },
   "schedule": {
