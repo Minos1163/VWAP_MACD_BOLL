@@ -183,3 +183,46 @@ def test_open_respects_entry_tif_override_gtc(tmp_path: Path):
     assert result["status"] == "pending"
     assert len(client.calls) == 1
     assert client.calls[0]["params"]["timeInForce"] == "GTC"
+
+
+def test_open_blocks_when_nominal_risk_exceeds_hard_limit(tmp_path: Path):
+    client = _FakeClient(
+        responses=[
+            {"orderId": 456, "status": "NEW"},
+        ]
+    )
+    risk = FundFlowRiskEngine(
+        {
+            "trading": {"default_leverage": 2, "max_leverage": 5},
+            "fund_flow": {
+                "min_open_portion": 0.1,
+                "max_open_portion": 1.0,
+                "max_single_trade_nominal_ratio": 0.6,
+            },
+        },
+        symbol_whitelist=["BTCUSDT"],
+    )
+    attr = FundFlowAttributionEngine(str(tmp_path))
+    router = FundFlowExecutionRouter(client, risk, attr)
+
+    decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.4,
+        leverage=2,
+        max_price=100.0,
+        take_profit_price=110.0,
+        stop_loss_price=95.0,
+        time_in_force=TimeInForce.IOC,
+    )
+    result = router.execute_decision(
+        decision=decision,
+        account_state={"available_balance": 1000.0},
+        current_price=100.0,
+        position=None,
+    )
+
+    assert result["status"] == "error"
+    assert "名义风险" in result["message"]
+    assert result["nominal_risk"]["ratio"] == 0.8
+    assert client.calls == []

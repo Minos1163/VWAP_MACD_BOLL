@@ -535,12 +535,24 @@ class FundFlowDecisionEngine:
                 flip_bullish_min_signal_score=self._to_float(thresholds_cfg.get("flip_bullish"), default_signal_threshold),
                 enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
                 disable_flip_bullish_entries=bool(filter_cfg.get("disable_flip_bullish_entries", False)),
+                disable_flip_bullish_trial_entries=bool(filter_cfg.get("disable_flip_bullish_trial_entries", False)),
                 flip_bullish_min_vwap_score=self._to_float(filter_cfg.get("flip_bullish_min_vwap_score"), 0.12),
                 flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
                 flip_bullish_require_15m_growing=bool(filter_cfg.get("flip_bullish_require_15m_growing", True)),
                 enable_flip_bullish_cvd_context_filter=bool(filter_cfg.get("enable_flip_bullish_cvd_context_filter", False)),
                 flip_bullish_max_cvd_upper_wick_ratio=self._to_float(filter_cfg.get("flip_bullish_max_cvd_upper_wick_ratio"), 0.0),
                 flip_bullish_min_cvd_1h_delta_ratio=self._to_float(filter_cfg.get("flip_bullish_min_cvd_1h_delta_ratio"), 0.0),
+                flip_bullish_trial_score_window_enabled=bool(
+                    filter_cfg.get("flip_bullish_trial_score_window_enabled", False)
+                ),
+                flip_bullish_trial_score_min=self._to_float(
+                    filter_cfg.get("flip_bullish_trial_score_min"),
+                    0.80,
+                ),
+                flip_bullish_trial_score_max=self._to_float(
+                    filter_cfg.get("flip_bullish_trial_score_max"),
+                    0.87,
+                ),
                 flip_bearish_min_ema_multiplier=self._to_float(filter_cfg.get("flip_bearish_min_boll_multiplier", filter_cfg.get("flip_bearish_min_ema_multiplier")), 0.0),
                 flip_bearish_normal_ema_min_signal_score=self._to_float(filter_cfg.get("flip_bearish_normal_boll_min_signal_score", filter_cfg.get("flip_bearish_normal_ema_min_signal_score")), 0.0),
                 flip_bearish_normal_ema_max_leverage=int(self._to_float(filter_cfg.get("flip_bearish_normal_boll_max_leverage", filter_cfg.get("flip_bearish_normal_ema_max_leverage")), 0.0)),
@@ -962,7 +974,10 @@ class FundFlowDecisionEngine:
 
     def _collect_symbol_signal_override_items(self, ff_cfg: Dict[str, Any]) -> list[Dict[str, Any]]:
         items: list[Dict[str, Any]] = []
-        raw_sources: list[Any] = [ff_cfg.get("symbol_signal_overrides")]
+        raw_sources: list[Any] = [
+            ff_cfg.get("symbol_signal_overrides"),
+            ff_cfg.get("symbol_overrides"),
+        ]
 
         v2_cfg = ff_cfg.get("macd_mtf_strategy_v2", {})
         if isinstance(v2_cfg, dict):
@@ -996,8 +1011,10 @@ class FundFlowDecisionEngine:
         result: Dict[str, Any] = {}
         for field_name in (
             "disable_flip_bullish",
+            "disable_flip_bullish_trial",
             "disable_green_bar_growing",
             "min_signal_score_override",
+            "preflip_trial_min_signal_score_override",
             "min_vwap_score_override",
         ):
             value = getattr(override, field_name, None)
@@ -1023,6 +1040,10 @@ class FundFlowDecisionEngine:
             disable_flip_bullish = bool(override.get("disable_flip_bullish"))
             if disable_flip_bullish != self.macd_v2_config.disable_flip_bullish_entries:
                 override_updates["disable_flip_bullish_entries"] = disable_flip_bullish
+        if "disable_flip_bullish_trial" in override:
+            disable_flip_bullish_trial = bool(override.get("disable_flip_bullish_trial"))
+            if disable_flip_bullish_trial != self.macd_v2_config.disable_flip_bullish_trial_entries:
+                override_updates["disable_flip_bullish_trial_entries"] = disable_flip_bullish_trial
         if "disable_green_bar_growing" in override:
             disable_green_bar_growing = bool(override.get("disable_green_bar_growing"))
             if disable_green_bar_growing != self.macd_v2_config.disable_green_bar_growing_entries:
@@ -1041,6 +1062,13 @@ class FundFlowDecisionEngine:
             )
             if min_vwap_score != self.macd_v2_config.flip_bullish_min_vwap_score:
                 override_updates["flip_bullish_min_vwap_score"] = min_vwap_score
+        if "preflip_trial_min_signal_score_override" in override:
+            preflip_trial_min_signal_score = self._to_float(
+                override.get("preflip_trial_min_signal_score_override"),
+                self.macd_v2_config.preflip_trial_min_signal_score,
+            )
+            if preflip_trial_min_signal_score != self.macd_v2_config.preflip_trial_min_signal_score:
+                override_updates["preflip_trial_min_signal_score"] = preflip_trial_min_signal_score
 
         if not override_updates:
             return self.macd_v2_engine, override

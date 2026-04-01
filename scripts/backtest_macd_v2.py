@@ -79,6 +79,15 @@ class BacktestConfig:
     breakeven_enabled: bool = True
     breakeven_trigger_pnl_ratio: float = 0.003
     breakeven_lock_ratio: float = 0.001
+    trailing_stop_enabled: bool = False
+    trailing_stop_activation_pct: float = 0.0
+    trailing_stop_atr_multiplier: float = 0.0
+    trailing_stop_min_distance: float = 0.0
+    trailing_stop_max_distance: float = 0.0
+    shrink_exit_loss_mitigation_enabled: bool = False
+    shrink_exit_loss_mitigation_pnl_threshold: float = -0.005
+    shrink_exit_loss_mitigation_exit_ratio: float = 0.60
+    shrink_exit_loss_mitigation_ignore_if_pnl_gt: float = 0.01
     max_hold_hours: float = 0.0
     entry_slippage: float = 0.0015
     entry_time_in_force: str = "IOC"
@@ -373,6 +382,11 @@ def build_backtest_config(
         breakeven_enabled=bool(fund_flow_cfg.get("breakeven_enabled", True)),
         breakeven_trigger_pnl_ratio=float(fund_flow_cfg.get("breakeven_trigger_pnl_ratio", 0.003)),
         breakeven_lock_ratio=float(fund_flow_cfg.get("breakeven_lock_ratio", 0.001)),
+        trailing_stop_enabled=bool(fund_flow_cfg.get("trailing_stop_enabled", False)),
+        trailing_stop_activation_pct=float(fund_flow_cfg.get("trailing_stop_activation_pct", 0.0) or 0.0),
+        trailing_stop_atr_multiplier=float(fund_flow_cfg.get("trailing_stop_atr_multiplier", 0.0) or 0.0),
+        trailing_stop_min_distance=float(fund_flow_cfg.get("trailing_stop_min_distance", 0.0) or 0.0),
+        trailing_stop_max_distance=float(fund_flow_cfg.get("trailing_stop_max_distance", 0.0) or 0.0),
         entry_slippage=float(fund_flow_cfg.get("entry_slippage", 0.0015)),
         entry_time_in_force=str(fund_flow_cfg.get("backtest_entry_time_in_force", "IOC")).upper(),
         gtc_expire_bars=max(0, int(fund_flow_cfg.get("backtest_gtc_expire_bars", 0) or 0)),
@@ -451,6 +465,16 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         flip_bullish_min_cvd_1h_delta_ratio=(
             0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_min_cvd_1h_delta_ratio", 0.0))
         ),
+        flip_bullish_trial_score_window_enabled=bool(
+            filter_cfg.get("flip_bullish_trial_score_window_enabled", False)
+        ),
+        flip_bullish_trial_score_min=float(filter_cfg.get("flip_bullish_trial_score_min", 0.80)),
+        flip_bullish_trial_score_max=float(filter_cfg.get("flip_bullish_trial_score_max", 0.87)),
+        green_bar_growing_score_window_enabled=bool(
+            filter_cfg.get("green_bar_growing_score_window_enabled", False)
+        ),
+        green_bar_growing_score_min=float(filter_cfg.get("green_bar_growing_score_min", 0.0)),
+        green_bar_growing_score_max=float(filter_cfg.get("green_bar_growing_score_max", 1.0)),
         flip_bearish_min_ema_multiplier=float(filter_cfg.get("flip_bearish_min_boll_multiplier", filter_cfg.get("flip_bearish_min_ema_multiplier", 0.0))),
         flip_bearish_normal_ema_min_signal_score=float(filter_cfg.get("flip_bearish_normal_boll_min_signal_score", filter_cfg.get("flip_bearish_normal_ema_min_signal_score", 0.0))),
         flip_bearish_normal_ema_max_leverage=int(float(filter_cfg.get("flip_bearish_normal_boll_max_leverage", filter_cfg.get("flip_bearish_normal_ema_max_leverage", 0.0)))),
@@ -480,6 +504,10 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         preflip_trial_min_vwap_score=float(filter_cfg.get("preflip_trial_min_vwap_score", 0.06)),
         preflip_trial_entry_scale=float(filter_cfg.get("preflip_trial_entry_scale", 0.35)),
         preflip_trial_max_leverage=int(float(filter_cfg.get("preflip_trial_max_leverage", 2))),
+        pocket_entry_overrides=copy.deepcopy(filter_cfg.get("pocket_entry_overrides", {}))
+        if isinstance(filter_cfg.get("pocket_entry_overrides"), dict) else {},
+        pocket_scoring_overrides=copy.deepcopy(v2_cfg.get("pocket_scoring_overrides", {}))
+        if isinstance(v2_cfg.get("pocket_scoring_overrides"), dict) else {},
         overheat_growing_penalty=float(penalty_cfg.get("overheat_growing_penalty", 0.12)),
         overheat_ema_multiplier_threshold=float(penalty_cfg.get("overheat_boll_multiplier_threshold", penalty_cfg.get("overheat_ema_multiplier_threshold", 1.2))),
         overheat_vwap_score_threshold=float(penalty_cfg.get("overheat_vwap_score_threshold", 0.10)),
@@ -493,6 +521,18 @@ def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
         exit_4h_min_shrink_pct=float(stop_cfg.get("exit_4h_min_shrink_pct", 0.20)),
         exit_4h_require_profit=bool(stop_cfg.get("exit_4h_require_profit", True)),
         exit_4h_weak_loss_threshold=float(stop_cfg.get("exit_4h_weak_loss_threshold", -1.0)),
+        shrink_exit_loss_mitigation_enabled=bool(
+            stop_cfg.get("shrink_exit_loss_mitigation_enabled", False)
+        ),
+        shrink_exit_loss_mitigation_pnl_threshold=float(
+            stop_cfg.get("shrink_exit_loss_mitigation_pnl_threshold", -0.005)
+        ),
+        shrink_exit_loss_mitigation_exit_ratio=float(
+            stop_cfg.get("shrink_exit_loss_mitigation_exit_ratio", 0.60)
+        ),
+        shrink_exit_loss_mitigation_ignore_if_pnl_gt=float(
+            stop_cfg.get("shrink_exit_loss_mitigation_ignore_if_pnl_gt", 0.01)
+        ),
         session_risk_control_enabled=bool(session_risk_cfg.get("enabled", False)),
         session_risk_high_risk_sessions=copy.deepcopy(session_risk_cfg.get("high_risk_sessions", [])) if isinstance(session_risk_cfg.get("high_risk_sessions"), list) else [],
         session_risk_apply_to_states=[
@@ -862,6 +902,21 @@ class BacktestEngine:
         self.runtime_config = runtime_config
         ff_cfg = runtime_config.get("fund_flow", {}) if isinstance(runtime_config.get("fund_flow"), dict) else {}
         backtest_cfg = ff_cfg.get("backtest", {}) if isinstance(ff_cfg.get("backtest"), dict) else {}
+        self.vwap_structure_overrides = (
+            ff_cfg.get("vwap_structure_overrides", {})
+            if isinstance(ff_cfg.get("vwap_structure_overrides"), dict)
+            else {}
+        )
+        self.trailing_stop_profiles = (
+            ff_cfg.get("trailing_stop_profiles", {})
+            if isinstance(ff_cfg.get("trailing_stop_profiles"), dict)
+            else {}
+        )
+        self.trailing_stop_profile_map = (
+            ff_cfg.get("trailing_stop_profile_map", {})
+            if isinstance(ff_cfg.get("trailing_stop_profile_map"), dict)
+            else {}
+        )
         self.disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
         self.signal_override_registry = create_override_registry(runtime_config)
         self.time_window_filter = TimeWindowFilter(
@@ -887,6 +942,42 @@ class BacktestEngine:
         self._consecutive_losses: int = 0
         self._loss_streak_date_utc: str = ""
         self._entry_cooldown_until: Optional[pd.Timestamp] = None
+
+    def _resolve_vwap_structure_override(self, vwap_state: object) -> Dict[str, object]:
+        state = str(vwap_state or "").strip()
+        overrides = getattr(self, "vwap_structure_overrides", {})
+        override = overrides.get(state, {}) if isinstance(overrides, dict) else {}
+        return dict(override) if isinstance(override, dict) else {}
+
+    def _resolve_trailing_profile(self, pos: dict) -> Dict[str, float]:
+        trailing_profiles = getattr(self, "trailing_stop_profiles", {})
+        trailing_profile_map = getattr(self, "trailing_stop_profile_map", {})
+        if not self.config.trailing_stop_enabled and not trailing_profiles:
+            return {}
+        key = str(
+            trailing_profile_map.get(
+                str(pos.get("vwap_state", "") or "").strip(),
+                trailing_profile_map.get(
+                    str(pos.get("signal_type_1h", "") or "").strip(),
+                    trailing_profile_map.get("_default", ""),
+                ),
+            )
+        ).strip()
+        if key:
+            profile = trailing_profiles.get(key, {})
+            if isinstance(profile, dict) and profile:
+                return {
+                    "activation_pnl_ratio": float(profile.get("activation_pnl_ratio", 0.0) or 0.0),
+                    "atr_multiplier": float(profile.get("atr_multiplier", 0.0) or 0.0),
+                    "min_distance_pct": float(profile.get("min_distance_pct", 0.0) or 0.0),
+                    "max_distance_pct": float(profile.get("max_distance_pct", 0.0) or 0.0),
+                }
+        return {
+            "activation_pnl_ratio": float(self.config.trailing_stop_activation_pct or 0.0),
+            "atr_multiplier": float(self.config.trailing_stop_atr_multiplier or 0.0),
+            "min_distance_pct": float(self.config.trailing_stop_min_distance or 0.0),
+            "max_distance_pct": float(self.config.trailing_stop_max_distance or 0.0),
+        }
 
     @staticmethod
     def _inactive_cvd_veto_context() -> dict:
@@ -930,6 +1021,16 @@ class BacktestEngine:
             updates["min_signal_score"] = float(override.min_signal_score_override)
         if override.min_vwap_score_override is not None:
             updates["flip_bullish_min_vwap_score"] = float(override.min_vwap_score_override)
+        if override.disable_long_dual_support is not None:
+            merged_pocket_overrides = copy.deepcopy(self.strategy_config.pocket_entry_overrides)
+            if not isinstance(merged_pocket_overrides, dict):
+                merged_pocket_overrides = {}
+            pocket_key = self.strategy_config.normalize_pocket_key("*", "long_dual_support")
+            pocket_override = dict(merged_pocket_overrides.get(pocket_key, {}))
+            pocket_override["disabled"] = bool(override.disable_long_dual_support)
+            pocket_override.setdefault("label", "symbol_long_dual_support_override")
+            merged_pocket_overrides[pocket_key] = pocket_override
+            updates["pocket_entry_overrides"] = merged_pocket_overrides
 
         if not updates:
             return self.strategy_engine
@@ -1285,6 +1386,7 @@ class BacktestEngine:
             adx_4h=float(row_4h['adx']) if 'adx' in row_4h.index else 0.0,
             cvd_upper_wick_ratio=cvd_upper_wick_ratio,
             cvd_1h_delta_ratio=cvd_1h_delta_ratio,
+            cvd_15m_delta_ratio=float(row_15m['cvd_delta_ratio']) if 'cvd_delta_ratio' in row_15m.index else None,
             atr_1h=row_1h['atr'],
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
@@ -1424,6 +1526,7 @@ class BacktestEngine:
             symbol,
             session_position_scale,
         )
+        vwap_structure_override = self._resolve_vwap_structure_override(signal.vwap_state)
         
         # 计算目标保证金与杠杆
         position_value, leverage = self.calculate_position_size(
@@ -1439,6 +1542,11 @@ class BacktestEngine:
             entry_scale=float(signal.entry_scale or 1.0),
             session_scale=session_position_scale,
         )
+        position_scale_override = max(
+            0.0,
+            min(1.0, float(vwap_structure_override.get("position_scale_override", 1.0) or 1.0)),
+        )
+        position_value *= position_scale_override
         if position_value <= 0:
             return
         
@@ -1448,23 +1556,53 @@ class BacktestEngine:
         else:
             # 备用：使用ATR或固定比例
             atr = analysis['row_1h']['atr']
-            stop_loss_pct = max(float(signal.stop_loss_pct or 0.0), self.config.default_stop_loss_pct)
+            stop_loss_pct_override = vwap_structure_override.get("stop_loss_pct_override")
+            if stop_loss_pct_override is not None:
+                stop_loss_pct = float(stop_loss_pct_override)
+            else:
+                stop_loss_pct = max(float(signal.stop_loss_pct or 0.0), self.config.default_stop_loss_pct)
             if signal.direction == 'long':
                 stop_price = max(price - atr * 1.5, price * (1 - stop_loss_pct))
             else:
                 stop_price = min(price + atr * 1.5, price * (1 + stop_loss_pct))
 
+        take_profit_pct_override = vwap_structure_override.get("take_profit_pct_override")
+        take_profit_pct = float(
+            take_profit_pct_override
+            if take_profit_pct_override is not None
+            else self.config.default_take_profit_pct
+        )
         take_profit = None
-        if self.config.default_take_profit_pct > 0:
+        if take_profit_pct > 0:
             if signal.direction == 'long':
-                take_profit = price * (1 + self.config.default_take_profit_pct)
+                take_profit = price * (1 + take_profit_pct)
             else:
-                take_profit = price * (1 - self.config.default_take_profit_pct)
+                take_profit = price * (1 - take_profit_pct)
         take_profit_levels = self._normalize_tp_levels(
             price=price,
             side=signal.direction,
-            pct_levels=self.config.take_profit_pct_levels,
-            reduce_levels=self.config.take_profit_reduce_pct_levels,
+            pct_levels=vwap_structure_override.get(
+                "take_profit_pct_levels_override",
+                self.config.take_profit_pct_levels,
+            ),
+            reduce_levels=vwap_structure_override.get(
+                "take_profit_reduce_pct_levels_override",
+                self.config.take_profit_reduce_pct_levels,
+            ),
+        )
+        default_breakeven_trigger = float(getattr(self.config, "breakeven_trigger_pnl_ratio", 0.0) or 0.0)
+        default_breakeven_lock = float(getattr(self.config, "breakeven_lock_ratio", 0.0) or 0.0)
+        breakeven_trigger_pnl_ratio = float(
+            vwap_structure_override.get(
+                "breakeven_trigger_pnl_ratio_override",
+                default_breakeven_trigger,
+            ) or default_breakeven_trigger
+        )
+        breakeven_lock_ratio = float(
+            vwap_structure_override.get(
+                "breakeven_lock_ratio_override",
+                default_breakeven_lock,
+            ) or default_breakeven_lock
         )
 
         required_margin = position_value
@@ -1531,6 +1669,10 @@ class BacktestEngine:
             'shrink_exit_ready': bool((signal.details or {}).get('shrink_exit_ready', False)),
             'macd_4h_shrink_pct': float((signal.details or {}).get('macd_4h_shrink_pct', 0.0)),
             'macd_4h_shrink_bars': int((signal.details or {}).get('macd_4h_shrink_bars', 0) or 0),
+            'breakeven_trigger_pnl_ratio': breakeven_trigger_pnl_ratio,
+            'breakeven_lock_ratio': breakeven_lock_ratio,
+            'position_scale_override': position_scale_override,
+            'vwap_structure_override_applied': bool(vwap_structure_override),
         }
     
     def close_position(
@@ -1704,6 +1846,11 @@ class BacktestEngine:
             'shrink_exit_ready': bool(order.get('shrink_exit_ready', False)),
             'macd_4h_shrink_pct': float(order.get('macd_4h_shrink_pct', 0.0)),
             'macd_4h_shrink_bars': int(order.get('macd_4h_shrink_bars', 0) or 0),
+            'breakeven_trigger_pnl_ratio': float(order.get('breakeven_trigger_pnl_ratio', self.config.breakeven_trigger_pnl_ratio)),
+            'breakeven_lock_ratio': float(order.get('breakeven_lock_ratio', self.config.breakeven_lock_ratio)),
+            'position_scale_override': float(order.get('position_scale_override', 1.0)),
+            'vwap_structure_override_applied': bool(order.get('vwap_structure_override_applied', False)),
+            'trailing_stop': None,
             'realized_pnl_accum': 0.0,
         }
         self.pending_orders.pop(symbol, None)
@@ -1772,20 +1919,51 @@ class BacktestEngine:
         
         # 保本止损：与实盘配置对齐
         if self.config.breakeven_enabled:
+            breakeven_trigger = float(pos.get('breakeven_trigger_pnl_ratio', self.config.breakeven_trigger_pnl_ratio))
+            breakeven_lock = float(pos.get('breakeven_lock_ratio', self.config.breakeven_lock_ratio))
             if pos['side'] == 'long':
                 best_pnl_pct = (high_price - pos['entry_price']) / pos['entry_price']
-                if best_pnl_pct >= self.config.breakeven_trigger_pnl_ratio:
+                if best_pnl_pct >= breakeven_trigger:
                     pos['stop_price'] = max(
                         pos['stop_price'],
-                        pos['entry_price'] * (1.0 + self.config.breakeven_lock_ratio),
+                        pos['entry_price'] * (1.0 + breakeven_lock),
                     )
             elif pos['side'] == 'short':
                 best_pnl_pct = (pos['entry_price'] - low_price) / pos['entry_price']
-                if best_pnl_pct >= self.config.breakeven_trigger_pnl_ratio:
+                if best_pnl_pct >= breakeven_trigger:
                     pos['stop_price'] = min(
                         pos['stop_price'],
-                        pos['entry_price'] * (1.0 - self.config.breakeven_lock_ratio),
+                        pos['entry_price'] * (1.0 - breakeven_lock),
                     )
+
+        trailing_profile = self._resolve_trailing_profile(pos)
+        activation_pnl_ratio = float(trailing_profile.get("activation_pnl_ratio", 0.0) or 0.0)
+        if activation_pnl_ratio > 0:
+            if pos['side'] == 'long':
+                best_pnl_pct = (high_price - pos['entry_price']) / pos['entry_price']
+            else:
+                best_pnl_pct = (pos['entry_price'] - low_price) / pos['entry_price']
+            if best_pnl_pct >= activation_pnl_ratio:
+                atr_value = float(row.get('atr', row.get('atr_15m', row.get('atr_1h', 0.0))) or 0.0)
+                ref_price = high_price if pos['side'] == 'long' else low_price
+                raw_dist = atr_value * float(trailing_profile.get("atr_multiplier", 0.0) or 0.0)
+                min_dist = max(0.0, float(trailing_profile.get("min_distance_pct", 0.0) or 0.0) * ref_price)
+                max_dist = max(min_dist, float(trailing_profile.get("max_distance_pct", 0.0) or 0.0) * ref_price)
+                trail_dist = max(min_dist, raw_dist)
+                if max_dist > 0:
+                    trail_dist = min(max_dist, trail_dist)
+                if trail_dist > 0:
+                    if pos['side'] == 'long':
+                        candidate_stop = ref_price - trail_dist
+                        if candidate_stop > float(pos.get('trailing_stop') or 0.0):
+                            pos['trailing_stop'] = candidate_stop
+                        pos['stop_price'] = max(pos['stop_price'], float(pos.get('trailing_stop') or candidate_stop))
+                    else:
+                        current_trailing = float(pos.get('trailing_stop') or 0.0)
+                        candidate_stop = ref_price + trail_dist
+                        if current_trailing <= 0 or candidate_stop < current_trailing:
+                            pos['trailing_stop'] = candidate_stop
+                        pos['stop_price'] = min(pos['stop_price'], float(pos.get('trailing_stop') or candidate_stop))
 
         stop_hit = False
         target_hit = False
@@ -1852,6 +2030,25 @@ class BacktestEngine:
             and shrink_exit_ready
             and shrink_exit_direction == pos['side']
         ):
+            shrink_loss_mitigation_active = bool(
+                self.strategy_config.shrink_exit_loss_mitigation_enabled
+                and pnl_pct <= float(self.strategy_config.shrink_exit_loss_mitigation_pnl_threshold)
+                and pnl_pct <= float(self.strategy_config.shrink_exit_loss_mitigation_ignore_if_pnl_gt)
+            )
+            if shrink_loss_mitigation_active:
+                reduce_pct_original = min(
+                    1.0,
+                    max(0.0, float(self.strategy_config.shrink_exit_loss_mitigation_exit_ratio)),
+                )
+                if reduce_pct_original > 0.0:
+                    self.close_position(
+                        symbol,
+                        price,
+                        time,
+                        "4h_shrink_reduce",
+                        reduce_pct_original=reduce_pct_original,
+                    )
+                    return symbol not in self.positions
             if self.strategy_config.exit_4h_require_profit:
                 shrink_profit_ok = pnl_pct > 0
             else:

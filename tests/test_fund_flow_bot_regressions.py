@@ -17,8 +17,52 @@ def test_live_config_stage2_ablation_disables_outer_entry_filters_and_ai_review(
 
     assert ff["ma10_macd_confluence"]["enabled"] is False
     assert ff["ma10_macd_confluence"]["entry_hard_filter"] is False
-    assert ff["pretrade_risk_gate"]["enabled"] is False
-    assert ff["ai_review"]["enabled"] is False
+    assert ff["pretrade_risk_gate"]["enabled"] is True
+    assert ff["pretrade_risk_gate"]["use_hard_rules_only"] is True
+    assert "ai_review" not in ff or ff["ai_review"]["enabled"] is False
+
+
+def test_fund_flow_main_config_applies_optimization_guardrails():
+    cfg = json.loads(Path("config/trading_config_fund_flow.json").read_text(encoding="utf-8"))
+
+    assert cfg["iflow"]["cwd"] == "d:\\AIDCA\\AI8"
+    assert cfg["iflow"]["file_allowed_dirs"] == [
+        "d:\\AIDCA\\AI8",
+        "d:\\AIDCA\\AI8\\config",
+        "d:\\AIDCA\\AI8\\src",
+    ]
+
+    ff = cfg["fund_flow"]
+    entry_filters = ff["macd_mtf_strategy_v2"]["entry_filters"]
+
+    assert ff["default_target_portion"] == 0.3
+    assert ff["max_symbol_position_portion"] == 0.3
+    assert ff["max_active_symbols"] == 4
+    assert ff["max_leverage"] == 5
+    assert ff["pretrade_risk_gate"]["equity_usage_block"] == 0.85
+    pocket_overrides = entry_filters["pocket_entry_overrides"]
+    assert "red_bar_growing|long_dual_support" in pocket_overrides
+    pocket_cfg = pocket_overrides["red_bar_growing|long_dual_support"]
+    assert pocket_cfg["min_signal_score"] == 0.88
+    assert pocket_cfg["min_vwap_score"] == 0.16
+    assert pocket_cfg["require_cvd_ok"] is True
+    assert pocket_cfg["require_cvd_momentum_ok"] is True
+    assert ff["vwap_structure_overrides"]["long_dual_support"]["position_scale_override"] == 0.80
+
+
+def test_fund_flow_main_config_applies_iteration2_quality_recovery_settings():
+    cfg = json.loads(Path("config/trading_config_fund_flow.json").read_text(encoding="utf-8"))
+
+    assert cfg["risk"]["take_profit_default_percent"] == 0.04
+
+    ff = cfg["fund_flow"]
+    entry_filters = ff["macd_mtf_strategy_v2"]["entry_filters"]
+    stop_cfg = ff["macd_mtf_strategy_v2"]["stop_loss_config"]
+
+    assert ff["take_profit_pct"] == 0.04
+    assert entry_filters["enable_flip_bullish_cvd_context_filter"] is False
+    assert entry_filters["stable_bear_continuation_min_adx_1h"] == 30.0
+    assert stop_cfg["boll_stop_atr_multiplier"] == 0.5
 
 
 def test_soften_conflict_exit_for_small_mae_downgrades_to_reduce():

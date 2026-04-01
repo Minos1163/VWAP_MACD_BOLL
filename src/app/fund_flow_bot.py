@@ -263,6 +263,7 @@ class TradingBot:
         self._trade_analysis_log_name = "trade_analysis_utc.csv"
         self._api_cycle_stats_log_name = "api_cycle_stats_utc.jsonl"
         self._alpha_dilution_log_name = "alpha_dilution_utc.jsonl"
+        self._exit_protection_audit_log_name = "exit_protection_audit_utc.jsonl"
         self._trade_fill_logged_keys: set[str] = set()
         self._consecutive_losses: int = 0
         self._cooldown_expires: Optional[datetime] = None
@@ -278,6 +279,7 @@ class TradingBot:
         self._pre_risk_exit_streak_by_pos: Dict[str, int] = {}
         self._dca_stage_by_pos: Dict[str, int] = {}
         self._winner_pyramid_stage_by_pos: Dict[str, int] = {}
+        self._partial_tp_state_by_pos: Dict[str, Dict[str, Any]] = {}
         self._opened_symbols_this_cycle: set[str] = set()
         self._volatility_spike_streak_by_symbol: Dict[str, int] = {}
         self._volatility_last_bucket_by_symbol: Dict[str, str] = {}
@@ -633,6 +635,15 @@ class TradingBot:
         os.makedirs(dir_path, exist_ok=True)
         return os.path.join(dir_path, self._trade_analysis_log_name)
 
+    def _resolve_exit_protection_audit_log_path_utc(self, now_utc: Optional[datetime] = None) -> str:
+        now_utc = now_utc or datetime.now(timezone.utc)
+        month = now_utc.strftime("%Y-%m")
+        date = now_utc.strftime("%Y-%m-%d")
+        dir_path = os.path.join(self.log_root_dir, month, date)
+        os.makedirs(dir_path, exist_ok=True)
+        file_name = getattr(self, "_exit_protection_audit_log_name", "exit_protection_audit_utc.jsonl")
+        return os.path.join(dir_path, file_name)
+
     def _migrate_legacy_log_layout(self) -> None:
         """
         兼容旧路径:
@@ -825,6 +836,164 @@ class TradingBot:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+    def _append_exit_protection_audit_log(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict) or not payload:
+            return
+        log_path = self._resolve_exit_protection_audit_log_path_utc()
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def live_exit_semantics_contract() -> Dict[str, Any]:
+        return {
+            "trailing_triggered_live": True,
+            "breakeven_triggered_live": True,
+            "same_bar_stop_vs_tp_priority": "exchange_managed_unknown",
+            "intrabar_model": "exchange_protection_orders_plus_runtime_reconciliation",
+            "protection_priority_chain": [
+                "partial_tp",
+                "time_exit",
+                "partial_tp_trailing",
+                "conflict_tighten_or_breakeven",
+                "exchange_tp_sl_matching",
+            ],
+            "shrink_exit_live_equivalent": "decision_engine.macd_v2_4h_shrink_exit",
+        }
+
+    def _log_exit_protection_event(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        event_type: str,
+        priority_stage: str,
+        current_price: float = 0.0,
+        position: Optional[Dict[str, Any]] = None,
+        flow_context: Optional[Dict[str, Any]] = None,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        position = position if isinstance(position, dict) else {}
+        flow_context = flow_context if isinstance(flow_context, dict) else {}
+        extra = payload if isinstance(payload, dict) else {}
+        row: Dict[str, Any] = {
+            "time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol,
+            "side": str(side or "").upper(),
+            "event_type": str(event_type or ""),
+            "priority_stage": str(priority_stage or ""),
+            "current_price": round(self._to_float(current_price, 0.0), 8),
+            "entry_price": round(self._to_float(position.get("entry_price"), 0.0), 8),
+            "amount": round(self._to_float(position.get("amount"), 0.0), 8),
+            "pnl_ratio": round(self._position_pnl_ratio(position, current_price), 8)
+            if position
+            else 0.0,
+            "atr_pct": round(self._to_float(flow_context.get("atr_pct"), 0.0), 8),
+            "adx": round(self._to_float(flow_context.get("adx"), 0.0), 8),
+            "contract": self.live_exit_semantics_contract(),
+        }
+        row.update(extra)
+        self._append_exit_protection_audit_log(row)
+
+    def _capture_protection_snapshot(self, symbol: str, side: str) -> Dict[str, Any]:
+        normalized_side = str(side or "").upper()
+        try:
+            orders = self._open_protection_orders(symbol, side=normalized_side)
+        except Exception:
+            orders = []
+        summary: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": normalized_side,
+            "order_count": 0,
+            "has_tp": False,
+            "has_sl": False,
+            "tp_order_ids": [],
+            "sl_order_ids": [],
+            "orders": [],
+        }
+        if not isinstance(orders, list):
+            return summary
+
+        normalized_orders: List[Dict[str, Any]] = []
+        for item in orders:
+            if not isinstance(item, dict):
+                continue
+            order_type = str(item.get("type") or item.get("strategyType") or "").upper()
+            order_id = str(item.get("orderId") or "")
+            stop_price = self._to_float(item.get("stopPrice"), 0.0)
+            price = self._to_float(item.get("price"), 0.0)
+            qty = self._to_float(item.get("origQty"), 0.0)
+            order_side = str(item.get("side") or "").upper()
+            normalized = {
+                "order_id": order_id,
+                "type": order_type,
+                "stop_price": round(stop_price, 8) if stop_price > 0 else 0.0,
+                "price": round(price, 8) if price > 0 else 0.0,
+                "qty": round(qty, 8) if qty > 0 else 0.0,
+                "side": order_side,
+            }
+            normalized_orders.append(normalized)
+            if "TAKE_PROFIT" in order_type:
+                summary["has_tp"] = True
+                summary["tp_order_ids"].append(order_id)
+            if "STOP" in order_type:
+                summary["has_sl"] = True
+                summary["sl_order_ids"].append(order_id)
+
+        summary["order_count"] = len(normalized_orders)
+        summary["orders"] = normalized_orders
+        return summary
+
+    def _log_same_bar_priority_evidence(
+        self,
+        *,
+        symbol: str,
+        decision: FundFlowDecision,
+        position: Optional[Dict[str, Any]],
+        current_price: float,
+        execution_result: Dict[str, Any],
+        fill_summary: Dict[str, Any],
+        trigger_type: str,
+        pre_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        side = self._extract_position_side(position)
+        if not side:
+            return
+        pre_snapshot = pre_snapshot if isinstance(pre_snapshot, dict) else self._capture_protection_snapshot(symbol, side)
+        same_bar_candidate = bool(pre_snapshot.get("has_tp")) and bool(pre_snapshot.get("has_sl"))
+        if not same_bar_candidate:
+            return
+
+        order = execution_result.get("order") if isinstance(execution_result, dict) else {}
+        order_id = str(order.get("orderId") or "") if isinstance(order, dict) else ""
+        reason = str(getattr(decision, "reason", "") or "")
+        inferred_source = "unknown"
+        reason_upper = reason.upper()
+        if "TAKE_PROFIT" in reason_upper or "PARTIAL_TP" in reason_upper:
+            inferred_source = "tp_like_reason"
+        elif "STOP" in reason_upper or "BREAKEVEN" in reason_upper or "PROTECT" in reason_upper:
+            inferred_source = "sl_or_protection_like_reason"
+
+        self._log_exit_protection_event(
+            symbol=symbol,
+            side=side,
+            event_type="same_bar_priority_evidence",
+            priority_stage="post_fill_same_bar_priority_probe",
+            current_price=current_price,
+            position=position,
+            flow_context={},
+            payload={
+                "trigger_type": trigger_type,
+                "decision_reason": reason,
+                "execution_status": str(execution_result.get("status") or ""),
+                "execution_order_id": order_id,
+                "fill_summary": dict(fill_summary or {}),
+                "pre_snapshot": pre_snapshot,
+                "same_bar_priority_candidate": same_bar_candidate,
+                "inferred_trigger_source": inferred_source,
+                "evidence_strength": "medium" if str(fill_summary.get("source") or "") == "user_trades" else "weak",
+            },
+        )
+
     def _append_trade_analysis_rows(self, rows: List[Dict[str, Any]]) -> None:
         if not rows:
             return
@@ -861,6 +1030,9 @@ class TradingBot:
             "目标仓位占比",
             "订单ID",
             "保护单状态",
+            "same_bar优先级候选",
+            "same_bar触发推断",
+            "same_bar证据摘要",
             "参数快照",
             "来源",
         ]
@@ -889,6 +1061,7 @@ class TradingBot:
             "realized_pnl": 0.0,
             "fee_asset": "USDT",
             "source": "",
+            "fill_time_utc": "",
         }
         if not isinstance(execution_result, dict):
             return summary
@@ -953,6 +1126,7 @@ class TradingBot:
                     "realized_pnl": total_realized,
                     "fee_asset": str(rows[0].get("手续费结算币种") or "USDT"),
                     "source": "user_trades",
+                    "fill_time_utc": str(rows[0].get("时间(UTC)") or ""),
                 }
             )
         else:
@@ -995,6 +1169,7 @@ class TradingBot:
                         "realized_pnl": 0.0,
                         "fee_asset": "USDT",
                         "source": "order_fallback",
+                        "fill_time_utc": ts_utc,
                     }
                 )
         self._append_trade_fill_rows(rows)
@@ -1086,6 +1261,25 @@ class TradingBot:
         protection_status = ""
         if isinstance(protection, dict):
             protection_status = str(protection.get("status") or "")
+        same_bar_candidate = ""
+        same_bar_inferred = ""
+        same_bar_evidence = ""
+        if isinstance(fill_summary, dict):
+            same_bar_candidate = fill_summary.get("same_bar_priority_candidate", "")
+            same_bar_inferred = fill_summary.get("inferred_trigger_source", "")
+            pre_snapshot = fill_summary.get("pre_protection_snapshot")
+            post_snapshot = fill_summary.get("post_protection_snapshot")
+            if isinstance(pre_snapshot, dict):
+                same_bar_evidence = (
+                    f"pre(tp={int(bool(pre_snapshot.get('has_tp')))},sl={int(bool(pre_snapshot.get('has_sl')))},"
+                    f"n={int(self._to_int(pre_snapshot.get('order_count'), 0))})"
+                )
+            if isinstance(post_snapshot, dict):
+                post_txt = (
+                    f" post(tp={int(bool(post_snapshot.get('has_tp')))},sl={int(bool(post_snapshot.get('has_sl')))},"
+                    f"n={int(self._to_int(post_snapshot.get('order_count'), 0))})"
+                )
+                same_bar_evidence = f"{same_bar_evidence}{post_txt}".strip()
 
         macd_v2_cfg = getattr(self.fund_flow_decision_engine, "macd_v2_config", None)
         params_snapshot = {
@@ -1131,6 +1325,9 @@ class TradingBot:
             "目标仓位占比": round(self._to_float(decision.target_portion_of_balance, 0.0), 6),
             "订单ID": order_id,
             "保护单状态": protection_status,
+            "same_bar优先级候选": same_bar_candidate,
+            "same_bar触发推断": same_bar_inferred,
+            "same_bar证据摘要": same_bar_evidence,
             "参数快照": json.dumps(params_snapshot, ensure_ascii=False, separators=(",", ":")),
             "来源": str(fill_summary.get("source") or "decision_execution"),
         }
@@ -1461,6 +1658,7 @@ class TradingBot:
         flat_top_n = max(1, int(self._to_float(ai_cfg.get("flat_top_n", 2), 2)))
         return {
             "enabled": bool(ai_cfg.get("enabled", True)),
+            "enforced": bool(ai_cfg.get("enforced", ai_cfg.get("enabled", True))),
             "position_timeframe_seconds": max(60, position_tf_seconds),
             "flat_timeframe_seconds": max(60, flat_tf_seconds),
             "flat_top_n": flat_top_n,
@@ -1738,13 +1936,19 @@ class TradingBot:
         risk_cfg = self.config.get("risk", {}) or {}
         ff_cfg = self.config.get("fund_flow", {}) or {}
         max_daily_loss_pct = self._normalize_percent_to_ratio(
-            risk_cfg.get("daily_cooldown_pct", risk_cfg.get("max_daily_loss_percent", 0.1)),
+            ff_cfg.get(
+                "daily_loss_limit_pct",
+                risk_cfg.get("daily_cooldown_pct", risk_cfg.get("max_daily_loss_percent", 0.1)),
+            ),
             0.1,
         )
         return {
             "enabled": bool(risk_cfg.get("account_circuit_enabled", True)),
             "max_daily_loss_pct": max_daily_loss_pct,
-            "max_consecutive_losses": max(1, int(risk_cfg.get("max_consecutive_losses", 3) or 3)),
+            "max_consecutive_losses": max(
+                1,
+                int(ff_cfg.get("consecutive_loss_halt_count", risk_cfg.get("max_consecutive_losses", 3)) or 3),
+            ),
             "daily_loss_cooldown_seconds": max(
                 0,
                 int(
@@ -1939,7 +2143,8 @@ class TradingBot:
         }
 
     def _alpha_dilution_monitor_config(self) -> Dict[str, Any]:
-        ff_cfg = self.config.get("fund_flow", {}) or {}
+        config = getattr(self, "config", {}) or {}
+        ff_cfg = config.get("fund_flow", {}) or {}
         raw = ff_cfg.get("alpha_dilution_monitor", {}) if isinstance(ff_cfg.get("alpha_dilution_monitor"), dict) else {}
         return {
             "enabled": bool(raw.get("enabled", False)),
@@ -2137,8 +2342,9 @@ class TradingBot:
     def _dca_config(self, engine_override: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         ff_cfg = self.config.get("fund_flow", {}) or {}
         override = engine_override if isinstance(engine_override, dict) else {}
-        enabled = bool(ff_cfg.get("dca_martingale_enabled", ff_cfg.get("dca_enabled", False)))
-        if "dca_max_additions" in override:
+        config_enabled = bool(ff_cfg.get("dca_martingale_enabled", ff_cfg.get("dca_enabled", False)))
+        enabled = config_enabled
+        if enabled and "dca_max_additions" in override:
             enabled = int(self._to_float(override.get("dca_max_additions"), 0)) > 0
         dca_disable_above_leverage = max(
             1,
@@ -2200,6 +2406,8 @@ class TradingBot:
         max_additions = int(override.get("dca_max_additions", ff_cfg.get("dca_max_additions", len(thresholds))) or len(thresholds))
         max_additions = max(0, min(max_additions, len(thresholds)))
         min_trigger_interval_seconds = max(0, int(ff_cfg.get("dca_min_trigger_interval_seconds", 0) or 0))
+        if not enabled:
+            max_additions = 0
         disabled_by_high_leverage = bool(enabled) and (not dca_high_leverage_opt_in) and effective_leverage >= dca_disable_above_leverage
         if disabled_by_high_leverage:
             enabled = False
@@ -2333,6 +2541,8 @@ class TradingBot:
         cfg = self._alpha_dilution_monitor_config()
         if not bool(cfg.get("enabled", False)):
             return
+        if not hasattr(self, "_alpha_dilution_buckets") or not isinstance(self._alpha_dilution_buckets, dict):
+            self._alpha_dilution_buckets = {}
         stage_key = str(stage or "").strip()
         if stage_key not in self._alpha_dilution_stage_order():
             return
@@ -3361,6 +3571,647 @@ class TradingBot:
             return (entry_price - current_price) / entry_price
         return 0.0
 
+    def _partial_tp_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
+        partial_levels_raw = ff_cfg.get("partial_tp_levels", [])
+        partial_levels = self._normalize_partial_tp_levels(partial_levels_raw)
+        volatile_levels = self._normalize_partial_tp_levels(
+            ff_cfg.get("partial_tp_volatile", {}),
+            ratio_key="ratio",
+            trigger_key="at_r",
+            fallback=partial_levels,
+        )
+        trending_levels = self._normalize_partial_tp_levels(
+            ff_cfg.get("partial_tp_trending", {}),
+            ratio_key="ratio",
+            trigger_key="at_r",
+            fallback=partial_levels,
+        )
+        return {
+            "enabled": bool(ff_cfg.get("partial_tp_enabled", False)),
+            "levels": partial_levels,
+            "partial_tp_mode": str(ff_cfg.get("partial_tp_mode", "static") or "static").strip().lower(),
+            "trailing_stop_mode": str(ff_cfg.get("trailing_stop_mode", "static") or "static").strip().lower(),
+            "stop_loss_pct": self._normalize_percent_to_ratio(ff_cfg.get("stop_loss_pct", 0.012), 0.012),
+            "trailing_enabled": bool(ff_cfg.get("trailing_stop_enabled", False)),
+            "trailing_activation_pct": self._normalize_percent_to_ratio(
+                ff_cfg.get("trailing_stop_activation_pct", ff_cfg.get("stop_loss_pct", 0.012)),
+                0.012,
+            ),
+            "trailing_atr_multiplier": max(
+                0.1,
+                self._to_float(ff_cfg.get("trailing_stop_atr_multiplier", 1.0), 1.0),
+            ),
+            "trailing_min_distance": self._normalize_percent_to_ratio(
+                ff_cfg.get("trailing_stop_min_distance", 0.007),
+                0.007,
+            ),
+            "trailing_max_distance": self._normalize_percent_to_ratio(
+                ff_cfg.get("trailing_stop_max_distance", 0.015),
+                0.015,
+            ),
+            "breakeven_trigger": self._normalize_percent_to_ratio(
+                ff_cfg.get("breakeven_trigger_pnl_ratio", 0.008),
+                0.008,
+            ),
+            "breakeven_lock": self._normalize_percent_to_ratio(
+                ff_cfg.get("breakeven_lock_ratio", 0.0025),
+                0.0025,
+            ),
+            "profiles": {
+                "VOLATILE": {
+                    "levels": volatile_levels,
+                    "trailing_activation_pct": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_volatile", {}) or {}).get("activation_pct", 0.008)),
+                        0.008,
+                    ),
+                    "trailing_atr_multiplier": max(
+                        0.1,
+                        self._to_float(((ff_cfg.get("trailing_volatile", {}) or {}).get("atr_multiplier", 0.6)), 0.6),
+                    ),
+                    "trailing_min_distance": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_volatile", {}) or {}).get("min_distance", 0.005)),
+                        0.005,
+                    ),
+                    "trailing_max_distance": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_volatile", {}) or {}).get("max_distance", 0.010)),
+                        0.010,
+                    ),
+                    "breakeven_trigger": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_volatile", {}) or {}).get("breakeven_trigger", 0.005)),
+                        0.005,
+                    ),
+                    "breakeven_lock": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_volatile", {}) or {}).get("breakeven_lock", 0.002)),
+                        0.002,
+                    ),
+                },
+                "TRENDING": {
+                    "levels": trending_levels,
+                    "trailing_activation_pct": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_trending", {}) or {}).get("activation_pct", 0.018)),
+                        0.018,
+                    ),
+                    "trailing_atr_multiplier": max(
+                        0.1,
+                        self._to_float(((ff_cfg.get("trailing_trending", {}) or {}).get("atr_multiplier", 1.8)), 1.8),
+                    ),
+                    "trailing_min_distance": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_trending", {}) or {}).get("min_distance", 0.012)),
+                        0.012,
+                    ),
+                    "trailing_max_distance": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_trending", {}) or {}).get("max_distance", 0.030)),
+                        0.030,
+                    ),
+                    "breakeven_trigger": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_trending", {}) or {}).get("breakeven_trigger", 0.012)),
+                        0.012,
+                    ),
+                    "breakeven_lock": self._normalize_percent_to_ratio(
+                        ((ff_cfg.get("trailing_trending", {}) or {}).get("breakeven_lock", 0.003)),
+                        0.003,
+                    ),
+                },
+            },
+        }
+
+    def _time_exit_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
+        return {
+            "enabled": bool(ff_cfg.get("time_exit_enabled", False)),
+            "minutes": max(1, int(self._to_float(ff_cfg.get("time_exit_minutes", 30), 30))),
+            "min_profit_pct": self._normalize_percent_to_ratio(
+                ff_cfg.get("time_exit_min_profit_pct", 0.0035),
+                0.0035,
+            ),
+        }
+
+    def _atr_position_scale_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
+        raw_bands = ff_cfg.get("atr_position_scale_bands", [])
+        bands: List[Dict[str, float]] = []
+        if isinstance(raw_bands, list):
+            for item in raw_bands:
+                if not isinstance(item, dict):
+                    continue
+                atr_pct_max = abs(self._to_float(item.get("atr_pct_max"), 0.0))
+                scale = min(1.0, max(0.0, self._to_float(item.get("scale"), 0.0)))
+                if atr_pct_max <= 0:
+                    continue
+                bands.append({"atr_pct_max": atr_pct_max, "scale": scale})
+        bands.sort(key=lambda item: item["atr_pct_max"])
+        if not bands:
+            bands = [
+                {"atr_pct_max": 0.014, "scale": 1.0},
+                {"atr_pct_max": 0.018, "scale": 0.85},
+                {"atr_pct_max": 0.022, "scale": 0.70},
+                {"atr_pct_max": 0.025, "scale": 0.55},
+            ]
+        return {
+            "enabled": bool(ff_cfg.get("atr_position_scale_enabled", False)),
+            "bands": bands,
+        }
+
+    def _normalize_partial_tp_levels(
+        self,
+        raw_levels: Any,
+        *,
+        ratio_key: str = "close_ratio",
+        trigger_key: str = "trigger_r_multiple",
+        fallback: Optional[List[Dict[str, float]]] = None,
+    ) -> List[Dict[str, float]]:
+        items: List[Any] = []
+        if isinstance(raw_levels, list):
+            items = raw_levels
+        elif isinstance(raw_levels, dict):
+            def _sort_key(pair: Any) -> Any:
+                key = str(pair[0])
+                tail = key.split("_")[-1]
+                return int(tail) if tail.isdigit() else key
+
+            items = [value for _key, value in sorted(raw_levels.items(), key=_sort_key)]
+
+        levels: List[Dict[str, float]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            close_ratio = min(1.0, max(0.0, self._to_float(item.get(ratio_key), item.get("close_ratio", item.get("ratio", 0.0)))))
+            trigger_r = max(0.0, self._to_float(item.get(trigger_key), item.get("trigger_r_multiple", item.get("at_r", 0.0))))
+            if close_ratio <= 0.0 or trigger_r <= 0.0:
+                continue
+            levels.append({"close_ratio": close_ratio, "trigger_r_multiple": trigger_r})
+        if levels:
+            return levels
+        return [dict(item) for item in (fallback or []) if isinstance(item, dict)]
+
+    def _get_or_create_partial_tp_state(self, symbol: str, side: str) -> Dict[str, Any]:
+        pos_key = self._position_track_key(symbol, side)
+        state_raw = self._partial_tp_state_by_pos.get(pos_key)
+        if isinstance(state_raw, dict):
+            return state_raw
+        state = {
+            "levels_completed": [],
+            "trailing_activated": False,
+            "trailing_high_water": 0.0,
+            "trailing_stop_price": 0.0,
+            "market_mode": "",
+            "mode_change_bars": 0,
+        }
+        self._partial_tp_state_by_pos[pos_key] = state
+        return state
+
+    def _extract_risk_regime_inputs(
+        self,
+        flow_context: Dict[str, Any],
+        base_decision: Optional[FundFlowDecision] = None,
+    ) -> Dict[str, float]:
+        timeframes = flow_context.get("timeframes", {}) if isinstance(flow_context, dict) else {}
+        tf_15m = timeframes.get("15m", {}) if isinstance(timeframes, dict) else {}
+        tf_1h = timeframes.get("1h", {}) if isinstance(timeframes, dict) else {}
+        tf_4h = timeframes.get("4h", {}) if isinstance(timeframes, dict) else {}
+        md = dict(getattr(base_decision, "metadata", None) or {})
+        atr_pct = self._normalize_percent_to_ratio(
+            flow_context.get(
+                "atr_pct",
+                tf_15m.get("atr_pct", md.get("regime_atr_pct", 0.010)),
+            ),
+            0.010,
+        )
+        adx_candidates = [
+            flow_context.get("adx"),
+            flow_context.get("regime_adx"),
+            tf_4h.get("adx"),
+            tf_1h.get("adx"),
+            tf_15m.get("adx"),
+            md.get("regime_adx"),
+        ]
+        adx = 0.0
+        for candidate in adx_candidates:
+            adx = self._to_float(candidate, 0.0)
+            if adx > 0:
+                break
+        return {"atr_pct": abs(atr_pct), "adx": max(0.0, adx)}
+
+    def _classify_market_regime(
+        self,
+        flow_context: Dict[str, Any],
+        base_decision: Optional[FundFlowDecision] = None,
+    ) -> str:
+        regime_inputs = self._extract_risk_regime_inputs(flow_context, base_decision)
+        atr_pct = regime_inputs["atr_pct"]
+        adx = regime_inputs["adx"]
+        if adx >= 32.0 and atr_pct <= 0.018:
+            return "TRENDING"
+        if atr_pct >= 0.016 or adx < 28.0:
+            return "VOLATILE"
+        return "VOLATILE"
+
+    def _resolve_partial_tp_profile(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        flow_context: Dict[str, Any],
+        base_decision: Optional[FundFlowDecision] = None,
+    ) -> Dict[str, Any]:
+        cfg = self._partial_tp_config()
+        state = self._get_or_create_partial_tp_state(symbol, side)
+        partial_mode = str(cfg.get("partial_tp_mode", "static")).upper()
+        trailing_mode = str(cfg.get("trailing_stop_mode", "static")).upper()
+        dynamic_mode = partial_mode == "DYNAMIC" or trailing_mode == "DYNAMIC"
+        active_mode = "STATIC"
+
+        if dynamic_mode:
+            candidate_mode = self._classify_market_regime(flow_context, base_decision)
+            previous_mode = str(state.get("market_mode", "") or "")
+            if previous_mode in ("VOLATILE", "TRENDING") and previous_mode != candidate_mode:
+                streak = int(state.get("mode_change_bars", 0) or 0) + 1
+                if streak >= 2:
+                    active_mode = candidate_mode
+                    streak = 0
+                else:
+                    active_mode = previous_mode
+                state["mode_change_bars"] = streak
+            else:
+                active_mode = candidate_mode
+                state["mode_change_bars"] = 0
+            state["market_mode"] = active_mode
+        else:
+            state["market_mode"] = "STATIC"
+            state["mode_change_bars"] = 0
+
+        profile: Dict[str, Any] = {
+            "mode": active_mode,
+            "levels": [dict(item) for item in cfg.get("levels", []) if isinstance(item, dict)],
+            "trailing_activation_pct": self._normalize_percent_to_ratio(
+                cfg.get("trailing_activation_pct", cfg.get("stop_loss_pct", 0.012)),
+                0.012,
+            ),
+            "trailing_atr_multiplier": max(0.1, self._to_float(cfg.get("trailing_atr_multiplier"), 1.0)),
+            "trailing_min_distance": self._normalize_percent_to_ratio(cfg.get("trailing_min_distance", 0.007), 0.007),
+            "trailing_max_distance": self._normalize_percent_to_ratio(cfg.get("trailing_max_distance", 0.015), 0.015),
+            "breakeven_trigger": self._normalize_percent_to_ratio(cfg.get("breakeven_trigger", 0.008), 0.008),
+            "breakeven_lock": self._normalize_percent_to_ratio(cfg.get("breakeven_lock", 0.0025), 0.0025),
+        }
+
+        if active_mode in ("VOLATILE", "TRENDING"):
+            dynamic_profile = cfg.get("profiles", {}).get(active_mode, {})
+            if partial_mode == "DYNAMIC":
+                profile["levels"] = [dict(item) for item in dynamic_profile.get("levels", []) if isinstance(item, dict)]
+            if trailing_mode == "DYNAMIC":
+                for key in (
+                    "trailing_activation_pct",
+                    "trailing_atr_multiplier",
+                    "trailing_min_distance",
+                    "trailing_max_distance",
+                    "breakeven_trigger",
+                    "breakeven_lock",
+                ):
+                    profile[key] = dynamic_profile.get(key, profile.get(key))
+        return profile
+
+    def _calculate_trailing_stop_distance(
+        self,
+        flow_context: Dict[str, Any],
+        trailing_profile: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        cfg = trailing_profile or self._partial_tp_config()
+        atr_pct = self._normalize_percent_to_ratio(flow_context.get("atr_pct", 0.010), 0.010)
+        raw_distance = atr_pct * self._to_float(cfg.get("trailing_atr_multiplier"), 1.0)
+        min_distance = self._normalize_percent_to_ratio(cfg.get("trailing_min_distance", 0.007), 0.007)
+        max_distance = self._normalize_percent_to_ratio(cfg.get("trailing_max_distance", 0.015), 0.015)
+        return max(min_distance, min(max_distance, raw_distance))
+
+    def _get_atr_position_scale(self, atr_pct: float) -> float:
+        cfg = self._atr_position_scale_config()
+        if not bool(cfg.get("enabled", False)):
+            return 1.0
+        atr_pct_abs = abs(self._to_float(atr_pct, 0.0))
+        for band in cfg.get("bands", []):
+            if atr_pct_abs <= self._to_float(band.get("atr_pct_max"), 0.0):
+                return min(1.0, max(0.0, self._to_float(band.get("scale"), 1.0)))
+        return 0.0
+
+    def _evaluate_time_exit(
+        self,
+        *,
+        symbol: str,
+        position: Dict[str, Any],
+        current_price: float,
+        flow_context: Dict[str, Any],
+        base_decision: FundFlowDecision,
+    ) -> Optional[FundFlowDecision]:
+        cfg = self._time_exit_config()
+        if not bool(cfg.get("enabled", False)):
+            return None
+
+        side = str(position.get("side", "")).upper()
+        if side not in ("LONG", "SHORT"):
+            return None
+        pos_key = self._position_track_key(symbol, side)
+        first_seen_ts = self._position_first_seen_ts.get(pos_key)
+        if not first_seen_ts:
+            return None
+
+        hold_minutes = max(0.0, (self._risk_now_ts() - float(first_seen_ts)) / 60.0)
+        if hold_minutes < float(cfg.get("minutes", 30)):
+            return None
+
+        pnl_ratio = self._position_pnl_ratio(position, current_price)
+        sign = 1.0 if side == "LONG" else -1.0
+        flow_expanding = self._to_float(flow_context.get("cvd_momentum"), 0.0) * sign > 0.0
+        min_profit_pct = self._normalize_percent_to_ratio(cfg.get("min_profit_pct", 0.0035), 0.0035)
+        if pnl_ratio >= min_profit_pct or flow_expanding:
+            return None
+
+        md = dict(getattr(base_decision, "metadata", None) or {})
+        md["time_exit_triggered"] = True
+        md["time_exit_hold_minutes"] = hold_minutes
+        md["time_exit_pnl_ratio"] = pnl_ratio
+        return FundFlowDecision(
+            operation=FundFlowOperation.CLOSE,
+            symbol=symbol,
+            target_portion_of_balance=1.0,
+            leverage=base_decision.leverage,
+            reason=(
+                f"time_exit hold={hold_minutes:.0f}m pnl={pnl_ratio:.4f} "
+                f"min_profit={min_profit_pct:.4f} flow_expanding={int(flow_expanding)}"
+            ),
+            metadata=md,
+        )
+
+    def _risk_now_ts(self) -> float:
+        ts = getattr(self, "_backtest_now_ts", None)
+        if ts is not None:
+            try:
+                return float(ts)
+            except (TypeError, ValueError):
+                pass
+        return time.time()
+
+    def _evaluate_partial_tp(
+        self,
+        *,
+        symbol: str,
+        position: Dict[str, Any],
+        current_price: float,
+        flow_context: Dict[str, Any],
+        base_decision: FundFlowDecision,
+    ) -> Optional[FundFlowDecision]:
+        cfg = self._partial_tp_config()
+        if not bool(cfg.get("enabled", False)):
+            return None
+
+        side = str(position.get("side", "")).upper()
+        if side not in ("LONG", "SHORT"):
+            return None
+
+        profile = self._resolve_partial_tp_profile(
+            symbol=symbol,
+            side=side,
+            flow_context=flow_context,
+            base_decision=base_decision,
+        )
+        levels = profile.get("levels", [])
+        if not isinstance(levels, list) or not levels:
+            return None
+
+        pnl_ratio = self._position_pnl_ratio(position, current_price)
+        stop_loss_pct = self._normalize_percent_to_ratio(cfg.get("stop_loss_pct", 0.012), 0.012)
+        state = self._get_or_create_partial_tp_state(symbol, side)
+        completed_levels = state.get("levels_completed", [])
+
+        for idx, level in enumerate(levels):
+            if idx in completed_levels or not isinstance(level, dict):
+                continue
+            close_ratio = min(1.0, max(0.0, self._to_float(level.get("close_ratio"), 0.0)))
+            trigger_r = max(0.0, self._to_float(level.get("trigger_r_multiple"), 0.0))
+            trigger_profit = stop_loss_pct * trigger_r
+            if close_ratio <= 0 or trigger_profit <= 0:
+                continue
+            if pnl_ratio + 1e-12 < trigger_profit:
+                continue
+
+            completed_levels.append(idx)
+            state["levels_completed"] = sorted(set(int(x) for x in completed_levels))
+            self._save_risk_state()
+            md = dict(getattr(base_decision, "metadata", None) or {})
+            md["partial_tp_triggered"] = True
+            md["partial_tp_level"] = idx + 1
+            md["partial_tp_trigger_profit"] = trigger_profit
+            md["partial_tp_mode"] = profile.get("mode", "STATIC")
+            self._log_exit_protection_event(
+                symbol=symbol,
+                side=side,
+                event_type="partial_tp_triggered",
+                priority_stage="partial_tp_before_time_exit",
+                current_price=current_price,
+                position=position,
+                flow_context=flow_context,
+                payload={
+                    "partial_tp_level": idx + 1,
+                    "partial_tp_close_ratio": close_ratio,
+                    "partial_tp_trigger_profit": round(trigger_profit, 8),
+                    "partial_tp_mode": str(profile.get("mode", "STATIC") or "STATIC"),
+                },
+            )
+            return FundFlowDecision(
+                operation=FundFlowOperation.CLOSE,
+                symbol=symbol,
+                target_portion_of_balance=close_ratio,
+                leverage=base_decision.leverage,
+                reason=f"partial_tp_level_{idx + 1}",
+                metadata=md,
+            )
+        return None
+
+    def _update_partial_tp_trailing_stop(
+        self,
+        *,
+        symbol: str,
+        position: Dict[str, Any],
+        current_price: float,
+        flow_context: Dict[str, Any],
+        base_decision: FundFlowDecision,
+    ) -> None:
+        cfg = self._partial_tp_config()
+        if not (bool(cfg.get("enabled", False)) and bool(cfg.get("trailing_enabled", False))):
+            return
+
+        side = str(position.get("side", "")).upper()
+        if side not in ("LONG", "SHORT"):
+            return
+        state = self._get_or_create_partial_tp_state(symbol, side)
+        if not state.get("levels_completed"):
+            return
+
+        profile = self._resolve_partial_tp_profile(
+            symbol=symbol,
+            side=side,
+            flow_context=flow_context,
+            base_decision=base_decision,
+        )
+        pnl_ratio = self._position_pnl_ratio(position, current_price)
+        activation_pct = self._normalize_percent_to_ratio(
+            profile.get("trailing_activation_pct", cfg.get("trailing_activation_pct", cfg.get("stop_loss_pct", 0.012))),
+            0.012,
+        )
+        if pnl_ratio < activation_pct:
+            return
+
+        if not bool(state.get("trailing_activated", False)):
+            state["trailing_activated"] = True
+            state["trailing_high_water"] = float(current_price)
+            self._log_exit_protection_event(
+                symbol=symbol,
+                side=side,
+                event_type="trailing_activated",
+                priority_stage="partial_tp_trailing_activation",
+                current_price=current_price,
+                position=position,
+                flow_context=flow_context,
+                payload={
+                    "activation_pnl_ratio": round(activation_pct, 8),
+                    "partial_tp_levels_completed": list(state.get("levels_completed", [])),
+                    "partial_tp_mode": str(profile.get("mode", "STATIC") or "STATIC"),
+                },
+            )
+        else:
+            if side == "LONG":
+                state["trailing_high_water"] = max(
+                    float(state.get("trailing_high_water", current_price)),
+                    float(current_price),
+                )
+            else:
+                current_high_water = self._to_float(state.get("trailing_high_water"), current_price)
+                state["trailing_high_water"] = (
+                    float(current_price) if current_high_water <= 0 else min(current_high_water, float(current_price))
+                )
+
+        trail_distance = self._calculate_trailing_stop_distance(flow_context, profile)
+        entry_price = self._to_float(position.get("entry_price"), 0.0)
+        desired_stop = 0.0
+        trailing_high_water = self._to_float(state.get("trailing_high_water"), current_price)
+        breakeven_trigger = self._normalize_percent_to_ratio(profile.get("breakeven_trigger", 0.0), 0.0)
+        breakeven_lock = self._normalize_percent_to_ratio(profile.get("breakeven_lock", 0.0), 0.0)
+
+        if side == "LONG":
+            desired_stop = trailing_high_water * (1.0 - trail_distance)
+            if entry_price > 0 and pnl_ratio >= breakeven_trigger > 0:
+                desired_stop = max(desired_stop, entry_price * (1.0 + breakeven_lock))
+                if not bool(state.get("breakeven_activated", False)):
+                    state["breakeven_activated"] = True
+                    self._log_exit_protection_event(
+                        symbol=symbol,
+                        side=side,
+                        event_type="breakeven_activated",
+                        priority_stage="partial_tp_trailing_breakeven",
+                        current_price=current_price,
+                        position=position,
+                        flow_context=flow_context,
+                        payload={
+                            "breakeven_trigger": round(breakeven_trigger, 8),
+                            "breakeven_lock": round(breakeven_lock, 8),
+                            "desired_stop": round(desired_stop, 8),
+                        },
+                    )
+            desired_stop = min(desired_stop, float(current_price) * (1.0 - 0.0001))
+            sl_distance_ratio = max(0.0001, min(0.20, 1.0 - (desired_stop / max(float(current_price), 1e-9))))
+        else:
+            desired_stop = trailing_high_water * (1.0 + trail_distance)
+            if entry_price > 0 and pnl_ratio >= breakeven_trigger > 0:
+                desired_stop = min(desired_stop, entry_price * (1.0 - breakeven_lock))
+                if not bool(state.get("breakeven_activated", False)):
+                    state["breakeven_activated"] = True
+                    self._log_exit_protection_event(
+                        symbol=symbol,
+                        side=side,
+                        event_type="breakeven_activated",
+                        priority_stage="partial_tp_trailing_breakeven",
+                        current_price=current_price,
+                        position=position,
+                        flow_context=flow_context,
+                        payload={
+                            "breakeven_trigger": round(breakeven_trigger, 8),
+                            "breakeven_lock": round(breakeven_lock, 8),
+                            "desired_stop": round(desired_stop, 8),
+                        },
+                    )
+            desired_stop = max(desired_stop, float(current_price) * (1.0 + 0.0001))
+            sl_distance_ratio = max(0.0001, min(0.20, (desired_stop / max(float(current_price), 1e-9)) - 1.0))
+
+        state["trailing_stop_price"] = float(desired_stop)
+        self._log_exit_protection_event(
+            symbol=symbol,
+            side=side,
+            event_type="protection_priority_applied",
+            priority_stage="partial_tp_trailing_to_conflict_tighten",
+            current_price=current_price,
+            position=position,
+            flow_context=flow_context,
+            payload={
+                "desired_stop": round(desired_stop, 8),
+                "trail_distance": round(trail_distance, 8),
+                "sl_distance_ratio_override": round(sl_distance_ratio, 8),
+            },
+        )
+        try:
+            self._tighten_protection_for_conflict(
+                symbol=symbol,
+                position=position,
+                current_price=current_price,
+                force_break_even=False,
+                atr_pct=self._to_float(flow_context.get("atr_pct"), 0.0),
+                cooldown_sec=60.0,
+                sl_distance_ratio_override=sl_distance_ratio,
+            )
+        except Exception as e:
+            print(f"⚠️ {symbol} partial TP trailing 更新失败: {e}")
+        self._save_risk_state()
+
+    def _apply_position_management_overrides(
+        self,
+        *,
+        symbol: str,
+        position: Optional[Dict[str, Any]],
+        current_price: float,
+        decision: FundFlowDecision,
+        flow_context: Dict[str, Any],
+    ) -> FundFlowDecision:
+        if not isinstance(position, dict):
+            return decision
+
+        partial_tp_decision = self._evaluate_partial_tp(
+            symbol=symbol,
+            position=position,
+            current_price=current_price,
+            flow_context=flow_context,
+            base_decision=decision,
+        )
+        if partial_tp_decision is not None:
+            return partial_tp_decision
+
+        if decision.operation != FundFlowOperation.CLOSE:
+            time_exit_decision = self._evaluate_time_exit(
+                symbol=symbol,
+                position=position,
+                current_price=current_price,
+                flow_context=flow_context,
+                base_decision=decision,
+            )
+            if time_exit_decision is not None:
+                return time_exit_decision
+
+        self._update_partial_tp_trailing_stop(
+            symbol=symbol,
+            position=position,
+            current_price=current_price,
+            flow_context=flow_context,
+            base_decision=decision,
+        )
+        return decision
+
     def _soften_conflict_exit_for_small_mae(
         self,
         *,
@@ -3464,6 +4315,60 @@ class TradingBot:
         else:
             direction = "NONE"
 
+        atr_position_scale = 1.0
+        if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+            atr_position_scale = self._get_atr_position_scale(atr_pct)
+            if atr_position_scale <= 0.0:
+                gate_meta = {
+                    "enabled": True,
+                    "action": "BLOCK",
+                    "score": 0.0,
+                    "reason": "ATR_POSITION_SCALE_BLOCK",
+                    "state": {
+                        "symbol": symbol,
+                        "atr": atr_pct,
+                        "direction": direction,
+                    },
+                }
+                if isinstance(md, dict):
+                    md["pretrade_risk_gate"] = gate_meta
+                    md["atr_position_scale"] = {
+                        "scale": atr_position_scale,
+                        "atr_pct": atr_pct,
+                    }
+                base_reason = str(decision.reason or "").strip()
+                block_reason = f"PRE_RISK_BLOCK ATR_POSITION_SCALE atr={atr_pct:.4f}"
+                return (
+                    FundFlowDecision(
+                        operation=FundFlowOperation.HOLD,
+                        symbol=symbol,
+                        target_portion_of_balance=0.0,
+                        leverage=decision.leverage,
+                        reason=f"{base_reason} | {block_reason}" if base_reason else block_reason,
+                        metadata=md if isinstance(md, dict) else {},
+                    ),
+                    gate_meta,
+                )
+            if atr_position_scale < 0.999999:
+                scaled_portion = max(
+                    0.0,
+                    min(1.0, self._to_float(decision.target_portion_of_balance, 0.0) * atr_position_scale),
+                )
+                decision = FundFlowDecision(
+                    operation=decision.operation,
+                    symbol=decision.symbol,
+                    target_portion_of_balance=scaled_portion,
+                    leverage=decision.leverage,
+                    max_price=decision.max_price,
+                    reason=decision.reason,
+                    metadata=md if isinstance(md, dict) else {},
+                )
+            if isinstance(md, dict):
+                md["atr_position_scale"] = {
+                    "scale": atr_position_scale,
+                    "atr_pct": atr_pct,
+                }
+
         if isinstance(position, dict):
             equity_fraction = max(0.0, self._estimate_position_portion(position, account_summary))
         else:
@@ -3493,6 +4398,7 @@ class TradingBot:
             "direction": direction,
             "leverage_available": leverage_available,
             "equity_fraction": equity_fraction,
+            "atr_position_scale": atr_position_scale,
         }
 
         execution_quality_1m_raw = flow_context.get("execution_quality_1m") if isinstance(flow_context, dict) else {}
@@ -4015,6 +4921,30 @@ class TradingBot:
         side = str(position.get("side", "")).upper()
         if side not in ("LONG", "SHORT"):
             return None
+        md = base_decision.metadata if isinstance(getattr(base_decision, "metadata", None), dict) else {}
+        direction_lock = str(
+            md.get("direction_lock", trigger_context.get("direction_lock", "BOTH")) or "BOTH"
+        ).upper()
+        direction_conflict = (
+            (side == "LONG" and direction_lock == "SHORT_ONLY")
+            or (side == "SHORT" and direction_lock == "LONG_ONLY")
+        )
+        if direction_conflict:
+            return FundFlowDecision(
+                operation=FundFlowOperation.HOLD,
+                symbol=symbol,
+                target_portion_of_balance=0.0,
+                leverage=max(1, int(getattr(base_decision, "leverage", 0) or getattr(self.fund_flow_decision_engine, "default_leverage", 1))),
+                reason="dca_direction_lock_block",
+                metadata={
+                    **md,
+                    "trigger": trigger_context,
+                    "direction_lock": direction_lock,
+                    "dca_blocked": True,
+                    "dca_block_reason": "direction_lock_conflict",
+                    "dca_position_side": side,
+                },
+            )
         pos_key = self._position_track_key(symbol, side)
         current_stage = int(self._dca_stage_by_pos.get(pos_key, 0) or 0)
         max_additions = int(cfg.get("max_additions", 0) or 0)
@@ -4060,7 +4990,6 @@ class TradingBot:
             return None
         action = FundFlowOperation.BUY if side == "LONG" else FundFlowOperation.SELL
 
-        md = base_decision.metadata if isinstance(getattr(base_decision, "metadata", None), dict) else {}
         metadata = {
             **md,
             "trigger": trigger_context,
@@ -4226,6 +5155,31 @@ class TradingBot:
                     if isinstance(k, str) and stage >= 0:
                         winner_state[k] = stage
             self._winner_pyramid_stage_by_pos = winner_state
+            raw_partial_tp_state = data.get("partial_tp_state_by_pos", {})
+            partial_tp_state: Dict[str, Dict[str, Any]] = {}
+            if isinstance(raw_partial_tp_state, dict):
+                for k, v in raw_partial_tp_state.items():
+                    if not isinstance(k, str) or not isinstance(v, dict):
+                        continue
+                    levels_completed: List[int] = []
+                    levels_raw = v.get("levels_completed", [])
+                    if isinstance(levels_raw, list):
+                        for item in levels_raw:
+                            try:
+                                idx = int(item)
+                            except Exception:
+                                continue
+                            if idx >= 0:
+                                levels_completed.append(idx)
+                    partial_tp_state[k] = {
+                        "levels_completed": sorted(set(levels_completed)),
+                        "trailing_activated": bool(v.get("trailing_activated", False)),
+                        "trailing_high_water": self._to_float(v.get("trailing_high_water"), 0.0),
+                        "trailing_stop_price": self._to_float(v.get("trailing_stop_price"), 0.0),
+                        "market_mode": str(v.get("market_mode", "") or ""),
+                        "mode_change_bars": max(0, int(self._to_float(v.get("mode_change_bars", 0), 0))),
+                    }
+            self._partial_tp_state_by_pos = partial_tp_state
             raw_conflict_streak = data.get("conflict_exit_streak_by_symbol", {})
             conflict_streak: Dict[str, int] = {}
             if isinstance(raw_conflict_streak, dict):
@@ -4269,6 +5223,7 @@ class TradingBot:
             "peak_equity": self._peak_equity,
             "dca_stage_by_pos": self._dca_stage_by_pos,
             "winner_pyramid_stage_by_pos": self._winner_pyramid_stage_by_pos,
+            "partial_tp_state_by_pos": self._partial_tp_state_by_pos,
             "conflict_exit_streak_by_symbol": self._conflict_exit_streak_by_symbol,
             "conflict_cooldown_until_by_symbol": {
                 k: v.isoformat() for k, v in self._conflict_cooldown_until_by_symbol.items() if isinstance(v, datetime)
@@ -5400,6 +6355,7 @@ class TradingBot:
             self._protection_missing_since_ts,
             self._protection_last_alert_ts,
             self._pre_risk_exit_streak_by_pos,
+            self._partial_tp_state_by_pos,
         ):
             keys = [k for k in list(store.keys()) if k.startswith(prefix) and (keep_key is None or k != keep_key)]
             for key in keys:
@@ -5885,7 +6841,7 @@ class TradingBot:
         now_ts = time.time()
         last_ts = float(self._sl_tighten_last_ts.get((symbol, side), 0.0))
         if (now_ts - last_ts) < float(cooldown_sec):
-            return {
+            result = {
                 "status": "skipped",
                 "message": f"cooldown_active: {symbol} {side} ({now_ts - last_ts:.0f}s < {cooldown_sec:.0f}s)",
                 "old_sl": old_sl,
@@ -5896,6 +6852,17 @@ class TradingBot:
                 "break_even_mode": be_mode,
                 "be_trigger_price": be_trigger_price,
             }
+            self._log_exit_protection_event(
+                symbol=symbol,
+                side=side,
+                event_type="protection_priority_applied",
+                priority_stage="conflict_tighten_cooldown_skip",
+                current_price=current_price,
+                position=position,
+                flow_context={"atr_pct": atr_pct_use},
+                payload=dict(result),
+            )
+            return result
 
         # 取消现有止损单
         try:
@@ -5908,7 +6875,7 @@ class TradingBot:
                     f"🛡️ {symbol} SL未更新(not tighter) | side={side} "
                     f"old_sl={old_sl:.6f} new_sl={new_sl:.6f}"
                 )
-                return {
+                result = {
                     "status": "skipped",
                     "message": "not_tighter",
                     "old_sl": old_sl,
@@ -5919,6 +6886,17 @@ class TradingBot:
                     "break_even_mode": be_mode,
                     "be_trigger_price": be_trigger_price,
                 }
+                self._log_exit_protection_event(
+                    symbol=symbol,
+                    side=side,
+                    event_type="protection_priority_applied",
+                    priority_stage="conflict_tighten_not_tighter_skip",
+                    current_price=current_price,
+                    position=position,
+                    flow_context={"atr_pct": atr_pct_use},
+                    payload=dict(result),
+                )
+                return result
 
             for order in existing_orders:
                 order_type = str(order.get("type") or order.get("strategyType") or "").upper()
@@ -5963,8 +6941,18 @@ class TradingBot:
             enriched["min_sl_distance_ratio"] = tighten_distance_ratio
             enriched["break_even_mode"] = be_mode
             enriched["be_trigger_price"] = be_trigger_price
+            self._log_exit_protection_event(
+                symbol=symbol,
+                side=side,
+                event_type="breakeven_activated" if force_break_even else "protection_priority_applied",
+                priority_stage="conflict_tighten_applied",
+                current_price=current_price,
+                position=position,
+                flow_context={"atr_pct": atr_pct_use},
+                payload=dict(enriched),
+            )
             return enriched
-        return {
+        result_payload = {
             "status": "unknown",
             "old_sl": old_sl,
             "new_sl": float(stop_loss),
@@ -5975,6 +6963,17 @@ class TradingBot:
             "be_trigger_price": be_trigger_price,
             "raw": result,
         }
+        self._log_exit_protection_event(
+            symbol=symbol,
+            side=side,
+            event_type="breakeven_activated" if force_break_even else "protection_priority_applied",
+            priority_stage="conflict_tighten_applied",
+            current_price=current_price,
+            position=position,
+            flow_context={"atr_pct": atr_pct_use},
+            payload=dict(result_payload),
+        )
+        return result_payload
 
     def _maybe_log_conflict_protection_stats(self, interval_sec: float = 600.0):
         """定期打印冲突保护统计摘要（每 10 分钟一条）"""
@@ -6349,6 +7348,13 @@ class TradingBot:
             },
         )
 
+        pre_protection_snapshot: Dict[str, Any] = {}
+        if decision.operation == FundFlowOperation.CLOSE and isinstance(position, dict):
+            pre_protection_snapshot = self._capture_protection_snapshot(
+                symbol,
+                self._extract_position_side(position),
+            )
+
         if decision.operation == FundFlowOperation.CLOSE and self._has_pending_close_order(symbol):
             print(f"⏭️ {symbol} 存在待成交平仓单，跳过重复平仓下发")
             return
@@ -6473,6 +7479,36 @@ class TradingBot:
         except Exception as e:
             print(f"⚠️ {symbol} 成交回报写入失败: {e}")
             fill_summary = {}
+
+        if decision.operation == FundFlowOperation.CLOSE and isinstance(position, dict):
+            try:
+                post_snapshot = self._capture_protection_snapshot(
+                    symbol,
+                    self._extract_position_side(position),
+                )
+                fill_summary["pre_protection_snapshot"] = pre_protection_snapshot
+                fill_summary["post_protection_snapshot"] = post_snapshot
+                same_bar_candidate = bool(pre_protection_snapshot.get("has_tp")) and bool(pre_protection_snapshot.get("has_sl"))
+                fill_summary["same_bar_priority_candidate"] = same_bar_candidate
+                inferred_source = "unknown"
+                decision_reason_upper = str(decision.reason or "").upper()
+                if "TAKE_PROFIT" in decision_reason_upper or "PARTIAL_TP" in decision_reason_upper:
+                    inferred_source = "tp_like_reason"
+                elif "STOP" in decision_reason_upper or "BREAKEVEN" in decision_reason_upper or "PROTECT" in decision_reason_upper:
+                    inferred_source = "sl_or_protection_like_reason"
+                fill_summary["inferred_trigger_source"] = inferred_source
+                self._log_same_bar_priority_evidence(
+                    symbol=symbol,
+                    decision=decision,
+                    position=position,
+                    current_price=current_price,
+                    execution_result=execution_result,
+                    fill_summary=fill_summary,
+                    trigger_type=trigger_type,
+                    pre_snapshot=pre_protection_snapshot,
+                )
+            except Exception as e:
+                print(f"⚠️ {symbol} same-bar priority evidence 记录失败: {e}")
 
         if execution_result.get("status") == "success" and decision.operation != FundFlowOperation.HOLD:
             self.trade_count += 1
@@ -7602,6 +8638,17 @@ class TradingBot:
                 decision = ai_decision
             decision_md_raw = getattr(decision, "metadata", None)
             decision_md: Dict[str, Any] = decision_md_raw if isinstance(decision_md_raw, dict) else {}
+            if isinstance(position, dict):
+                decision = self._apply_position_management_overrides(
+                    symbol=symbol,
+                    position=position,
+                    current_price=current_price,
+                    decision=decision,
+                    flow_context=flow_context if isinstance(flow_context, dict) else {},
+                )
+                decision_md_candidate = getattr(decision, "metadata", None)
+                if isinstance(decision_md_candidate, dict):
+                    decision_md = decision_md_candidate
             if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                 self._record_alpha_dilution_stage(
                     "v2_engine_raw",
@@ -8583,7 +9630,7 @@ class TradingBot:
             
                 if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                     local_entry_score = self._decision_signal_score(decision, flow_context)
-                    ai_review_enforced = bool(ai_review_cfg.get("enabled", True))
+                    ai_review_enforced = bool(ai_review_cfg.get("enforced", ai_review_cfg.get("enabled", True)))
                     allow_same_side_add, block_reason = self._ai_entry_guard(
                         decision=decision,
                         local_score=local_entry_score,
@@ -8836,6 +9883,8 @@ class TradingBot:
     def _finalize_entries(self, context: Dict[str, Any]) -> None:
         pending_new_entries_raw = context.get("pending_new_entries")
         pending_new_entries = pending_new_entries_raw if isinstance(pending_new_entries_raw, list) else []
+        position_snapshot_raw = context.get("position_snapshot")
+        position_snapshot = position_snapshot_raw if isinstance(position_snapshot_raw, dict) else {}
         block_new_entries_due_to_protection_gap = bool(
             context.get("block_new_entries_due_to_protection_gap", False)
         )
@@ -8850,7 +9899,7 @@ class TradingBot:
         ai_review_mode = str(context.get("ai_review_mode") or "disabled").lower()
         ai_flat_top_n = max(1, int(self._to_float(ai_review_cfg.get("flat_top_n", 2), 2)))
         ai_review_flat_enabled = self._ai_review_mode_supports_flat_candidates(ai_review_mode)
-        ai_review_enforced = bool(ai_review_cfg.get("enabled", True))
+        ai_review_enforced = bool(ai_review_cfg.get("enforced", ai_review_cfg.get("enabled", True)))
 
         def _item_decision(item: Dict[str, Any]) -> Optional[FundFlowDecision]:
             decision_raw = item.get("decision")
@@ -8905,13 +9954,24 @@ class TradingBot:
                     )
         pending_new_entries = close_candidates + open_candidates
         if pending_new_entries:
-            active_symbols_estimate: set[str] = set()
+            active_symbols_estimate: set[str] = {
+                str(symbol).upper()
+                for symbol, pos in position_snapshot.items()
+                if str(symbol).strip() and isinstance(pos, dict)
+            }
             try:
-                active_positions = self.position_data.get_all_positions()
+                active_positions = self._position_snapshot_by_symbol()
                 if isinstance(active_positions, dict):
-                    active_symbols_estimate = {str(s).upper() for s in active_positions.keys()}
+                    active_symbols_estimate.update(str(s).upper() for s in active_positions.keys())
             except Exception:
-                active_symbols_estimate = set()
+                pass
+            if not active_symbols_estimate:
+                try:
+                    cached_positions = self.position_data.get_all_positions()
+                    if isinstance(cached_positions, dict):
+                        active_symbols_estimate = {str(s).upper() for s in cached_positions.keys()}
+                except Exception:
+                    active_symbols_estimate = set()
             active_symbols_estimate.update(str(s).upper() for s in self._opened_symbols_this_cycle)
             for rank, item in enumerate(pending_new_entries, start=1):
                 decision_i = _item_decision(item)
@@ -9037,6 +10097,10 @@ class TradingBot:
                                 f"action={ai_decision.operation.value.upper()} "
                                 f"source={ai_source} conf={ai_conf:.3f}"
                             )
+                        if ai_review_enforced and (
+                            ai_decision.operation != decision_i.operation or not allow_ai_entry
+                        ):
+                            continue
                 else:
                     print(
                         f"🤖 {symbol_i} 未进入AI终审: rank={rank} shortlist={shortlist_rank} "

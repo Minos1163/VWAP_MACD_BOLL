@@ -97,6 +97,25 @@ def test_dca_config_disables_martingale_when_effective_leverage_is_nine_or_more(
     assert cfg["effective_leverage"] == 10
 
 
+def test_dca_config_cannot_be_reenabled_by_override_when_global_switch_is_off():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "trading": {"default_leverage": 3},
+        "fund_flow": {
+            "dca_martingale_enabled": False,
+            "dca_max_additions": 0,
+            "dca_drawdown_thresholds": [0.01, 0.02],
+            "dca_multipliers": [1.0, 2.0],
+        },
+    }
+    bot.fund_flow_decision_engine = SimpleNamespace(default_leverage=3)
+
+    cfg = bot._dca_config({"dca_max_additions": 2})
+
+    assert cfg["enabled"] is False
+    assert cfg["max_additions"] == 0
+
+
 def test_build_dca_decision_hard_blocks_high_leverage_even_if_cfg_enabled():
     bot = TradingBot.__new__(TradingBot)
     bot.config = {"fund_flow": {}}
@@ -137,3 +156,66 @@ def test_build_dca_decision_hard_blocks_high_leverage_even_if_cfg_enabled():
     )
 
     assert decision is None
+
+
+def test_build_dca_decision_blocks_when_direction_lock_conflicts_with_position_side():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {"fund_flow": {"dca_martingale_enabled": True}}
+    bot._dca_stage_by_pos = {}
+    bot._position_track_key = lambda symbol, side: f"{symbol}:{side}"
+    bot._position_drawdown_ratio = lambda position, current_price: 0.03
+    bot.fund_flow_decision_engine = SimpleNamespace(
+        entry_slippage=0.001,
+        take_profit_pct=0.0,
+        stop_loss_pct=0.02,
+        default_leverage=2,
+    )
+
+    base_decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.1,
+        leverage=2,
+        metadata={"direction_lock": "SHORT_ONLY"},
+    )
+
+    decision = bot._build_dca_decision(
+        symbol="BTCUSDT",
+        position={"side": "LONG", "leverage": 2},
+        current_price=100.0,
+        base_decision=base_decision,
+        trigger_context={"trigger_type": "signal"},
+        dca_cfg={
+            "enabled": True,
+            "max_additions": 1,
+            "drawdown_thresholds": [0.01],
+            "multipliers": [1.0],
+            "base_add_portion": 0.05,
+        },
+    )
+
+    assert decision is not None
+    assert decision.operation == Operation.HOLD
+    assert decision.reason == "dca_direction_lock_block"
+    assert decision.metadata["direction_lock"] == "SHORT_ONLY"
+    assert decision.metadata["dca_blocked"] is True
+
+
+def test_risk_config_reads_new_fund_flow_limits():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "daily_loss_limit_pct": 0.03,
+            "consecutive_loss_halt_count": 3,
+            "consecutive_loss_cooldown_seconds": 900,
+            "daily_loss_cooldown_seconds": 1800,
+        }
+    }
+    bot._normalize_percent_to_ratio = lambda value, default: float(value if value is not None else default)
+
+    cfg = bot._risk_config()
+
+    assert cfg["max_daily_loss_pct"] == 0.03
+    assert cfg["max_consecutive_losses"] == 3
+    assert cfg["consecutive_loss_cooldown_seconds"] == 900
+    assert cfg["daily_loss_cooldown_seconds"] == 1800

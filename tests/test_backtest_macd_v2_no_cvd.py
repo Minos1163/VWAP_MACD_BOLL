@@ -34,6 +34,29 @@ def test_build_strategy_config_disables_cvd_decision_logic_by_default():
     assert strategy_config.use_cvd_veto_filter is False
 
 
+def test_build_strategy_config_loads_pocket_scoring_overrides() -> None:
+    strategy_config = build_strategy_config(
+        {
+            "fund_flow": {
+                "macd_mtf_strategy_v2": {
+                    "pocket_scoring_overrides": {
+                        "*|long_dual_support": {
+                            "weight_4h_direction": 0.15,
+                            "weight_1h_direction": 0.35,
+                            "weight_vwap": 0.25,
+                            "weight_15m_entry": 0.10,
+                            "weight_volume": 0.05,
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    assert strategy_config.pocket_scoring_overrides["*|long_dual_support"]["weight_4h_direction"] == 0.15
+    assert strategy_config.pocket_scoring_overrides["*|long_dual_support"]["weight_1h_direction"] == 0.35
+
+
 def test_analyze_bar_skips_cvd_veto_and_bonus_when_no_cvd_mode():
     engine = BacktestEngine.__new__(BacktestEngine)
     engine.disable_cvd_decision_logic = True

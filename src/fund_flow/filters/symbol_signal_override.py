@@ -21,10 +21,13 @@ class SymbolSignalOverride:
     
     # 信号禁用覆盖（None = 继承全局配置）
     disable_flip_bullish: Optional[bool] = None
+    disable_flip_bullish_trial: Optional[bool] = None
     disable_green_bar_growing: Optional[bool] = None
+    disable_long_dual_support: Optional[bool] = None
     
     # 评分门槛覆盖
     min_signal_score_override: Optional[float] = None
+    preflip_trial_min_signal_score_override: Optional[float] = None
     
     # VWAP 评分门槛覆盖
     min_vwap_score_override: Optional[float] = None
@@ -41,8 +44,11 @@ class SymbolSignalOverride:
         return cls(
             symbol=str(data.get("symbol", "")).strip().upper(),
             disable_flip_bullish=data.get("disable_flip_bullish"),
+            disable_flip_bullish_trial=data.get("disable_flip_bullish_trial"),
             disable_green_bar_growing=data.get("disable_green_bar_growing"),
+            disable_long_dual_support=data.get("disable_long_dual_support"),
             min_signal_score_override=data.get("min_signal_score_override"),
+            preflip_trial_min_signal_score_override=data.get("preflip_trial_min_signal_score_override"),
             min_vwap_score_override=data.get("min_vwap_score_override"),
             ema_multiplier_override=data.get("ema_multiplier_override"),
             extra_config=data.get("extra_config", {}),

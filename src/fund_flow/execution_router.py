@@ -45,6 +45,10 @@ class FundFlowExecutionRouter:
         self.close_ioc_retry_step_bps = max(0.0, self._to_float(degrade_cfg.get("close_ioc_retry_step_bps", 10.0), 10.0))
         self.close_gtc_fallback_enabled = self._to_bool(degrade_cfg.get("close_gtc_fallback_enabled", True), True)
         self.close_market_fallback_enabled = self._to_bool(degrade_cfg.get("close_market_fallback_enabled", False), False)
+        self.max_single_trade_nominal_ratio = max(
+            0.0,
+            self._to_float(ff_cfg.get("max_single_trade_nominal_ratio"), 0.0),
+        )
 
     @staticmethod
     def _to_float(value: Any, default: float = 0.0) -> float:
@@ -777,6 +781,27 @@ class FundFlowExecutionRouter:
             return executed_qty >= max(orig_qty - 1e-12, 0.0)
         return False
 
+    def _check_nominal_risk_limit(
+        self,
+        *,
+        symbol: str,
+        quantity: float,
+        price: float,
+        account_equity: float,
+    ) -> Dict[str, Any]:
+        nominal_value = max(0.0, quantity) * max(0.0, price)
+        equity = max(0.0, account_equity)
+        ratio = (nominal_value / equity) if equity > 0 else 0.0
+        limit = self.max_single_trade_nominal_ratio
+        return {
+            "symbol": symbol,
+            "nominal_value": nominal_value,
+            "account_equity": equity,
+            "ratio": ratio,
+            "limit": limit,
+            "blocked": bool(limit > 0 and ratio > limit),
+        }
+
     def execute_decision(
         self,
         decision: FundFlowDecision,
@@ -841,6 +866,27 @@ class FundFlowExecutionRouter:
                         "status": "error",
                         "message": "开仓数量无效（最小下单量/余额约束）",
                         "quantity_info": qty_info,
+                    }
+                    self.attribution.log_execution(decision, result)
+                    return result
+                account_equity = self._to_float(
+                    account_state.get("equity", account_state.get("total_equity", available_balance)),
+                    available_balance,
+                )
+                nominal_risk = self._check_nominal_risk_limit(
+                    symbol=decision.symbol,
+                    quantity=qty,
+                    price=current_price,
+                    account_equity=account_equity,
+                )
+                if nominal_risk.get("blocked"):
+                    result = {
+                        "status": "error",
+                        "message": "单笔名义风险超限，禁止开仓",
+                        "nominal_risk": nominal_risk,
+                        "quantity_info": qty_info,
+                        "leverage_sync": leverage_sync,
+                        "trigger_context": trigger_context,
                     }
                     self.attribution.log_execution(decision, result)
                     return result

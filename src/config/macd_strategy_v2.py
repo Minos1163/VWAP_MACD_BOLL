@@ -89,12 +89,16 @@ class MACDStrategyV2Config:
     # 1H flip_bullish 严格过滤
     enable_flip_bullish_strict_filter: bool = True
     disable_flip_bullish_entries: bool = False
+    disable_flip_bullish_trial_entries: bool = False
     flip_bullish_min_vwap_score: float = 0.12
     flip_bullish_require_pullback_bounce: bool = True
     flip_bullish_require_15m_growing: bool = True
     enable_flip_bullish_cvd_context_filter: bool = False
     flip_bullish_max_cvd_upper_wick_ratio: float = 0.0
     flip_bullish_min_cvd_1h_delta_ratio: float = 0.0
+    flip_bullish_trial_score_window_enabled: bool = False
+    flip_bullish_trial_score_min: float = 0.80
+    flip_bullish_trial_score_max: float = 0.87
     flip_bearish_min_ema_multiplier: float = 0.0
     flip_bearish_normal_ema_min_signal_score: float = 0.0
     flip_bearish_normal_ema_max_leverage: int = 0
@@ -2426,6 +2430,32 @@ class MACDStrategyV2Engine:
             )
 
         if (
+            signal_type_1h == 'flip_bullish'
+            and is_trial_entry
+            and self.config.disable_flip_bullish_trial_entries
+        ):
+            debug_details = self._set_stage(
+                debug_details,
+                "flip_bullish_trial_disabled",
+                flip_bullish_trial_disabled=True,
+            )
+            return self._neutral_signal(
+                reason='flip_bullish_trial_disabled',
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+
+        if (
             strict_1h_filters_enabled
             and not stable_continuation_active
             and self.config.enable_flip_bullish_strict_filter
@@ -2464,8 +2494,7 @@ class MACDStrategyV2Engine:
                 )
 
         if (
-            not is_trial_entry
-            and trade_direction == 'long'
+            trade_direction == 'long'
             and signal_type_1h == 'flip_bullish'
             and self.config.enable_flip_bullish_cvd_context_filter
             and not stable_continuation_active

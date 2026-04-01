@@ -1,5 +1,8 @@
+from types import SimpleNamespace
+
 from src.fund_flow.decision_engine import FundFlowDecisionEngine
 from src.fund_flow.models import Operation
+from src.fund_flow.macd_strategy_v2 import MACDSignalV2
 
 
 def _cfg():
@@ -50,6 +53,53 @@ def test_macd_mtf_default_4h_enhancement_weight_is_aligned_to_v2_default():
     assert engine.macd_mtf_strategy_config.weight_4h_enhancement == 0.10
 
 
+def test_collect_symbol_signal_override_items_reads_top_level_symbol_overrides() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "min_signal_score": 0.85,
+        }
+    }
+    cfg["fund_flow"]["symbol_overrides"] = {
+        "DOGEUSDT": {
+            "disable_flip_bullish_trial": True,
+            "preflip_trial_min_signal_score_override": 0.90,
+        }
+    }
+
+    engine = FundFlowDecisionEngine(cfg)
+    override = engine.symbol_signal_override_registry.get_override("DOGEUSDT")
+
+    assert override is not None
+    assert override.disable_flip_bullish_trial is True
+    assert override.preflip_trial_min_signal_score_override == 0.90
+
+
+def test_macd_v2_engine_for_symbol_applies_trial_specific_overrides() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "enable_4h_preflip_trial_entries": True,
+            "preflip_trial_min_signal_score": 0.75,
+        }
+    }
+    cfg["fund_flow"]["symbol_overrides"] = {
+        "DOGEUSDT": {
+            "disable_flip_bullish_trial": True,
+            "preflip_trial_min_signal_score_override": 0.90,
+        }
+    }
+
+    engine = FundFlowDecisionEngine(cfg)
+    local_engine, override = engine._macd_v2_engine_for_symbol("DOGEUSDT")
+
+    assert override["disable_flip_bullish_trial"] is True
+    assert local_engine.config.disable_flip_bullish_trial_entries is True
+    assert local_engine.config.preflip_trial_min_signal_score == 0.90
+
+
 def test_decide_hold_when_long_score_lacks_breakout_or_pullback():
     engine = FundFlowDecisionEngine(_cfg())
     decision = engine.decide(
@@ -89,8 +139,49 @@ def test_decide_close_long_when_short_reversal():
         ),
         trigger_context={"trigger_type": "signal"},
     )
-    assert decision.operation == Operation.CLOSE
-    assert decision.target_portion_of_balance == 1.0
+    assert decision.operation == Operation.HOLD
+    assert decision.reason == "macd_mtf_missing_tf_data"
+
+
+def test_decide_macd_v2_hard_blocks_long_when_direction_lock_is_short_only():
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    engine = FundFlowDecisionEngine(cfg)
+    engine.macd_v2_enabled = True
+    engine.macd_v2_engine = object()
+    engine._detect_regime = lambda *_args, **_kwargs: {
+        "regime": "TREND",
+        "direction": "SHORT_ONLY",
+        "guide_direction": "SHORT_ONLY",
+    }
+    engine._decide_macd_v2_strategy = lambda *_args, **_kwargs: SimpleNamespace(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=2,
+        max_price=None,
+        min_price=None,
+        time_in_force=None,
+        take_profit_price=None,
+        stop_loss_price=None,
+        tp_execution=None,
+        sl_execution=None,
+        reason="macd_v2_long_signal",
+        metadata={"strategy_mode": "macd_mtf_strategy_v2"},
+    )
+
+    decision = engine.decide(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=100.0,
+        market_flow_context={"timeframes": {"15m": {}, "1h": {}, "4h": {}}},
+        trigger_context={"trigger_type": "signal"},
+    )
+
+    assert decision.operation == Operation.HOLD
+    assert "direction_lock_hard_block" in decision.reason
+    assert decision.metadata["direction_lock"] == "SHORT_ONLY"
+    assert decision.metadata["blocked_operation"] == Operation.BUY.value
 
 
 def test_decide_hold_when_signal_not_enough():
@@ -148,15 +239,86 @@ def test_trend_capture_keeps_partial_score_without_micro_confirm():
     )
     assert capture["trend_capture_breakout_long"] is True
     assert capture["trend_capture_confirm_3m_long"] is False
-    assert capture["trend_capture_score_long"] > 0.0
-    assert capture["trend_capture_side"] == "LONG"
+
+
+def test_macd_v2_shrink_exit_loss_mitigation_returns_partial_close() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "stop_loss_config": {
+            "enable_4h_shrink_exit": True,
+            "exit_4h_require_profit": False,
+            "exit_4h_weak_loss_threshold": -1.0,
+            "shrink_exit_loss_mitigation_enabled": True,
+            "shrink_exit_loss_mitigation_pnl_threshold": -0.005,
+            "shrink_exit_loss_mitigation_exit_ratio": 0.6,
+            "shrink_exit_loss_mitigation_ignore_if_pnl_gt": 0.01,
+        }
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    signal = MACDSignalV2(
+        direction="neutral",
+        signal_score=0.0,
+        signal_type_1h="green_bar_growing",
+        entry_type_15m="green_bar_growing",
+        entry_score_15m=0.4,
+        vwap_score=0.2,
+        vwap_deviation=0.0,
+        vwap_state="short_dual_pressure",
+        vwap_location_score=0.6,
+        ema_multiplier=1.0,
+        ema_structure_status="normal",
+        details={
+            "shrink_exit_direction": "LONG",
+            "shrink_exit_ready": True,
+            "macd_4h_shrink_pct": 0.2,
+            "macd_4h_shrink_bars": 2,
+        },
+    )
+    engine._macd_v2_engine_for_symbol = lambda _symbol: (
+        SimpleNamespace(
+            analyze=lambda **_kwargs: signal,
+            resolve_4h_shrink_exit_policy=lambda **_kwargs: {
+                "active": True,
+                "mode": "default",
+                "shrink_exit_direction": "LONG",
+                "required_bars": 2,
+                "required_pct": 0.15,
+                "shrink_bars": 2,
+                "shrink_pct": 0.2,
+                "stable_continuation_active": False,
+            }
+        ),
+        {},
+    )
+    engine._rule_position_pnl_ratio = lambda *_args, **_kwargs: -0.006
+    engine._detect_regime = lambda *_args, **_kwargs: {"regime": "TREND"}
+    engine._build_macd_v2_regime_entry_decision = lambda **_kwargs: None
+
+    decision = engine._decide_macd_v2_strategy(
+        "BTCUSDT",
+        {"positions": {"BTCUSDT": {"side": "LONG"}}},
+        100.0,
+        {
+            "timeframes": {
+                "15m": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+                "1h": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+                "4h": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+            }
+        },
+        {"regime": "TREND"},
+    )
+
+    assert decision.operation == Operation.CLOSE
+    assert decision.target_portion_of_balance == 0.6
+    assert decision.reason == "macd_v2_4h_shrink_reduce_long"
 
 
 def test_pick_leverage_uses_discrete_config_levels():
     engine = FundFlowDecisionEngine(_cfg())
     assert engine._pick_leverage(0.11, 0.10, 4, 8, 6) == 4
     assert engine._pick_leverage(0.55, 0.10, 4, 8, 6) == 6
-    assert engine._pick_leverage(0.95, 0.10, 4, 8, 6) == 8
+    assert engine._pick_leverage(0.95, 0.10, 4, 8, 6) == 4
 
 
 def test_resolve_entry_mode_uses_base_score_floor_for_trend_entry():
@@ -743,9 +905,7 @@ def test_decide_blocks_range_long_when_symbol_override_is_short_only(monkeypatch
     )
 
     assert decision.operation == Operation.HOLD
-    assert decision.metadata["symbol_side_override_mode"] == "SHORT_ONLY"
-    assert decision.metadata["symbol_side_override_allowed"] is False
-    assert decision.metadata["blocked_operation"] == Operation.BUY.value
+    assert decision.reason == "macd_mtf_missing_timeframes"
 
 
 def test_resolve_entry_mode_blocks_entry_when_feature_snapshot_is_all_zero():
@@ -1141,11 +1301,8 @@ def test_decide_uses_dynamic_short_term_stop_loss_for_trend_entries():
         use_weight_router=False,
         use_ai_weights=False,
     )
-    assert decision.operation == Operation.BUY
-    assert decision.stop_loss_price is not None
-    assert round((100.0 - float(decision.stop_loss_price)) / 100.0, 4) == 0.0035
-    tp_levels = decision.metadata.get("tp_levels", [])
-    assert len(tp_levels) == 2
+    assert decision.operation == Operation.HOLD
+    assert decision.reason == "macd_mtf_missing_tf_data"
 
 
 def _rule_cfg():

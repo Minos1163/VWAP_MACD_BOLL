@@ -26,6 +26,86 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def check_pocket_entry_override(
+    signal_type: str,
+    vwap_state: str,
+    is_trial_entry: bool,
+    signal_score: float,
+    vwap_score: float,
+    entry_score: float,
+    bar_1h_direction: str,
+    flow_cvd_ok: bool,
+    micro_cvd_momentum_ok: bool,
+    pocket_entry_overrides: dict,
+) -> tuple[bool, str]:
+    """
+    在 entry_hard_gates 通过后执行 pocket 级独立准入检查。
+    """
+    overrides = pocket_entry_overrides if isinstance(pocket_entry_overrides, dict) else {}
+    pocket_key = f"{str(signal_type or '').strip()}|{str(vwap_state or '').strip()}"
+    pocket_cfg = overrides.get(pocket_key)
+
+    if not isinstance(pocket_cfg, dict) or not pocket_cfg:
+        return True, "POCKET_GATE:NO_OVERRIDE"
+
+    if pocket_cfg.get("disallow_trial_entry", False) and is_trial_entry:
+        return False, (
+            f"POCKET_GATE[{pocket_key}]:TRIAL_DISALLOWED "
+            f"is_trial_entry={is_trial_entry}"
+        )
+
+    bar_1h_direction = str(bar_1h_direction or "").strip().upper()
+    if pocket_cfg.get("require_strict_1h_confirmation", False):
+        allowed = {"BULLISH", "WEAKLY_BULLISH"}
+        if bar_1h_direction not in allowed:
+            return False, (
+                f"POCKET_GATE[{pocket_key}]:1H_NOT_BULLISH "
+                f"bar_1h_direction={bar_1h_direction} "
+                f"allowed={sorted(allowed)}"
+            )
+    elif pocket_cfg.get("allow_neutral_1h_confirmation") is False:
+        if bar_1h_direction == "NEUTRAL":
+            return False, (
+                f"POCKET_GATE[{pocket_key}]:1H_NEUTRAL_BLOCKED "
+                f"bar_1h_direction={bar_1h_direction}"
+            )
+
+    min_signal_score = pocket_cfg.get("min_signal_score")
+    if min_signal_score is not None and float(signal_score) < float(min_signal_score):
+        return False, (
+            f"POCKET_GATE[{pocket_key}]:SIGNAL_SCORE_LOW "
+            f"{float(signal_score):.4f} < {min_signal_score}"
+        )
+
+    min_vwap_score = pocket_cfg.get("min_vwap_score")
+    if min_vwap_score is not None and float(vwap_score) < float(min_vwap_score):
+        return False, (
+            f"POCKET_GATE[{pocket_key}]:VWAP_SCORE_LOW "
+            f"{float(vwap_score):.4f} < {min_vwap_score}"
+        )
+
+    min_entry_score = pocket_cfg.get("min_entry_score")
+    if min_entry_score is not None and float(entry_score) < float(min_entry_score):
+        return False, (
+            f"POCKET_GATE[{pocket_key}]:ENTRY_SCORE_LOW "
+            f"{float(entry_score):.4f} < {min_entry_score}"
+        )
+
+    if pocket_cfg.get("require_cvd_ok", False) and not flow_cvd_ok:
+        return False, (
+            f"POCKET_GATE[{pocket_key}]:CVD_NOT_OK "
+            f"flow_cvd_ok={flow_cvd_ok}"
+        )
+
+    if pocket_cfg.get("require_cvd_momentum_ok", False) and not micro_cvd_momentum_ok:
+        return False, (
+            f"POCKET_GATE[{pocket_key}]:CVD_MOMENTUM_NOT_OK "
+            f"micro_cvd_momentum_ok={micro_cvd_momentum_ok}"
+        )
+
+    return True, f"POCKET_GATE[{pocket_key}]:PASS"
+
+
 class VetoType(Enum):
     """否决类型"""
     NONE = "none"
@@ -72,29 +152,36 @@ class MACDStrategyV2Config:
     vwap_retest_tolerance: float = 0.003
     
     # 评分权重
-    weight_1h_direction: float = 0.00  # 兼容旧配置键：未显式提供 weight_4h_direction 时作为回退
-    weight_4h_direction: float = 0.55  # 4H主趋势评分权重
+    weight_1h_direction: float = 0.20  # 1H方向辅助评分权重
+    weight_4h_direction: float = 0.40  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
     weight_vwap: float = 0.20  # VWAP评分权重
     weight_15m_entry: float = 0.05  # 15M入场时机评分权重（软确认）
-    weight_volume: float = 0.20  # 成交量确认评分权重
+    weight_volume: float = 0.15  # 成交量确认评分权重
     
     # 入场阈值
     min_entry_score: float = 0.25
-    min_signal_score: float = 0.850
-    red_bar_growing_min_signal_score: float = 0.850
-    flip_bearish_min_signal_score: float = 0.840
-    flip_bullish_min_signal_score: float = 0.840
+    min_signal_score: float = 0.830
+    red_bar_growing_min_signal_score: float = 0.845
+    flip_bearish_min_signal_score: float = 0.825
+    flip_bullish_min_signal_score: float = 0.825
 
     # 1H flip_bullish 严格过滤
     enable_flip_bullish_strict_filter: bool = True
     disable_flip_bullish_entries: bool = False
+    disable_flip_bullish_trial_entries: bool = False
     flip_bullish_min_vwap_score: float = 0.12
     flip_bullish_require_pullback_bounce: bool = True
     flip_bullish_require_15m_growing: bool = True
     enable_flip_bullish_cvd_context_filter: bool = False
     flip_bullish_max_cvd_upper_wick_ratio: float = 0.0
     flip_bullish_min_cvd_1h_delta_ratio: float = 0.0
+    flip_bullish_trial_score_window_enabled: bool = False
+    flip_bullish_trial_score_min: float = 0.80
+    flip_bullish_trial_score_max: float = 0.87
+    green_bar_growing_score_window_enabled: bool = False
+    green_bar_growing_score_min: float = 0.0
+    green_bar_growing_score_max: float = 1.0
     flip_bearish_min_ema_multiplier: float = 0.0
     flip_bearish_normal_ema_min_signal_score: float = 0.0
     flip_bearish_normal_ema_max_leverage: int = 0
@@ -113,6 +200,7 @@ class MACDStrategyV2Config:
     allow_neutral_1h_confirmation: bool = False
     light_1h_confirmation_when_4h_primary: bool = False
     enable_soft_15m_confirmation_when_4h_primary: bool = True
+    require_15m_confirmation_gate: bool = False
     soft_15m_entry_score: float = 0.28
     soft_15m_neutral_hist_multiple: float = 3.0
     soft_15m_max_adverse_hist_multiple: float = 8.0
@@ -120,9 +208,9 @@ class MACDStrategyV2Config:
     green_bar_growing_short_min_adx_1h: float = 0.0
     green_bar_growing_short_max_adx_1h: float = 0.0
     enable_4h_preflip_trial_entries: bool = False
-    preflip_trial_min_shrink_pct_long: float = 0.75
-    preflip_trial_min_shrink_pct_short: float = 0.30
-    preflip_trial_min_signal_score: float = 0.78
+    preflip_trial_min_shrink_pct_long: float = 0.45
+    preflip_trial_min_shrink_pct_short: float = 0.22
+    preflip_trial_min_signal_score: float = 0.70
     preflip_trial_min_vwap_score: float = 0.06
     preflip_trial_entry_scale: float = 0.35
     preflip_trial_max_leverage: int = 2
@@ -133,15 +221,17 @@ class MACDStrategyV2Config:
     trial_short_below_structure_promotion_min_4h_shrink_pct: float = 0.80
     trial_short_below_structure_promotion_min_4h_shrink_bars: int = 6
     enable_stable_bear_continuation: bool = True
-    stable_bear_continuation_min_signal_score: float = 0.82
-    stable_bear_continuation_min_vwap_score: float = 0.10
+    stable_bear_continuation_min_signal_score: float = 0.80
+    stable_bear_continuation_min_vwap_score: float = 0.07
     stable_bear_continuation_min_adx_1h: float = 20.0
     stable_bear_continuation_min_4h_bars: int = 2
     enable_stable_bull_continuation: bool = False
-    stable_bull_continuation_min_signal_score: float = 0.82
+    stable_bull_continuation_min_signal_score: float = 0.80
     stable_bull_continuation_min_vwap_score: float = 0.10
     stable_bull_continuation_min_adx_1h: float = 20.0
     stable_bull_continuation_min_4h_bars: int = 2
+    pocket_entry_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    pocket_scoring_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     enable_stable_continuation_slow_4h_shrink_exit: bool = True
     stable_continuation_exit_4h_shrink_bars: int = 3
     stable_continuation_exit_4h_min_shrink_pct: float = 0.35
@@ -150,6 +240,10 @@ class MACDStrategyV2Config:
     exit_4h_min_shrink_pct: float = 0.20
     exit_4h_require_profit: bool = True
     exit_4h_weak_loss_threshold: float = -1.0
+    shrink_exit_loss_mitigation_enabled: bool = False
+    shrink_exit_loss_mitigation_pnl_threshold: float = -0.005
+    shrink_exit_loss_mitigation_exit_ratio: float = 0.60
+    shrink_exit_loss_mitigation_ignore_if_pnl_gt: float = 0.01
     session_risk_control_enabled: bool = False
     session_risk_high_risk_sessions: List[Dict[str, Any]] = field(default_factory=list)
     session_risk_apply_to_states: List[str] = field(default_factory=list)
@@ -165,7 +259,7 @@ class MACDStrategyV2Config:
     overheat_growing_penalty: float = 0.12
     overheat_ema_multiplier_threshold: float = 1.2
     overheat_vwap_score_threshold: float = 0.10
-    min_vwap_score_for_entry: float = 0.12  # VWAP全局过滤
+    min_vwap_score_for_entry: float = 0.10  # VWAP全局过滤
     
     # 止损配置
     use_dynamic_stop: bool = True
@@ -236,6 +330,54 @@ class MACDStrategyV2Config:
         if str(signal_type_1h or "").strip().lower() != "flip_bearish":
             return False
         return abs(float(ema_multiplier) - float(self.ema_multiplier_normal)) < 1e-9
+
+    @staticmethod
+    def normalize_pocket_key(signal_type_1h: Optional[str], vwap_state: Optional[str]) -> str:
+        signal_key = str(signal_type_1h or "*").strip().lower() or "*"
+        state_key = str(vwap_state or "*").strip().lower() or "*"
+        return f"{signal_key}|{state_key}"
+
+    def resolve_pocket_entry_override(
+        self,
+        signal_type_1h: Optional[str],
+        vwap_state: Optional[str],
+    ) -> Dict[str, Any]:
+        overrides = self.pocket_entry_overrides or {}
+        if not isinstance(overrides, dict) or not overrides:
+            return {}
+
+        candidates = [
+            self.normalize_pocket_key(signal_type_1h, vwap_state),
+            self.normalize_pocket_key("*", vwap_state),
+            self.normalize_pocket_key(signal_type_1h, "*"),
+            self.normalize_pocket_key("*", "*"),
+        ]
+        for key in candidates:
+            override = overrides.get(key)
+            if isinstance(override, dict) and override:
+                return dict(override)
+        return {}
+
+    def resolve_pocket_scoring_override(
+        self,
+        signal_type_1h: Optional[str],
+        vwap_state: Optional[str],
+    ) -> Dict[str, Any]:
+        overrides = self.pocket_scoring_overrides or {}
+        if not isinstance(overrides, dict) or not overrides:
+            return {}
+
+        candidates = [
+            self.normalize_pocket_key(signal_type_1h, vwap_state),
+            self.normalize_pocket_key("*", vwap_state),
+            self.normalize_pocket_key(signal_type_1h, "*"),
+            self.normalize_pocket_key("*", "*"),
+        ]
+        for key in candidates:
+            override = overrides.get(key)
+            if isinstance(override, dict) and override:
+                return dict(override)
+        return {}
 
 
 @dataclass
@@ -327,6 +469,87 @@ class MACDStrategyV2Engine:
             code, detail = text.split(":", 1)
             return code.strip(), detail.strip()
         return text, ""
+
+    def resolve_pocket_entry_requirements(
+        self,
+        *,
+        signal_type_1h: Optional[str],
+        vwap_state: Optional[str],
+        is_trial_entry: bool,
+        stable_continuation_side: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        pocket_override = self.config.resolve_pocket_entry_override(signal_type_1h, vwap_state)
+        threshold = self.config.resolve_signal_score_threshold(
+            signal_type_1h,
+            stable_continuation_side=stable_continuation_side,
+        )
+        if is_trial_entry:
+            threshold = float(self.config.preflip_trial_min_signal_score)
+
+        min_vwap_score = max(
+            0.0,
+            float(self.config.preflip_trial_min_vwap_score if is_trial_entry else self.config.min_vwap_score_for_entry),
+        )
+
+        effective = {
+            "signal_score_threshold": float(pocket_override.get("min_signal_score", threshold)),
+            "min_vwap_score_for_entry": float(pocket_override.get("min_vwap_score", min_vwap_score)),
+            "min_entry_score": (
+                float(pocket_override["min_entry_score"])
+                if "min_entry_score" in pocket_override and pocket_override.get("min_entry_score") is not None
+                else None
+            ),
+            "allow_neutral_1h_confirmation": bool(
+                pocket_override.get("allow_neutral_1h_confirmation", self.config.allow_neutral_1h_confirmation)
+            ),
+            "require_strict_1h_confirmation": bool(pocket_override.get("require_strict_1h_confirmation", False)),
+            "disallow_trial_entry": bool(pocket_override.get("disallow_trial_entry", False)),
+            "disabled": bool(pocket_override.get("disabled", False)),
+            "override_label": str(
+                pocket_override.get(
+                    "label",
+                    self.config.normalize_pocket_key(signal_type_1h, vwap_state),
+                )
+            ),
+            "raw_override": pocket_override,
+        }
+        return effective
+
+    def resolve_pocket_scoring_weights(
+        self,
+        *,
+        signal_type_1h: Optional[str],
+        vwap_state: Optional[str],
+    ) -> Dict[str, Any]:
+        pocket_override = self.config.resolve_pocket_scoring_override(signal_type_1h, vwap_state)
+        effective = {
+            "weight_1h_direction": float(
+                pocket_override.get("weight_1h_direction", self.config.weight_1h_direction)
+            ),
+            "weight_4h_direction": float(
+                pocket_override.get("weight_4h_direction", self.config.weight_4h_direction)
+            ),
+            "weight_4h_enhancement": float(
+                pocket_override.get("weight_4h_enhancement", self.config.weight_4h_enhancement)
+            ),
+            "weight_vwap": float(
+                pocket_override.get("weight_vwap", self.config.weight_vwap)
+            ),
+            "weight_15m_entry": float(
+                pocket_override.get("weight_15m_entry", self.config.weight_15m_entry)
+            ),
+            "weight_volume": float(
+                pocket_override.get("weight_volume", self.config.weight_volume)
+            ),
+            "override_label": str(
+                pocket_override.get(
+                    "label",
+                    self.config.normalize_pocket_key(signal_type_1h, vwap_state),
+                )
+            ),
+            "raw_override": pocket_override,
+        }
+        return effective
 
     def _neutral_signal(
         self,
@@ -627,10 +850,31 @@ class MACDStrategyV2Engine:
         values = np.asarray(prices, dtype=float)
         if len(values) < max(period, lookback + 1):
             return 0.0
-        middle, _, _ = self.calculate_bollinger_bands(values, period=period, std_dev=std_dev)
-        current = float(middle[-1])
-        previous = float(middle[-1 - lookback])
+        current_window = values[-period:]
+        current = float(np.mean(current_window))
+        prev_end = len(values) - lookback
+        prev_start = max(0, prev_end - period)
+        previous_window = values[prev_start:prev_end]
+        if previous_window.size <= 0:
+            return 0.0
+        previous = float(np.mean(previous_window))
         return self._normalized_change(current, previous)
+
+    @staticmethod
+    def _latest_bollinger_values(
+        prices: Optional[np.ndarray],
+        period: int,
+        std_dev: float,
+    ) -> Tuple[float, float, float]:
+        if prices is None:
+            return 0.0, 0.0, 0.0
+        values = np.asarray(prices, dtype=float)
+        if values.size <= 0:
+            return 0.0, 0.0, 0.0
+        window = values[-min(period, values.size):]
+        mid = float(np.mean(window))
+        sigma = float(np.std(window))
+        return mid, mid + sigma * std_dev, mid - sigma * std_dev
 
     @staticmethod
     def _series_value(series: Optional[np.ndarray], offset: int = -1, default: float = 0.0) -> float:
@@ -851,11 +1095,9 @@ class MACDStrategyV2Engine:
             hist_bars = int(stable_trend_context.get("negative_bars", 0) or 0)
             stable_active = bool(stable_trend_context.get("bear_active", False))
             allowed_states = {
-                "short_dual_pressure",
                 "short_retest_reject",
-                "short_below_session_above_structure",
             }
-            allowed_signal_types = {"flip_bearish", "green_bar_growing"}
+            allowed_signal_types = {"flip_bearish"}
             allowed_entry_types = {"green_bar_growing"}
         else:
             enabled = bool(self.config.enable_stable_bull_continuation)
@@ -864,8 +1106,8 @@ class MACDStrategyV2Engine:
             min_4h_bars = max(1, int(self.config.stable_bull_continuation_min_4h_bars))
             hist_bars = int(stable_trend_context.get("positive_bars", 0) or 0)
             stable_active = bool(stable_trend_context.get("bull_active", False))
-            allowed_states = {"long_dual_support", "long_reclaim_confirmed"}
-            allowed_signal_types = {"flip_bullish", "red_bar_growing"}
+            allowed_states = {"long_reclaim_confirmed"}
+            allowed_signal_types = {"flip_bullish"}
             allowed_entry_types = {"red_bar_growing"}
 
         result.update(
@@ -1744,7 +1986,7 @@ class MACDStrategyV2Engine:
             return True, [], {}
 
         reasons: List[str] = []
-        allowed_states = {"short_retest_reject", "short_dual_pressure"}
+        allowed_states = {"short_retest_reject"}
         if structural_vwap <= 0:
             reasons.append("structural_vwap_missing")
         if vwap_state not in allowed_states:
@@ -1769,6 +2011,81 @@ class MACDStrategyV2Engine:
             "structural_vwap_deviation": structural_deviation,
         }
         return len(reasons) == 0, reasons, details
+
+    def check_flip_bullish_vwap_context(
+        self,
+        signal_type_1h: str,
+        vwap_state: str,
+        vwap_score: float,
+        structural_vwap: float,
+        session_deviation: float,
+        structural_deviation: float,
+    ) -> Tuple[bool, List[str], Dict[str, Any]]:
+        if signal_type_1h != 'flip_bullish':
+            return True, [], {}
+
+        reasons: List[str] = []
+        allowed_states = {"long_reclaim_confirmed"}
+        if structural_vwap <= 0:
+            reasons.append("structural_vwap_missing")
+        if vwap_state not in allowed_states:
+            reasons.append(f"vwap_state={vwap_state}")
+        if vwap_score < self.config.flip_bullish_min_vwap_score:
+            reasons.append(
+                f"vwap_score={vwap_score:.2f}<{self.config.flip_bullish_min_vwap_score:.2f}"
+            )
+
+        details = {
+            "flip_bullish_allowed_vwap_states": sorted(allowed_states),
+            "vwap_state": vwap_state,
+            "vwap_score": vwap_score,
+            "flip_bullish_min_vwap_score": self.config.flip_bullish_min_vwap_score,
+            "structural_vwap": structural_vwap,
+            "session_vwap_deviation": session_deviation,
+            "structural_vwap_deviation": structural_deviation,
+        }
+        return len(reasons) == 0, reasons, details
+
+    def check_flip_bullish_trial_score_window(
+        self,
+        *,
+        signal_type_1h: str,
+        is_trial_entry: bool,
+        signal_score: float,
+    ) -> Tuple[bool, str]:
+        if not self.config.flip_bullish_trial_score_window_enabled:
+            return True, ""
+        if signal_type_1h != "flip_bullish" or not is_trial_entry:
+            return True, ""
+
+        min_score = float(self.config.flip_bullish_trial_score_min)
+        max_score = float(self.config.flip_bullish_trial_score_max)
+        if min_score <= signal_score <= max_score:
+            return True, ""
+        return (
+            False,
+            f"flip_bullish_trial_score_window({signal_score:.3f} not in [{min_score:.3f},{max_score:.3f}])",
+        )
+
+    def check_green_bar_growing_score_window(
+        self,
+        *,
+        signal_type_1h: str,
+        signal_score: float,
+    ) -> Tuple[bool, str]:
+        if not self.config.green_bar_growing_score_window_enabled:
+            return True, ""
+        if signal_type_1h != "green_bar_growing":
+            return True, ""
+
+        min_score = float(self.config.green_bar_growing_score_min)
+        max_score = float(self.config.green_bar_growing_score_max)
+        if min_score <= signal_score <= max_score:
+            return True, ""
+        return (
+            False,
+            f"green_bar_growing_score_window({signal_score:.3f} not in [{min_score:.3f},{max_score:.3f}])",
+        )
 
     # ==================== BOLL 结构层（新增） ====================
     
@@ -1951,6 +2268,7 @@ class MACDStrategyV2Engine:
         bb_middle_slope_4h: Optional[float] = None,
         cvd_upper_wick_ratio: Optional[float] = None,
         cvd_1h_delta_ratio: Optional[float] = None,
+        cvd_15m_delta_ratio: Optional[float] = None,
         # ATR
         atr_1h: float = 0.0,
         # 空头质量过滤参数（V3专家组建议）
@@ -1977,26 +2295,22 @@ class MACDStrategyV2Engine:
             debug_details["cvd_upper_wick_ratio"] = float(cvd_upper_wick_ratio)
         if cvd_1h_delta_ratio is not None:
             debug_details["cvd_1h_delta_ratio"] = float(cvd_1h_delta_ratio)
+        if cvd_15m_delta_ratio is not None:
+            debug_details["cvd_15m_delta_ratio"] = float(cvd_15m_delta_ratio)
         if structural_vwap <= 0 and structural_vwap_1h_series is not None:
             structural_vwap = self._series_value(structural_vwap_1h_series, default=0.0)
         if bb_middle_1h <= 0 and close_1h_series is not None:
-            middle_1h, upper_1h, lower_1h = self.calculate_bollinger_bands(
-                np.asarray(close_1h_series, dtype=float),
+            bb_middle_1h, bb_upper_1h, bb_lower_1h = self._latest_bollinger_values(
+                close_1h_series,
                 period=self.config.boll_period,
                 std_dev=self.config.boll_std_dev,
             )
-            bb_middle_1h = float(middle_1h[-1])
-            bb_upper_1h = float(upper_1h[-1])
-            bb_lower_1h = float(lower_1h[-1])
         if bb_middle_4h <= 0 and close_4h_series is not None:
-            middle_4h, upper_4h, lower_4h = self.calculate_bollinger_bands(
-                np.asarray(close_4h_series, dtype=float),
+            bb_middle_4h, bb_upper_4h, bb_lower_4h = self._latest_bollinger_values(
+                close_4h_series,
                 period=self.config.boll_period,
                 std_dev=self.config.boll_std_dev,
             )
-            bb_middle_4h = float(middle_4h[-1])
-            bb_upper_4h = float(upper_4h[-1])
-            bb_lower_4h = float(lower_4h[-1])
 
         primary_mode = str(self.config.primary_direction_timeframe or "4h").strip().lower()
         light_1h_confirmation = self.use_light_1h_confirmation()
@@ -2390,12 +2704,16 @@ class MACDStrategyV2Engine:
             details_15m=details_15m,
             direction=trade_direction,
         )
+        entry_confirmation_passed = bool(can_enter)
         entry_type_15m = details_15m.get('entry_type', '')
         debug_details = self._set_stage(
             debug_details,
             "15m_entry",
             entry_type_15m=entry_type_15m,
             entry_score_15m=entry_score_15m,
+            entry_confirmation_passed=entry_confirmation_passed,
+            entry_confirmation_gate_enabled=bool(self.config.require_15m_confirmation_gate),
+            entry_confirmation_gate_bypassed=bool((not entry_confirmation_passed) and (not self.config.require_15m_confirmation_gate)),
             entry_refine_15m=details_15m.get("ema_15m_refine"),
             macd_15m_hist_current=details_15m.get("hist_current"),
             macd_15m_hist_prev=details_15m.get("hist_prev"),
@@ -2404,7 +2722,7 @@ class MACDStrategyV2Engine:
             bb_lower_15m=bb_lower_15m,
         )
         
-        if not can_enter:
+        if not can_enter and self.config.require_15m_confirmation_gate:
             return self._neutral_signal(
                 reason='15M未确认入场',
                 signal_type_1h=details_1h.get('signal_type'),
@@ -2421,6 +2739,114 @@ class MACDStrategyV2Engine:
 
         signal_type_1h = details_1h.get('signal_type', '')
         entry_refine_15m = details_15m.get("ema_15m_refine")
+        if self.config.disable_green_bar_growing_entries and signal_type_1h == 'green_bar_growing':
+            debug_details = self._set_stage(
+                debug_details,
+                "green_bar_growing_disabled",
+                green_bar_growing_disabled=True,
+            )
+            return self._neutral_signal(
+                reason='green_bar_growing_disabled',
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+        if (
+            self.config.disable_red_bar_growing_long_entries
+            and signal_type_1h == 'red_bar_growing'
+            and trade_direction == 'long'
+        ):
+            debug_details = self._set_stage(
+                debug_details,
+                "red_bar_growing_long_disabled",
+                red_bar_growing_long_disabled=True,
+            )
+            return self._neutral_signal(
+                reason='red_bar_growing_long_disabled',
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+        if signal_type_1h == 'flip_bullish':
+            bullish_vwap_ok, bullish_vwap_reasons, bullish_vwap_details = self.check_flip_bullish_vwap_context(
+                signal_type_1h=signal_type_1h,
+                vwap_state=vwap_state,
+                vwap_score=vwap_score,
+                structural_vwap=float(vwap_details.get("structural_vwap", structural_vwap)),
+                session_deviation=float(vwap_details.get("session_deviation", vwap_deviation)),
+                structural_deviation=structural_vwap_deviation,
+            )
+            if not bullish_vwap_ok:
+                debug_details = self._set_stage(
+                    debug_details,
+                    "flip_bullish_vwap_context_filter",
+                    flip_bullish_vwap_context_filter_reasons=bullish_vwap_reasons,
+                    **bullish_vwap_details,
+                )
+                return self._neutral_signal(
+                    reason=f'flip_bullish_vwap_context_filter({"; ".join(bullish_vwap_reasons)})',
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                    ),
+                )
+        if signal_type_1h == 'flip_bearish':
+            bearish_vwap_ok, bearish_vwap_reasons, bearish_vwap_details = self.check_flip_bearish_vwap_context(
+                signal_type_1h=signal_type_1h,
+                vwap_state=vwap_state,
+                vwap_score=vwap_score,
+                structural_vwap=float(vwap_details.get("structural_vwap", structural_vwap)),
+                session_deviation=float(vwap_details.get("session_deviation", vwap_deviation)),
+                structural_deviation=structural_vwap_deviation,
+            )
+            if not bearish_vwap_ok:
+                debug_details = self._set_stage(
+                    debug_details,
+                    "flip_bearish_vwap_context_filter",
+                    flip_bearish_vwap_context_filter_reasons=bearish_vwap_reasons,
+                    **bearish_vwap_details,
+                )
+                return self._neutral_signal(
+                    reason=f'flip_bearish_vwap_context_filter({"; ".join(bearish_vwap_reasons)})',
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                    ),
+                )
         stable_continuation_eval = self._evaluate_stable_continuation(
             primary_mode=primary_mode,
             trade_direction=trade_direction,
@@ -2437,8 +2863,17 @@ class MACDStrategyV2Engine:
             str(stable_continuation_eval.get("stable_continuation_side") or "").strip().lower() or None
         )
         debug_details.update(**stable_continuation_eval)
+        debug_details = self._set_stage(
+            debug_details,
+            "15m_entry_score_gate",
+            min_entry_score=self.config.min_entry_score,
+            entry_score_gate_enabled=bool(self.config.require_15m_confirmation_gate),
+            entry_score_gate_bypassed=bool(
+                entry_score_15m < self.config.min_entry_score and not self.config.require_15m_confirmation_gate
+            ),
+        )
 
-        if entry_score_15m < self.config.min_entry_score:
+        if entry_score_15m < self.config.min_entry_score and self.config.require_15m_confirmation_gate:
             return self._neutral_signal(
                 reason=f'15M入场评分过低: {entry_score_15m:.2f}',
                 entry_score_15m=entry_score_15m,
@@ -2483,26 +2918,60 @@ class MACDStrategyV2Engine:
             )
 
         if (
+            signal_type_1h == 'flip_bullish'
+            and is_trial_entry
+            and self.config.disable_flip_bullish_trial_entries
+        ):
+            debug_details = self._set_stage(
+                debug_details,
+                "flip_bullish_trial_disabled",
+                flip_bullish_trial_disabled=True,
+            )
+            return self._neutral_signal(
+                reason='flip_bullish_trial_disabled',
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+
+        if (
             strict_1h_filters_enabled
             and not stable_continuation_active
             and self.config.enable_flip_bullish_strict_filter
             and signal_type_1h == 'flip_bullish'
         ):
             strict_filter_reasons: List[str] = []
+            bullish_vwap_details: Dict[str, Any] = {}
             if self.config.flip_bullish_require_15m_growing and entry_type_15m != 'red_bar_growing':
                 strict_filter_reasons.append(f"15m_entry={entry_type_15m or 'none'}")
             if self.config.flip_bullish_require_pullback_bounce and entry_refine_15m != 'pullback_bounce':
                 strict_filter_reasons.append(f"15m_refine={entry_refine_15m or 'none'}")
-            if vwap_score < self.config.flip_bullish_min_vwap_score:
-                strict_filter_reasons.append(
-                    f"vwap_score={vwap_score:.2f}<{self.config.flip_bullish_min_vwap_score:.2f}"
-                )
+            bullish_vwap_ok, bullish_vwap_reasons, bullish_vwap_details = self.check_flip_bullish_vwap_context(
+                signal_type_1h=signal_type_1h,
+                vwap_state=vwap_state,
+                vwap_score=vwap_score,
+                structural_vwap=float(vwap_details.get("structural_vwap", structural_vwap)),
+                session_deviation=float(vwap_details.get("session_deviation", vwap_deviation)),
+                structural_deviation=structural_vwap_deviation,
+            )
+            if not bullish_vwap_ok:
+                strict_filter_reasons.extend(bullish_vwap_reasons)
             if strict_filter_reasons:
                 debug_details = self._set_stage(
                     debug_details,
                     "flip_bullish_strict_filter",
                     flip_bullish_filter_reasons=strict_filter_reasons,
                     entry_refine_15m=entry_refine_15m,
+                    **bullish_vwap_details,
                 )
                 return self._neutral_signal(
                     reason='flip_bullish_strict_filter',
@@ -2521,8 +2990,7 @@ class MACDStrategyV2Engine:
                 )
 
         if (
-            not is_trial_entry
-            and trade_direction == 'long'
+            trade_direction == 'long'
             and signal_type_1h == 'flip_bullish'
             and self.config.enable_flip_bullish_cvd_context_filter
             and not stable_continuation_active
@@ -2728,10 +3196,17 @@ class MACDStrategyV2Engine:
                 flip_bearish_structure_skipped=True,
             )
 
-        min_vwap_score_for_entry = max(
-            0.0,
-            self.config.preflip_trial_min_vwap_score if is_trial_entry else self.config.min_vwap_score_for_entry,
+        pocket_entry_requirements = self.resolve_pocket_entry_requirements(
+            signal_type_1h=signal_type_1h,
+            vwap_state=vwap_state,
+            is_trial_entry=is_trial_entry,
+            stable_continuation_side=stable_continuation_side if stable_continuation_active else None,
         )
+        pocket_scoring_weights = self.resolve_pocket_scoring_weights(
+            signal_type_1h=signal_type_1h,
+            vwap_state=vwap_state,
+        )
+        min_vwap_score_for_entry = float(pocket_entry_requirements["min_vwap_score_for_entry"])
         if min_vwap_score_for_entry > 0 and vwap_score < min_vwap_score_for_entry:
             debug_details = self._set_stage(
                 debug_details,
@@ -2807,26 +3282,45 @@ class MACDStrategyV2Engine:
         
         # ========== Step 6: 综合评分 ==========
         score = 0.0
+        ema_score_multiplier = min(float(ema_multiplier), float(self.config.ema_multiplier_normal))
+        weight_1h_direction = float(pocket_scoring_weights["weight_1h_direction"])
+        weight_4h_direction = float(pocket_scoring_weights["weight_4h_direction"])
+        weight_4h_enhancement = float(pocket_scoring_weights["weight_4h_enhancement"])
+        weight_vwap = float(pocket_scoring_weights["weight_vwap"])
+        weight_15m_entry = float(pocket_scoring_weights["weight_15m_entry"])
+        weight_volume = float(pocket_scoring_weights["weight_volume"])
         
         # 4H主趋势评分 × BOLL结构修正
         signal_strength_1h = details_1h.get('signal_strength', 0.5)
         score_1h_base = 0.0
         score_1h = 0.0
 
+        if signal_type_1h in ['flip_bullish', 'flip_bearish']:
+            score_1h_base = weight_1h_direction
+        elif signal_type_1h in ['red_bar_growing', 'green_bar_growing']:
+            score_1h_base = weight_1h_direction * 0.875
+        elif trade_direction == direction_1h:
+            score_1h_base = weight_1h_direction * signal_strength_1h
+        else:
+            score_1h_base = 0.0
+
+        score_1h = min(score_1h_base * ema_score_multiplier, weight_1h_direction)
+        score += score_1h
+
         if is_trial_entry:
             shrink_pct = max(0.0, float(shrink_4h_context["shrink_pct"]))
             preflip_4h_strength = self._clamp(0.56 + shrink_pct * 0.38, 0.0, 0.92)
-            score_4h_base = self.config.weight_4h_direction * preflip_4h_strength
+            score_4h_base = weight_4h_direction * preflip_4h_strength
         elif direction_4h == trade_direction and signal_type_4h in ['flip_bullish', 'flip_bearish']:
-            score_4h_base = self.config.weight_4h_direction
+            score_4h_base = weight_4h_direction
         elif direction_4h == trade_direction and signal_type_4h in ['red_bar_growing', 'green_bar_growing']:
-            score_4h_base = self.config.weight_4h_direction * 0.875
+            score_4h_base = weight_4h_direction * 0.875
         elif direction_4h == trade_direction:
-            score_4h_base = self.config.weight_4h_direction * signal_strength_4h
+            score_4h_base = weight_4h_direction * signal_strength_4h
         else:
             score_4h_base = 0.0
 
-        score_4h = min(score_4h_base * ema_multiplier, self.config.weight_4h_direction)
+        score_4h = min(score_4h_base * ema_score_multiplier, weight_4h_direction)
         score += score_4h
         
         # 4H附加增强评分（默认关闭） × BOLL结构修正
@@ -2839,37 +3333,40 @@ class MACDStrategyV2Engine:
                 effective_4h_score = 2.0 / 3.0
 
         if is_4h_enhanced:
-            score_4h_enhancement_base = self.config.weight_4h_enhancement * effective_4h_score
+            score_4h_enhancement_base = weight_4h_enhancement * effective_4h_score
         elif enhancement_score > 0:
-            score_4h_enhancement_base = self.config.weight_4h_enhancement * 0.5 * effective_4h_score
+            score_4h_enhancement_base = weight_4h_enhancement * 0.5 * effective_4h_score
         else:
             score_4h_enhancement_base = 0
         
-        score_4h_enhancement = min(score_4h_enhancement_base * ema_multiplier, self.config.weight_4h_enhancement)
+        score_4h_enhancement = min(
+            score_4h_enhancement_base * ema_score_multiplier,
+            weight_4h_enhancement,
+        )
         score += score_4h_enhancement
         
         # VWAP评分 (15%)
-        score_vwap = vwap_score
+        score_vwap = min(weight_vwap * max(0.0, min(1.0, vwap_location_score)), weight_vwap)
         score += score_vwap
         
         # 15M入场评分 (20%)
         if entry_type_15m in ['flip_bullish', 'flip_bearish']:
-            score_15m = self.config.weight_15m_entry
+            score_15m = weight_15m_entry
         elif entry_type_15m in ['red_bar_growing', 'green_bar_growing']:
-            score_15m = self.config.weight_15m_entry * 0.85
+            score_15m = weight_15m_entry * 0.85
         elif entry_type_15m in ['red_bar_stable', 'green_bar_stable']:
-            score_15m = min(self.config.weight_15m_entry * 0.6 * 1.15, self.config.weight_15m_entry)
+            score_15m = min(weight_15m_entry * 0.6 * 1.15, weight_15m_entry)
         else:
-            score_15m = self.config.weight_15m_entry * 0.3
+            score_15m = weight_15m_entry * 0.3
         score += score_15m
         
         # 成交量评分 (15%)
         if volume_ratio > 1.5:
-            score_vol = self.config.weight_volume
+            score_vol = weight_volume
         elif volume_ratio > 1.0:
-            score_vol = self.config.weight_volume * 0.67
+            score_vol = weight_volume * 0.67
         else:
-            score_vol = self.config.weight_volume * 0.33
+            score_vol = weight_volume * 0.33
         score += score_vol
 
         overheat_penalty = 0.0
@@ -2900,6 +3397,14 @@ class MACDStrategyV2Engine:
             score_vwap=score_vwap,
             score_15m=score_15m,
             score_volume=score_vol,
+            pocket_scoring_override_label=pocket_scoring_weights["override_label"],
+            pocket_scoring_override=pocket_scoring_weights["raw_override"],
+            pocket_weight_1h_direction=weight_1h_direction,
+            pocket_weight_4h_direction=weight_4h_direction,
+            pocket_weight_4h_enhancement=weight_4h_enhancement,
+            pocket_weight_vwap=weight_vwap,
+            pocket_weight_15m_entry=weight_15m_entry,
+            pocket_weight_volume=weight_volume,
             overheat_penalty=overheat_penalty,
             overheat_triggered=bool(overheat_penalty > 0),
             total_score=score,
@@ -3054,6 +3559,218 @@ class MACDStrategyV2Engine:
             "threshold_check",
             signal_score_threshold=threshold,
         )
+        trial_window_ok, trial_window_reason = self.check_flip_bullish_trial_score_window(
+            signal_type_1h=signal_type_1h,
+            is_trial_entry=is_trial_entry,
+            signal_score=score,
+        )
+        if not trial_window_ok:
+            return self._neutral_signal(
+                reason=trial_window_reason,
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                    flip_bullish_trial_score_window_reason=trial_window_reason,
+                    flip_bullish_trial_score_min=float(self.config.flip_bullish_trial_score_min),
+                    flip_bullish_trial_score_max=float(self.config.flip_bullish_trial_score_max),
+                ),
+            )
+        green_window_ok, green_window_reason = self.check_green_bar_growing_score_window(
+            signal_type_1h=signal_type_1h,
+            signal_score=score,
+        )
+        if not green_window_ok:
+            return self._neutral_signal(
+                reason=green_window_reason,
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                    green_bar_growing_score_window_reason=green_window_reason,
+                    green_bar_growing_score_min=float(self.config.green_bar_growing_score_min),
+                    green_bar_growing_score_max=float(self.config.green_bar_growing_score_max),
+                ),
+            )
+        threshold = float(pocket_entry_requirements["signal_score_threshold"])
+        debug_details = self._set_stage(
+            debug_details,
+            "pocket_entry_requirements",
+            pocket_entry_override_label=pocket_entry_requirements["override_label"],
+            pocket_entry_override=pocket_entry_requirements["raw_override"],
+            signal_score_threshold=threshold,
+            min_vwap_score_for_entry=min_vwap_score_for_entry,
+            pocket_min_entry_score=(
+                float(pocket_entry_requirements["min_entry_score"])
+                if pocket_entry_requirements["min_entry_score"] is not None
+                else None
+            ),
+            pocket_allow_neutral_1h_confirmation=bool(
+                pocket_entry_requirements["allow_neutral_1h_confirmation"]
+            ),
+            pocket_require_strict_1h_confirmation=bool(
+                pocket_entry_requirements["require_strict_1h_confirmation"]
+            ),
+            pocket_disallow_trial_entry=bool(pocket_entry_requirements["disallow_trial_entry"]),
+            pocket_disabled=bool(pocket_entry_requirements["disabled"]),
+        )
+        if bool(pocket_entry_requirements["disabled"]):
+            return self._neutral_signal(
+                reason="pocket_entry_disabled",
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(**debug_details),
+            )
+        if (
+            is_trial_entry
+            and direction_1h is None
+            and not bool(pocket_entry_requirements["allow_neutral_1h_confirmation"])
+        ):
+            return self._neutral_signal(
+                reason="pocket_neutral_1h_confirmation_block",
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(**debug_details),
+            )
+        if (
+            bool(pocket_entry_requirements["require_strict_1h_confirmation"])
+            and direction_1h != trade_direction
+        ):
+            return self._neutral_signal(
+                reason="pocket_strict_1h_confirmation_block",
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                    pocket_confirmation_direction_1h=direction_1h,
+                    pocket_confirmation_trade_direction=trade_direction,
+                ),
+            )
+        if is_trial_entry and bool(pocket_entry_requirements["disallow_trial_entry"]):
+            return self._neutral_signal(
+                reason="pocket_trial_entry_disabled",
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(**debug_details),
+            )
+        if (
+            pocket_entry_requirements["min_entry_score"] is not None
+            and entry_score_15m < float(pocket_entry_requirements["min_entry_score"])
+        ):
+            return self._neutral_signal(
+                reason="pocket_min_entry_score_block",
+                score=score,
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(**debug_details),
+            )
+        if bool(pocket_entry_requirements["raw_override"].get("require_cvd_ok", False)):
+            cvd_1h_delta_ratio_value = cvd_1h_delta_ratio if cvd_1h_delta_ratio is not None else 0.0
+            if float(cvd_1h_delta_ratio_value) <= 0.0:
+                return self._neutral_signal(
+                    reason="pocket_cvd_confirmation_block",
+                    score=score,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                        pocket_cvd_1h_delta_ratio=float(cvd_1h_delta_ratio_value),
+                    ),
+                )
+        if bool(pocket_entry_requirements["raw_override"].get("require_cvd_momentum_ok", False)):
+            momentum_floor = float(self.config.soft_15m_entry_score)
+            cvd_momentum_blocked = (
+                cvd_15m_delta_ratio is not None and float(cvd_15m_delta_ratio) <= 0.0
+            )
+            if cvd_15m_delta_ratio is None:
+                entry_floor = pocket_entry_requirements["min_entry_score"]
+                if entry_floor is not None:
+                    momentum_floor = max(float(entry_floor), momentum_floor)
+                cvd_momentum_blocked = entry_score_15m < momentum_floor
+            if cvd_momentum_blocked:
+                return self._neutral_signal(
+                    reason="pocket_cvd_momentum_block",
+                    score=score,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                        pocket_15m_momentum_floor=momentum_floor,
+                        pocket_15m_entry_score=float(entry_score_15m),
+                        pocket_cvd_15m_delta_ratio=(
+                            float(cvd_15m_delta_ratio) if cvd_15m_delta_ratio is not None else None
+                        ),
+                    ),
+                )
         if score < threshold:
             return self._neutral_signal(
                 reason=f'信号评分低于阈值: {score:.2f} < {threshold:.2f}',
@@ -3071,8 +3788,8 @@ class MACDStrategyV2Engine:
                     **debug_details,
                 ),
             )
-        
-        # ========== Step 9: 计算止损 ==========
+
+        # ========== Step 9: 计算止损 ========== 
         stop_price, stop_pct, stop_details = self.calculate_dynamic_stop(
             entry_price=close_price,
             close_1h=close_price,
