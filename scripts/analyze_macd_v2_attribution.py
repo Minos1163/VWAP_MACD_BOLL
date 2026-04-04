@@ -160,13 +160,19 @@ def build_attribution(
     accepted_score_buckets = Counter()
     hold_score_buckets = Counter()
     category_score_buckets: Dict[str, Counter] = defaultdict(Counter)
+    analysis_attempts = 0
+    analysis_ready = 0
+    analysis_skipped = Counter()
 
     for symbol, data in market_data_map.items():
         tf_15m = data["15m"]
         for idx in range(len(tf_15m)):
-            analysis = engine._build_analysis(symbol, data, idx)
+            analysis_attempts += 1
+            analysis, analysis_status = engine._build_analysis_with_status(symbol, data, idx)
             if analysis is None:
+                analysis_skipped[analysis_status] += 1
                 continue
+            analysis_ready += 1
             decision = engine._decide(symbol, analysis)
             metadata = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
             reason = str(decision.reason or "")
@@ -204,6 +210,11 @@ def build_attribution(
         "config_path": config_path,
         "profile_name": applied_profile,
         "symbols_loaded": len(market_data_map),
+        "replay_input_counters": {
+            "analysis_attempts": analysis_attempts,
+            "analysis_ready": analysis_ready,
+            "analysis_skipped": dict(analysis_skipped),
+        },
         "decision_counts": dict(decision_counts),
         "entry_count": total_entries,
         "hold_count": total_holds,

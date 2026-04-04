@@ -14,6 +14,9 @@ def _make_bot():
             "time_exit_enabled": True,
             "time_exit_minutes": 30,
             "time_exit_min_profit_pct": 0.0035,
+            "runner_time_exit_enabled": False,
+            "runner_time_exit_minutes": 15,
+            "runner_time_exit_min_completed_levels": 1,
             "partial_tp_enabled": True,
             "partial_tp_levels": [
                 {"close_ratio": 0.30, "trigger_r_multiple": 1.0},
@@ -142,6 +145,50 @@ def test_time_exit_uses_injected_backtest_clock_instead_of_wall_clock():
     assert decision is None
 
 
+def test_runner_time_exit_closes_partial_runner_after_stall_window():
+    bot = _make_bot()
+    bot.config["fund_flow"]["runner_time_exit_enabled"] = True
+    pos_key = bot._position_track_key("BTCUSDT", "LONG")
+    state = bot._get_or_create_partial_tp_state("BTCUSDT", "LONG")
+    state["levels_completed"] = [0]
+    state["last_tp_trigger_ts"] = 1000.0
+    bot._backtest_now_ts = 1000.0 + (16 * 60)
+    bot._position_first_seen_ts[pos_key] = 1000.0 - (60 * 60)
+
+    decision = bot._evaluate_time_exit(
+        symbol="BTCUSDT",
+        position=_position(),
+        current_price=100.1,
+        flow_context={"cvd_momentum": 0.0},
+        base_decision=_decision(),
+    )
+
+    assert decision is not None
+    assert decision.operation == FundFlowOperation.CLOSE
+    assert "runner_time_exit" in decision.reason
+
+
+def test_runner_time_exit_skips_when_flow_still_expanding():
+    bot = _make_bot()
+    bot.config["fund_flow"]["runner_time_exit_enabled"] = True
+    pos_key = bot._position_track_key("BTCUSDT", "LONG")
+    state = bot._get_or_create_partial_tp_state("BTCUSDT", "LONG")
+    state["levels_completed"] = [0]
+    state["last_tp_trigger_ts"] = 1000.0
+    bot._backtest_now_ts = 1000.0 + (16 * 60)
+    bot._position_first_seen_ts[pos_key] = 1000.0 - (60 * 60)
+
+    decision = bot._evaluate_time_exit(
+        symbol="BTCUSDT",
+        position=_position(),
+        current_price=100.1,
+        flow_context={"cvd_momentum": 0.02},
+        base_decision=_decision(),
+    )
+
+    assert decision is None
+
+
 def test_partial_tp_fires_first_level_in_volatile_mode_at_point_seven_r():
     bot = _make_bot()
 
@@ -158,6 +205,7 @@ def test_partial_tp_fires_first_level_in_volatile_mode_at_point_seven_r():
     assert decision.target_portion_of_balance == 0.45
     state = bot._get_or_create_partial_tp_state("BTCUSDT", "LONG")
     assert state["levels_completed"] == [0]
+    assert state["last_tp_trigger_ts"] > 0
 
 
 def test_position_management_prioritizes_partial_tp_over_fast_exit_full_close():

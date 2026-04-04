@@ -15,6 +15,7 @@ MACD多时间框架交易策略模块 V2.0 - VWAP + BOLL 增强版
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
@@ -417,6 +418,234 @@ class MACDSignalV2:
     entry_scale: float = 1.0
 
     details: Dict = field(default_factory=dict)
+
+
+def build_macd_v2_config_from_runtime(
+    runtime_cfg: Dict[str, Any],
+    *,
+    disable_cvd_decision_logic: bool = False,
+) -> MACDStrategyV2Config:
+    """Build MACDStrategyV2Config from runtime config with the same semantics as pure backtest."""
+    runtime_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    ff_cfg = runtime_cfg.get("fund_flow", {}) if isinstance(runtime_cfg.get("fund_flow"), dict) else {}
+    v2_cfg = ff_cfg.get("macd_mtf_strategy_v2", {}) if isinstance(ff_cfg.get("macd_mtf_strategy_v2"), dict) else {}
+    boll_cfg = v2_cfg.get("boll_config", {}) if isinstance(v2_cfg.get("boll_config"), dict) else {}
+    ema_cfg = v2_cfg.get("ema_config", {}) if isinstance(v2_cfg.get("ema_config"), dict) else {}
+    leverage_cfg = v2_cfg.get("leverage_config", {}) if isinstance(v2_cfg.get("leverage_config"), dict) else {}
+    cvd_filter_cfg = v2_cfg.get("cvd_filter_config", {}) if isinstance(v2_cfg.get("cvd_filter_config"), dict) else {}
+    vwap_cfg = v2_cfg.get("vwap_config", {}) if isinstance(v2_cfg.get("vwap_config"), dict) else {}
+    weights_cfg = v2_cfg.get("scoring_weights", {}) if isinstance(v2_cfg.get("scoring_weights"), dict) else {}
+    thresholds_cfg = v2_cfg.get("entry_thresholds", {}) if isinstance(v2_cfg.get("entry_thresholds"), dict) else {}
+    stop_cfg = v2_cfg.get("stop_loss_config", {}) if isinstance(v2_cfg.get("stop_loss_config"), dict) else {}
+    session_risk_cfg = v2_cfg.get("session_risk_control", {}) if isinstance(v2_cfg.get("session_risk_control"), dict) else {}
+    vwap_score_tier_cfg = v2_cfg.get("vwap_score_position_tiers", {}) if isinstance(v2_cfg.get("vwap_score_position_tiers"), dict) else {}
+    symbol_risk_cfg = v2_cfg.get("symbol_risk_tiers", {}) if isinstance(v2_cfg.get("symbol_risk_tiers"), dict) else {}
+    macd_cfg = v2_cfg.get("macd_config", {}) if isinstance(v2_cfg.get("macd_config"), dict) else {}
+    filter_cfg = v2_cfg.get("entry_filters", {}) if isinstance(v2_cfg.get("entry_filters"), dict) else {}
+    penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
+    default_signal_threshold = float(thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score", 0.850)))
+
+    return MACDStrategyV2Config(
+        macd_1h_fast=int(macd_cfg.get("macd_1h_fast", 12)),
+        macd_1h_slow=int(macd_cfg.get("macd_1h_slow", 26)),
+        macd_1h_signal=int(macd_cfg.get("macd_1h_signal", 9)),
+        macd_4h_fast=int(macd_cfg.get("macd_4h_fast", 12)),
+        macd_4h_slow=int(macd_cfg.get("macd_4h_slow", 26)),
+        macd_4h_signal=int(macd_cfg.get("macd_4h_signal", 9)),
+        macd_15m_fast=int(macd_cfg.get("macd_15m_fast", 12)),
+        macd_15m_slow=int(macd_cfg.get("macd_15m_slow", 26)),
+        macd_15m_signal=int(macd_cfg.get("macd_15m_signal", 9)),
+        macd_threshold=float(macd_cfg.get("macd_threshold", 0.00005)),
+        boll_period=int(float(boll_cfg.get("period", 20))),
+        boll_std_dev=float(boll_cfg.get("std_dev", 2.0)),
+        ema_multiplier_strong=float(boll_cfg.get("multiplier_strong", ema_cfg.get("ema_multiplier_strong", 1.2))),
+        ema_multiplier_normal=float(boll_cfg.get("multiplier_normal", ema_cfg.get("ema_multiplier_normal", 1.0))),
+        ema_multiplier_weak=float(boll_cfg.get("multiplier_weak", ema_cfg.get("ema_multiplier_weak", 0.6))),
+        ema_55_1h_hard_block=bool(boll_cfg.get("middle_hard_block", ema_cfg.get("ema_55_1h_hard_block", True))),
+        ema_strong_trend_leverage_mult=float(
+            boll_cfg.get("strong_trend_leverage_mult", ema_cfg.get("ema_strong_trend_leverage_mult", 0.8))
+        ),
+        vwap_deviation_optimal=float(vwap_cfg.get("vwap_deviation_optimal", 0.005)),
+        vwap_deviation_warning=float(vwap_cfg.get("vwap_deviation_warning", 0.015)),
+        vwap_deviation_hard_block=float(vwap_cfg.get("vwap_deviation_hard_block", 0.030)),
+        structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_weekly")),
+        structural_vwap_rolling_window=int(float(vwap_cfg.get("structural_vwap_rolling_window", 20))),
+        vwap_retest_tolerance=float(vwap_cfg.get("vwap_retest_tolerance", 0.003)),
+        weight_1h_direction=float(weights_cfg.get("weight_1h_direction", 0.00)),
+        weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.55))),
+        weight_4h_enhancement=float(weights_cfg.get("weight_4h_enhancement", 0.10)),
+        weight_vwap=float(weights_cfg.get("weight_vwap", 0.20)),
+        weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.05)),
+        weight_volume=float(weights_cfg.get("weight_volume", 0.20)),
+        min_entry_score=float(thresholds_cfg.get("min_entry_score", 0.25)),
+        min_signal_score=default_signal_threshold,
+        red_bar_growing_min_signal_score=float(thresholds_cfg.get("red_bar_growing", default_signal_threshold)),
+        flip_bearish_min_signal_score=float(thresholds_cfg.get("flip_bearish", default_signal_threshold)),
+        flip_bullish_min_signal_score=float(thresholds_cfg.get("flip_bullish", default_signal_threshold)),
+        enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
+        disable_flip_bullish_entries=bool(filter_cfg.get("disable_flip_bullish_entries", False)),
+        disable_flip_bullish_trial_entries=bool(filter_cfg.get("disable_flip_bullish_trial_entries", False)),
+        flip_bullish_min_vwap_score=float(filter_cfg.get("flip_bullish_min_vwap_score", 0.12)),
+        flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
+        flip_bullish_require_15m_growing=bool(filter_cfg.get("flip_bullish_require_15m_growing", True)),
+        enable_flip_bullish_cvd_context_filter=(
+            False if disable_cvd_decision_logic else bool(filter_cfg.get("enable_flip_bullish_cvd_context_filter", False))
+        ),
+        flip_bullish_max_cvd_upper_wick_ratio=(
+            0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_max_cvd_upper_wick_ratio", 0.0))
+        ),
+        flip_bullish_min_cvd_1h_delta_ratio=(
+            0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_min_cvd_1h_delta_ratio", 0.0))
+        ),
+        flip_bullish_trial_score_window_enabled=bool(filter_cfg.get("flip_bullish_trial_score_window_enabled", False)),
+        flip_bullish_trial_score_min=float(filter_cfg.get("flip_bullish_trial_score_min", 0.80)),
+        flip_bullish_trial_score_max=float(filter_cfg.get("flip_bullish_trial_score_max", 0.87)),
+        green_bar_growing_score_window_enabled=bool(filter_cfg.get("green_bar_growing_score_window_enabled", False)),
+        green_bar_growing_score_min=float(filter_cfg.get("green_bar_growing_score_min", 0.0)),
+        green_bar_growing_score_max=float(filter_cfg.get("green_bar_growing_score_max", 1.0)),
+        flip_bearish_min_ema_multiplier=float(
+            filter_cfg.get("flip_bearish_min_boll_multiplier", filter_cfg.get("flip_bearish_min_ema_multiplier", 0.0))
+        ),
+        flip_bearish_normal_ema_min_signal_score=float(
+            filter_cfg.get("flip_bearish_normal_boll_min_signal_score", filter_cfg.get("flip_bearish_normal_ema_min_signal_score", 0.0))
+        ),
+        flip_bearish_normal_ema_max_leverage=int(
+            float(filter_cfg.get("flip_bearish_normal_boll_max_leverage", filter_cfg.get("flip_bearish_normal_ema_max_leverage", 0.0)))
+        ),
+        flip_bearish_min_adx_1h=float(filter_cfg.get("flip_bearish_min_adx_1h", 18.0)),
+        flip_bearish_retest_reject_min_vwap_score=float(filter_cfg.get("flip_bearish_retest_reject_min_vwap_score", 0.0)),
+        flip_bearish_max_ema21_slope_1h=float(
+            filter_cfg.get("flip_bearish_max_bb_middle_slope_1h", filter_cfg.get("flip_bearish_max_ema21_slope_1h", 0.0))
+        ),
+        flip_bearish_max_ema21_slope_4h=float(
+            filter_cfg.get("flip_bearish_max_bb_middle_slope_4h", filter_cfg.get("flip_bearish_max_ema21_slope_4h", 0.0001))
+        ),
+        ema_slope_lookback_1h=int(float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h", 3)))),
+        ema_slope_lookback_4h=int(float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h", 2)))),
+        disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
+        disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
+        primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
+        require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
+        allow_neutral_1h_confirmation=bool(filter_cfg.get("allow_neutral_1h_confirmation", False)),
+        light_1h_confirmation_when_4h_primary=bool(filter_cfg.get("light_1h_confirmation_when_4h_primary", False)),
+        enable_soft_15m_confirmation_when_4h_primary=bool(filter_cfg.get("enable_soft_15m_confirmation_when_4h_primary", True)),
+        require_15m_confirmation_gate=bool(filter_cfg.get("require_15m_confirmation_gate", False)),
+        soft_15m_entry_score=float(filter_cfg.get("soft_15m_entry_score", 0.28)),
+        soft_15m_neutral_hist_multiple=float(filter_cfg.get("soft_15m_neutral_hist_multiple", 3.0)),
+        soft_15m_max_adverse_hist_multiple=float(filter_cfg.get("soft_15m_max_adverse_hist_multiple", 8.0)),
+        enable_green_bar_growing_short_adx_1h_range_filter=bool(filter_cfg.get("enable_green_bar_growing_short_adx_1h_range_filter", False)),
+        green_bar_growing_short_min_adx_1h=float(filter_cfg.get("green_bar_growing_short_min_adx_1h", 0.0)),
+        green_bar_growing_short_max_adx_1h=float(filter_cfg.get("green_bar_growing_short_max_adx_1h", 0.0)),
+        enable_4h_preflip_trial_entries=bool(filter_cfg.get("enable_4h_preflip_trial_entries", False)),
+        preflip_trial_min_shrink_pct_long=float(filter_cfg.get("preflip_trial_min_shrink_pct_long", 0.75)),
+        preflip_trial_min_shrink_pct_short=float(filter_cfg.get("preflip_trial_min_shrink_pct_short", 0.30)),
+        preflip_trial_min_signal_score=float(filter_cfg.get("preflip_trial_min_signal_score", 0.78)),
+        preflip_trial_min_vwap_score=float(filter_cfg.get("preflip_trial_min_vwap_score", 0.06)),
+        preflip_trial_entry_scale=float(filter_cfg.get("preflip_trial_entry_scale", 0.35)),
+        preflip_trial_max_leverage=int(float(filter_cfg.get("preflip_trial_max_leverage", 2))),
+        enable_trial_short_below_structure_continuation_promotion=bool(
+            filter_cfg.get("enable_trial_short_below_structure_continuation_promotion", False)
+        ),
+        trial_short_below_structure_promotion_min_signal_score=float(
+            filter_cfg.get("trial_short_below_structure_promotion_min_signal_score", 0.82)
+        ),
+        trial_short_below_structure_promotion_min_vwap_score=float(
+            filter_cfg.get("trial_short_below_structure_promotion_min_vwap_score", 0.075)
+        ),
+        trial_short_below_structure_promotion_min_adx_1h=float(
+            filter_cfg.get("trial_short_below_structure_promotion_min_adx_1h", 25.0)
+        ),
+        trial_short_below_structure_promotion_min_4h_shrink_pct=float(
+            filter_cfg.get("trial_short_below_structure_promotion_min_4h_shrink_pct", 0.80)
+        ),
+        trial_short_below_structure_promotion_min_4h_shrink_bars=int(
+            float(filter_cfg.get("trial_short_below_structure_promotion_min_4h_shrink_bars", 6))
+        ),
+        enable_stable_bear_continuation=bool(filter_cfg.get("enable_stable_bear_continuation", True)),
+        stable_bear_continuation_min_signal_score=float(
+            thresholds_cfg.get("stable_bear_continuation_min_signal_score", filter_cfg.get("stable_bear_continuation_min_signal_score", 0.82))
+        ),
+        stable_bear_continuation_min_vwap_score=float(filter_cfg.get("stable_bear_continuation_min_vwap_score", 0.07)),
+        stable_bear_continuation_min_adx_1h=float(filter_cfg.get("stable_bear_continuation_min_adx_1h", 20.0)),
+        stable_bear_continuation_min_4h_bars=int(float(filter_cfg.get("stable_bear_continuation_min_4h_bars", 2))),
+        enable_stable_bull_continuation=bool(filter_cfg.get("enable_stable_bull_continuation", False)),
+        stable_bull_continuation_min_signal_score=float(
+            thresholds_cfg.get("stable_bull_continuation_min_signal_score", filter_cfg.get("stable_bull_continuation_min_signal_score", 0.82))
+        ),
+        stable_bull_continuation_min_vwap_score=float(filter_cfg.get("stable_bull_continuation_min_vwap_score", 0.10)),
+        stable_bull_continuation_min_adx_1h=float(filter_cfg.get("stable_bull_continuation_min_adx_1h", 20.0)),
+        stable_bull_continuation_min_4h_bars=int(float(filter_cfg.get("stable_bull_continuation_min_4h_bars", 2))),
+        pocket_entry_overrides=copy.deepcopy(filter_cfg.get("pocket_entry_overrides", {}))
+        if isinstance(filter_cfg.get("pocket_entry_overrides"), dict) else {},
+        pocket_scoring_overrides=copy.deepcopy(v2_cfg.get("pocket_scoring_overrides", {}))
+        if isinstance(v2_cfg.get("pocket_scoring_overrides"), dict) else {},
+        overheat_growing_penalty=float(penalty_cfg.get("overheat_growing_penalty", 0.12)),
+        overheat_ema_multiplier_threshold=float(
+            penalty_cfg.get("overheat_boll_multiplier_threshold", penalty_cfg.get("overheat_ema_multiplier_threshold", 1.2))
+        ),
+        overheat_vwap_score_threshold=float(penalty_cfg.get("overheat_vwap_score_threshold", 0.10)),
+        min_vwap_score_for_entry=float(filter_cfg.get("min_vwap_score_for_entry", penalty_cfg.get("min_vwap_score_for_entry", 0.12))),
+        use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
+        ema_stop_atr_multiplier=float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier", 0.5))),
+        max_stop_loss_pct=float(stop_cfg.get("max_stop_loss_pct", 0.025)),
+        vwap_alert_deviation=float(stop_cfg.get("vwap_alert_deviation", 0.005)),
+        enable_4h_shrink_exit=bool(stop_cfg.get("enable_4h_shrink_exit", False)),
+        exit_4h_shrink_bars=int(float(stop_cfg.get("exit_4h_shrink_bars", 2))),
+        exit_4h_min_shrink_pct=float(stop_cfg.get("exit_4h_min_shrink_pct", 0.20)),
+        exit_4h_require_profit=bool(stop_cfg.get("exit_4h_require_profit", True)),
+        exit_4h_weak_loss_threshold=float(stop_cfg.get("exit_4h_weak_loss_threshold", -1.0)),
+        shrink_exit_loss_mitigation_enabled=bool(stop_cfg.get("shrink_exit_loss_mitigation_enabled", False)),
+        shrink_exit_loss_mitigation_pnl_threshold=float(stop_cfg.get("shrink_exit_loss_mitigation_pnl_threshold", -0.005)),
+        shrink_exit_loss_mitigation_exit_ratio=float(stop_cfg.get("shrink_exit_loss_mitigation_exit_ratio", 0.60)),
+        shrink_exit_loss_mitigation_ignore_if_pnl_gt=float(stop_cfg.get("shrink_exit_loss_mitigation_ignore_if_pnl_gt", 0.01)),
+        session_risk_control_enabled=bool(session_risk_cfg.get("enabled", False)),
+        session_risk_high_risk_sessions=copy.deepcopy(session_risk_cfg.get("high_risk_sessions", []))
+        if isinstance(session_risk_cfg.get("high_risk_sessions"), list) else [],
+        session_risk_apply_to_states=[
+            str(x).strip() for x in (session_risk_cfg.get("apply_to_states", []) or []) if str(x).strip()
+        ] if isinstance(session_risk_cfg.get("apply_to_states"), list) else [],
+        vwap_score_tier_apply_to_states=[
+            str(x).strip() for x in (vwap_score_tier_cfg.get("apply_to_states", []) or []) if str(x).strip()
+        ] if isinstance(vwap_score_tier_cfg.get("apply_to_states"), list) else [],
+        vwap_score_position_tiers=copy.deepcopy(vwap_score_tier_cfg.get("tiers", []))
+        if isinstance(vwap_score_tier_cfg.get("tiers"), list) else [],
+        symbol_risk_watchlist_symbols=[
+            str(x).strip().upper() for x in (symbol_risk_cfg.get("watchlist_symbols", []) or []) if str(x).strip()
+        ] if isinstance(symbol_risk_cfg.get("watchlist_symbols"), list) else [],
+        symbol_risk_watchlist_max_position_portion=float(symbol_risk_cfg.get("watchlist_max_position_portion", 0.0)),
+        symbol_risk_watchlist_max_leverage=int(float(symbol_risk_cfg.get("watchlist_max_leverage", 0))),
+        symbol_risk_watchlist_apply_session_scale_double=bool(symbol_risk_cfg.get("watchlist_apply_session_scale_double", False)),
+        symbol_risk_watchlist_session_scale_multiplier=float(symbol_risk_cfg.get("watchlist_session_scale_multiplier", 0.80)),
+        dual_pressure_target_portion_bonus=float(leverage_cfg.get("dual_pressure_target_portion_bonus", 0.0)),
+        dual_pressure_max_symbol_position_portion=float(leverage_cfg.get("dual_pressure_max_symbol_position_portion", 0.0)),
+        use_cvd_bonus_filter=False if disable_cvd_decision_logic else bool(leverage_cfg.get("use_cvd_bonus_filter", False)),
+        cvd_1h_slope_lookback=int(float(leverage_cfg.get("cvd_1h_slope_lookback", 3))),
+        cvd_15m_slope_lookback=int(float(leverage_cfg.get("cvd_15m_slope_lookback", 3))),
+        cvd_positive_delta_ratio_threshold=float(leverage_cfg.get("cvd_positive_delta_ratio_threshold", 0.05)),
+        cvd_negative_delta_ratio_threshold=float(leverage_cfg.get("cvd_negative_delta_ratio_threshold", -0.05)),
+        cvd_bullish_bonus_multiplier=float(leverage_cfg.get("cvd_bullish_bonus_multiplier", 0.0)),
+        cvd_neutral_bonus_multiplier=float(leverage_cfg.get("cvd_neutral_bonus_multiplier", 0.7)),
+        cvd_bearish_bonus_multiplier=float(leverage_cfg.get("cvd_bearish_bonus_multiplier", 1.0)),
+        use_cvd_veto_filter=False if disable_cvd_decision_logic else bool(cvd_filter_cfg.get("enabled", False)),
+        cvd_veto_session_reset=str(cvd_filter_cfg.get("session_reset", "daily_utc0")),
+        cvd_veto_lookback_15m=int(float(cvd_filter_cfg.get("lookback_15m", 3))),
+        cvd_veto_positive_delta_ratio_threshold=float(cvd_filter_cfg.get("positive_delta_ratio_threshold", 0.10)),
+        cvd_veto_positive_pressure_threshold=float(cvd_filter_cfg.get("positive_pressure_threshold", 0.0)),
+        cvd_veto_session_ratio_change_threshold=float(cvd_filter_cfg.get("session_ratio_change_threshold", -0.003)),
+        cvd_veto_session_price_change_threshold=float(cvd_filter_cfg.get("session_price_change_threshold", -0.005)),
+        cvd_veto_strong_close_pos_threshold=float(cvd_filter_cfg.get("strong_close_pos_threshold", 0.72)),
+        cvd_veto_upper_wick_ratio_max=float(cvd_filter_cfg.get("upper_wick_ratio_max", 0.25)),
+        cvd_absorption_delta_ratio_threshold=float(cvd_filter_cfg.get("absorption_delta_ratio_threshold", 0.05)),
+        cvd_absorption_close_pos_threshold=float(cvd_filter_cfg.get("absorption_close_pos_threshold", 0.45)),
+        cvd_absorption_upper_wick_ratio_threshold=float(cvd_filter_cfg.get("absorption_upper_wick_ratio_threshold", 0.35)),
+        cvd_absorption_structure_gap_threshold=float(cvd_filter_cfg.get("absorption_structure_gap_threshold", 0.002)),
+        cvd_divergence_price_change_threshold=float(cvd_filter_cfg.get("divergence_price_change_threshold", 0.003)),
+        cvd_divergence_session_change_threshold=float(cvd_filter_cfg.get("divergence_session_change_threshold", -0.005)),
+        enable_short_quality_filter=bool(v2_cfg.get("short_quality_filter", {}).get("enabled", False)),
+        short_filter_min_funding_rate=float(v2_cfg.get("short_quality_filter", {}).get("min_funding_rate", 0.0005)),
+        short_filter_max_oi_delta_ratio=float(v2_cfg.get("short_quality_filter", {}).get("max_oi_delta_ratio", 0.0)),
+        short_filter_min_vwap_deviation=float(v2_cfg.get("short_quality_filter", {}).get("min_vwap_deviation", 0.005)),
+    )
 
 
 class MACDStrategyV2Engine:

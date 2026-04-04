@@ -149,6 +149,9 @@ def _collect_samples(
     l1_rows: List[Dict[str, Any]] = []
     l3_rows: List[Dict[str, Any]] = []
     l3_imbalance_rows: List[Dict[str, Any]] = []
+    analysis_attempts = 0
+    analysis_ready = 0
+    analysis_skipped = Counter()
 
     l1_total = 0
     l3_total = 0
@@ -157,9 +160,12 @@ def _collect_samples(
     for symbol, data in market_data_map.items():
         tf_15m = data["15m"]
         for idx in range(len(tf_15m)):
-            analysis = engine._build_analysis(symbol, data, idx)
+            analysis_attempts += 1
+            analysis, analysis_status = engine._build_analysis_with_status(symbol, data, idx)
             if analysis is None:
+                analysis_skipped[analysis_status] += 1
                 continue
+            analysis_ready += 1
             decision = engine._decide(symbol, analysis)
             if decision.operation.value != "hold":
                 continue
@@ -191,6 +197,11 @@ def _collect_samples(
         "min_score": min_score,
         "sample_limit": sample_limit,
         "per_symbol_limit": per_symbol_limit,
+        "replay_input_counters": {
+            "analysis_attempts": analysis_attempts,
+            "analysis_ready": analysis_ready,
+            "analysis_skipped": dict(analysis_skipped),
+        },
         "counts": {
             "l1_high_score_blocked_total": l1_total,
             "l3_high_score_blocked_total": l3_total,

@@ -27,10 +27,17 @@ warnings.filterwarnings('ignore')
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config.config_loader import ConfigLoader
-from src.fund_flow.macd_strategy_v2 import MACDStrategyV2Engine, MACDStrategyV2Config, MACDSignalV2, VetoType
+from src.fund_flow.macd_strategy_v2 import (
+    MACDStrategyV2Engine,
+    MACDStrategyV2Config,
+    MACDSignalV2,
+    VetoType,
+    build_macd_v2_config_from_runtime,
+)
 from src.fund_flow.filters.symbol_signal_override import create_override_registry
 from src.fund_flow.filters.time_window_filter import TimeWindowFilter, TimeWindowFilterConfig
 from src.utils.indicators import calculate_macd_histogram_series
+from src.utils.passive_fill import classify_passive_limit_fill, direct_ioc_fill_is_valid
 
 
 # ==================== 配置 ====================
@@ -84,6 +91,7 @@ class BacktestConfig:
     trailing_stop_atr_multiplier: float = 0.0
     trailing_stop_min_distance: float = 0.0
     trailing_stop_max_distance: float = 0.0
+    entry_bar_same_bar_enabled: bool = False
     same_bar_tp_priority_mode: str = "stop_first"
     partial_aware_breakeven_enabled: bool = False
     partial_aware_no_partial_trigger_pnl_ratio: float = 0.0
@@ -95,8 +103,18 @@ class BacktestConfig:
     shrink_exit_loss_mitigation_ignore_if_pnl_gt: float = 0.01
     max_hold_hours: float = 0.0
     entry_slippage: float = 0.0015
+    entry_passive_offset_pct: float = 0.0015
+    entry_passive_pricing_atr_fraction: float = 0.25
+    entry_passive_pricing_min_offset_pct: float = 0.0008
+    entry_passive_pricing_max_offset_pct: float = 0.0060
+    entry_passive_pricing_signal_type_multipliers: Dict[str, float] = field(default_factory=dict)
+    entry_passive_pricing_vwap_state_multipliers: Dict[str, float] = field(default_factory=dict)
     entry_time_in_force: str = "IOC"
+    direct_ioc_fill_mode: str = "touch"
+    direct_ioc_min_penetration_bps: float = 0.0
     gtc_expire_bars: int = 0
+    gtc_cancel_on_signal_reversal: bool = False
+    open_gtc_fallback_enabled: bool = True
     max_consecutive_losses: int = 0
     consecutive_loss_cooldown_seconds: int = 0
 
@@ -188,6 +206,8 @@ def build_backtest_summary(
     signal_type_breakdown: Dict[str, dict] = {}
     cvd_bonus_breakdown: Dict[str, dict] = {}
     cvd_veto_breakdown: Dict[str, dict] = {}
+    entry_tif_breakdown: Dict[str, dict] = {}
+    entry_degradation_breakdown: Dict[str, dict] = {}
     for trade in trades:
         signal_type = str(trade.get("signal_type_1h", "unknown"))
         bucket = signal_type_breakdown.setdefault(
@@ -220,6 +240,32 @@ def build_backtest_summary(
         if pnl_value > 0:
             cvd_veto_bucket["wins"] += 1
 
+        initial_tif = str(trade.get("entry_initial_time_in_force", "") or "")
+        final_tif = str(trade.get("entry_time_in_force", "") or "")
+        tif_key = f"{initial_tif}->{final_tif}" if initial_tif or final_tif else "unknown"
+        tif_bucket = entry_tif_breakdown.setdefault(
+            tif_key,
+            {"count": 0, "wins": 0, "pnl": 0.0},
+        )
+        tif_bucket["count"] += 1
+        tif_bucket["pnl"] += pnl_value
+        if pnl_value > 0:
+            tif_bucket["wins"] += 1
+
+        degradation_path = trade.get("entry_degradation_path")
+        degradation_key = "direct_fill"
+        if isinstance(degradation_path, list) and degradation_path:
+            last_step = degradation_path[-1] if isinstance(degradation_path[-1], dict) else {}
+            degradation_key = str(last_step.get("step", "degraded") or "degraded")
+        deg_bucket = entry_degradation_breakdown.setdefault(
+            degradation_key,
+            {"count": 0, "wins": 0, "pnl": 0.0},
+        )
+        deg_bucket["count"] += 1
+        deg_bucket["pnl"] += pnl_value
+        if pnl_value > 0:
+            deg_bucket["wins"] += 1
+
     for bucket in signal_type_breakdown.values():
         count = int(bucket["count"])
         bucket["win_rate_pct"] = (bucket["wins"] / count * 100.0) if count > 0 else 0.0
@@ -227,6 +273,12 @@ def build_backtest_summary(
         count = int(bucket["count"])
         bucket["win_rate_pct"] = (bucket["wins"] / count * 100.0) if count > 0 else 0.0
     for bucket in cvd_veto_breakdown.values():
+        count = int(bucket["count"])
+        bucket["win_rate_pct"] = (bucket["wins"] / count * 100.0) if count > 0 else 0.0
+    for bucket in entry_tif_breakdown.values():
+        count = int(bucket["count"])
+        bucket["win_rate_pct"] = (bucket["wins"] / count * 100.0) if count > 0 else 0.0
+    for bucket in entry_degradation_breakdown.values():
         count = int(bucket["count"])
         bucket["win_rate_pct"] = (bucket["wins"] / count * 100.0) if count > 0 else 0.0
 
@@ -250,6 +302,8 @@ def build_backtest_summary(
         "signal_type_breakdown": signal_type_breakdown,
         "cvd_bonus_breakdown": cvd_bonus_breakdown,
         "cvd_veto_breakdown": cvd_veto_breakdown,
+        "entry_tif_breakdown": entry_tif_breakdown,
+        "entry_degradation_breakdown": entry_degradation_breakdown,
         "risk_metrics": {
             "equity_curve_points": len(getattr(engine, "equity_curve", []) or []),
             "max_drawdown_value": float(getattr(engine, "max_drawdown_value", 0.0) or 0.0),
@@ -307,7 +361,15 @@ def build_backtest_summary(
             "breakeven_trigger_pnl_ratio": config.breakeven_trigger_pnl_ratio,
             "breakeven_lock_ratio": config.breakeven_lock_ratio,
             "entry_slippage": config.entry_slippage,
+            "entry_passive_offset_pct": config.entry_passive_offset_pct,
+            "entry_passive_pricing_atr_fraction": config.entry_passive_pricing_atr_fraction,
+            "entry_passive_pricing_min_offset_pct": config.entry_passive_pricing_min_offset_pct,
+            "entry_passive_pricing_max_offset_pct": config.entry_passive_pricing_max_offset_pct,
+            "entry_passive_pricing_signal_type_multipliers": config.entry_passive_pricing_signal_type_multipliers,
+            "entry_passive_pricing_vwap_state_multipliers": config.entry_passive_pricing_vwap_state_multipliers,
             "entry_time_in_force": config.entry_time_in_force,
+            "direct_ioc_fill_mode": config.direct_ioc_fill_mode,
+            "direct_ioc_min_penetration_bps": config.direct_ioc_min_penetration_bps,
             "gtc_expire_bars": config.gtc_expire_bars,
         },
     }
@@ -330,6 +392,8 @@ def build_backtest_config(
     position_limits = ConfigLoader.get_position_limits(runtime_cfg)
     fund_flow_cfg = runtime_cfg.get("fund_flow", {}) if isinstance(runtime_cfg.get("fund_flow"), dict) else {}
     risk_cfg = runtime_cfg.get("risk", {}) if isinstance(runtime_cfg.get("risk"), dict) else {}
+    backtest_cfg = fund_flow_cfg.get("backtest", {}) if isinstance(fund_flow_cfg.get("backtest"), dict) else {}
+    passive_pricing_cfg = backtest_cfg.get("passive_pricing", {}) if isinstance(backtest_cfg.get("passive_pricing"), dict) else {}
 
     return BacktestConfig(
         symbols=symbols,
@@ -392,37 +456,79 @@ def build_backtest_config(
         trailing_stop_atr_multiplier=float(fund_flow_cfg.get("trailing_stop_atr_multiplier", 0.0) or 0.0),
         trailing_stop_min_distance=float(fund_flow_cfg.get("trailing_stop_min_distance", 0.0) or 0.0),
         trailing_stop_max_distance=float(fund_flow_cfg.get("trailing_stop_max_distance", 0.0) or 0.0),
+        entry_bar_same_bar_enabled=bool(
+            backtest_cfg.get("entry_bar_same_bar_enabled", False)
+        ),
         same_bar_tp_priority_mode=str(
-            ((fund_flow_cfg.get("backtest", {}) or {}).get("same_bar_tp_priority_mode", "stop_first"))
-            if isinstance(fund_flow_cfg.get("backtest"), dict)
-            else "stop_first"
+            backtest_cfg.get("same_bar_tp_priority_mode", "stop_first")
         ).strip().lower() or "stop_first",
         partial_aware_breakeven_enabled=bool(
-            ((fund_flow_cfg.get("backtest", {}) or {}).get("partial_aware_breakeven_enabled", False))
-            if isinstance(fund_flow_cfg.get("backtest"), dict)
-            else False
+            backtest_cfg.get("partial_aware_breakeven_enabled", False)
         ),
         partial_aware_no_partial_trigger_pnl_ratio=float(
-            ((fund_flow_cfg.get("backtest", {}) or {}).get("partial_aware_no_partial_trigger_pnl_ratio", 0.0))
-            if isinstance(fund_flow_cfg.get("backtest"), dict)
-            else 0.0
+            backtest_cfg.get("partial_aware_no_partial_trigger_pnl_ratio", 0.0)
         ),
         runner_only_trailing_enabled=bool(
-            ((fund_flow_cfg.get("backtest", {}) or {}).get("runner_only_trailing_enabled", False))
-            if isinstance(fund_flow_cfg.get("backtest"), dict)
-            else False
+            backtest_cfg.get("runner_only_trailing_enabled", False)
         ),
         runner_only_trailing_min_completed_levels=max(
             0,
             int(
-                ((fund_flow_cfg.get("backtest", {}) or {}).get("runner_only_trailing_min_completed_levels", 0))
-                if isinstance(fund_flow_cfg.get("backtest"), dict)
-                else 0
+                backtest_cfg.get("runner_only_trailing_min_completed_levels", 0)
             ),
         ),
         entry_slippage=float(fund_flow_cfg.get("entry_slippage", 0.0015)),
-        entry_time_in_force=str(fund_flow_cfg.get("backtest_entry_time_in_force", "IOC")).upper(),
-        gtc_expire_bars=max(0, int(fund_flow_cfg.get("backtest_gtc_expire_bars", 0) or 0)),
+        entry_passive_offset_pct=float(
+            backtest_cfg.get(
+                "entry_passive_offset_pct",
+                fund_flow_cfg.get(
+                    "entry_passive_offset_pct",
+                    fund_flow_cfg.get("entry_slippage", 0.0015),
+                ),
+            )
+        ),
+        entry_passive_pricing_atr_fraction=float(
+            passive_pricing_cfg.get("atr_fraction", 0.25)
+        ),
+        entry_passive_pricing_min_offset_pct=float(
+            passive_pricing_cfg.get("min_offset_pct", 0.0008)
+        ),
+        entry_passive_pricing_max_offset_pct=float(
+            passive_pricing_cfg.get("max_offset_pct", 0.0060)
+        ),
+        entry_passive_pricing_signal_type_multipliers={
+            str(k): float(v)
+            for k, v in passive_pricing_cfg.get("signal_type_multipliers", {}).items()
+            if isinstance(passive_pricing_cfg.get("signal_type_multipliers", {}), dict)
+        } if isinstance(passive_pricing_cfg.get("signal_type_multipliers", {}), dict) else {},
+        entry_passive_pricing_vwap_state_multipliers={
+            str(k): float(v)
+            for k, v in passive_pricing_cfg.get("vwap_state_multipliers", {}).items()
+            if isinstance(passive_pricing_cfg.get("vwap_state_multipliers", {}), dict)
+        } if isinstance(passive_pricing_cfg.get("vwap_state_multipliers", {}), dict) else {},
+        entry_time_in_force=str(
+            backtest_cfg.get(
+                "entry_time_in_force",
+                fund_flow_cfg.get("backtest_entry_time_in_force", "IOC"),
+            )
+        ).upper(),
+        direct_ioc_fill_mode=str(
+            backtest_cfg.get("direct_ioc_fill_mode", "touch")
+        ).strip().lower() or "touch",
+        direct_ioc_min_penetration_bps=float(
+            backtest_cfg.get("direct_ioc_min_penetration_bps", 0.0) or 0.0
+        ),
+        gtc_expire_bars=max(
+            0,
+            int(
+                backtest_cfg.get(
+                    "gtc_expire_bars",
+                    fund_flow_cfg.get("backtest_gtc_expire_bars", 0),
+                ) or 0
+            ),
+        ),
+        gtc_cancel_on_signal_reversal=bool(backtest_cfg.get("gtc_cancel_on_signal_reversal", False)),
+        open_gtc_fallback_enabled=bool(backtest_cfg.get("open_gtc_fallback_enabled", True)),
         max_consecutive_losses=max(0, int(risk_cfg.get("max_consecutive_losses", 0) or 0)),
         consecutive_loss_cooldown_seconds=max(0, int(risk_cfg.get("consecutive_loss_cooldown_seconds", 0) or 0)),
     )
@@ -430,187 +536,11 @@ def build_backtest_config(
 
 def build_strategy_config(runtime_cfg: dict) -> MACDStrategyV2Config:
     ff_cfg = runtime_cfg.get("fund_flow", {}) if isinstance(runtime_cfg.get("fund_flow"), dict) else {}
-    v2_cfg = ff_cfg.get("macd_mtf_strategy_v2", {}) if isinstance(ff_cfg.get("macd_mtf_strategy_v2"), dict) else {}
-    boll_cfg = v2_cfg.get("boll_config", {}) if isinstance(v2_cfg.get("boll_config"), dict) else {}
-    ema_cfg = v2_cfg.get("ema_config", {}) if isinstance(v2_cfg.get("ema_config"), dict) else {}
-    leverage_cfg = v2_cfg.get("leverage_config", {}) if isinstance(v2_cfg.get("leverage_config"), dict) else {}
-    cvd_filter_cfg = v2_cfg.get("cvd_filter_config", {}) if isinstance(v2_cfg.get("cvd_filter_config"), dict) else {}
-    vwap_cfg = v2_cfg.get("vwap_config", {}) if isinstance(v2_cfg.get("vwap_config"), dict) else {}
-    weights_cfg = v2_cfg.get("scoring_weights", {}) if isinstance(v2_cfg.get("scoring_weights"), dict) else {}
-    thresholds_cfg = v2_cfg.get("entry_thresholds", {}) if isinstance(v2_cfg.get("entry_thresholds"), dict) else {}
-    stop_cfg = v2_cfg.get("stop_loss_config", {}) if isinstance(v2_cfg.get("stop_loss_config"), dict) else {}
-    session_risk_cfg = v2_cfg.get("session_risk_control", {}) if isinstance(v2_cfg.get("session_risk_control"), dict) else {}
-    vwap_score_tier_cfg = v2_cfg.get("vwap_score_position_tiers", {}) if isinstance(v2_cfg.get("vwap_score_position_tiers"), dict) else {}
-    symbol_risk_cfg = v2_cfg.get("symbol_risk_tiers", {}) if isinstance(v2_cfg.get("symbol_risk_tiers"), dict) else {}
-    macd_cfg = v2_cfg.get("macd_config", {}) if isinstance(v2_cfg.get("macd_config"), dict) else {}
-    filter_cfg = v2_cfg.get("entry_filters", {}) if isinstance(v2_cfg.get("entry_filters"), dict) else {}
-    penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
-    default_signal_threshold = float(thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score", 0.850)))
     backtest_cfg = ff_cfg.get("backtest", {}) if isinstance(ff_cfg.get("backtest"), dict) else {}
     disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
-
-    return MACDStrategyV2Config(
-        macd_1h_fast=int(macd_cfg.get("macd_1h_fast", 12)),
-        macd_1h_slow=int(macd_cfg.get("macd_1h_slow", 26)),
-        macd_1h_signal=int(macd_cfg.get("macd_1h_signal", 9)),
-        macd_4h_fast=int(macd_cfg.get("macd_4h_fast", 12)),
-        macd_4h_slow=int(macd_cfg.get("macd_4h_slow", 26)),
-        macd_4h_signal=int(macd_cfg.get("macd_4h_signal", 9)),
-        macd_15m_fast=int(macd_cfg.get("macd_15m_fast", 12)),
-        macd_15m_slow=int(macd_cfg.get("macd_15m_slow", 26)),
-        macd_15m_signal=int(macd_cfg.get("macd_15m_signal", 9)),
-        macd_threshold=float(macd_cfg.get("macd_threshold", 0.00005)),
-        boll_period=int(float(boll_cfg.get("period", 20))),
-        boll_std_dev=float(boll_cfg.get("std_dev", 2.0)),
-        ema_multiplier_strong=float(boll_cfg.get("multiplier_strong", ema_cfg.get("ema_multiplier_strong", 1.2))),
-        ema_multiplier_normal=float(boll_cfg.get("multiplier_normal", ema_cfg.get("ema_multiplier_normal", 1.0))),
-        ema_multiplier_weak=float(boll_cfg.get("multiplier_weak", ema_cfg.get("ema_multiplier_weak", 0.6))),
-        ema_55_1h_hard_block=bool(boll_cfg.get("middle_hard_block", ema_cfg.get("ema_55_1h_hard_block", True))),
-        ema_strong_trend_leverage_mult=float(boll_cfg.get("strong_trend_leverage_mult", ema_cfg.get("ema_strong_trend_leverage_mult", 0.8))),
-        vwap_deviation_optimal=float(vwap_cfg.get("vwap_deviation_optimal", 0.005)),
-        vwap_deviation_warning=float(vwap_cfg.get("vwap_deviation_warning", 0.015)),
-        vwap_deviation_hard_block=float(vwap_cfg.get("vwap_deviation_hard_block", 0.030)),
-        structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_weekly")),
-        structural_vwap_rolling_window=int(float(vwap_cfg.get("structural_vwap_rolling_window", 20))),
-        vwap_retest_tolerance=float(vwap_cfg.get("vwap_retest_tolerance", 0.003)),
-        weight_1h_direction=float(weights_cfg.get("weight_1h_direction", 0.00)),
-        weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.55))),
-        weight_4h_enhancement=float(weights_cfg.get("weight_4h_enhancement", 0.10)),
-        weight_vwap=float(weights_cfg.get("weight_vwap", 0.20)),
-        weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.05)),
-        weight_volume=float(weights_cfg.get("weight_volume", 0.20)),
-        min_entry_score=float(thresholds_cfg.get("min_entry_score", 0.25)),
-        min_signal_score=default_signal_threshold,
-        red_bar_growing_min_signal_score=float(thresholds_cfg.get("red_bar_growing", default_signal_threshold)),
-        flip_bearish_min_signal_score=float(thresholds_cfg.get("flip_bearish", default_signal_threshold)),
-        flip_bullish_min_signal_score=float(thresholds_cfg.get("flip_bullish", default_signal_threshold)),
-        enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
-        disable_flip_bullish_entries=bool(filter_cfg.get("disable_flip_bullish_entries", False)),
-        flip_bullish_min_vwap_score=float(filter_cfg.get("flip_bullish_min_vwap_score", 0.12)),
-        flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
-        flip_bullish_require_15m_growing=bool(filter_cfg.get("flip_bullish_require_15m_growing", True)),
-        enable_flip_bullish_cvd_context_filter=(
-            False if disable_cvd_decision_logic else bool(filter_cfg.get("enable_flip_bullish_cvd_context_filter", False))
-        ),
-        flip_bullish_max_cvd_upper_wick_ratio=(
-            0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_max_cvd_upper_wick_ratio", 0.0))
-        ),
-        flip_bullish_min_cvd_1h_delta_ratio=(
-            0.0 if disable_cvd_decision_logic else float(filter_cfg.get("flip_bullish_min_cvd_1h_delta_ratio", 0.0))
-        ),
-        flip_bullish_trial_score_window_enabled=bool(
-            filter_cfg.get("flip_bullish_trial_score_window_enabled", False)
-        ),
-        flip_bullish_trial_score_min=float(filter_cfg.get("flip_bullish_trial_score_min", 0.80)),
-        flip_bullish_trial_score_max=float(filter_cfg.get("flip_bullish_trial_score_max", 0.87)),
-        green_bar_growing_score_window_enabled=bool(
-            filter_cfg.get("green_bar_growing_score_window_enabled", False)
-        ),
-        green_bar_growing_score_min=float(filter_cfg.get("green_bar_growing_score_min", 0.0)),
-        green_bar_growing_score_max=float(filter_cfg.get("green_bar_growing_score_max", 1.0)),
-        flip_bearish_min_ema_multiplier=float(filter_cfg.get("flip_bearish_min_boll_multiplier", filter_cfg.get("flip_bearish_min_ema_multiplier", 0.0))),
-        flip_bearish_normal_ema_min_signal_score=float(filter_cfg.get("flip_bearish_normal_boll_min_signal_score", filter_cfg.get("flip_bearish_normal_ema_min_signal_score", 0.0))),
-        flip_bearish_normal_ema_max_leverage=int(float(filter_cfg.get("flip_bearish_normal_boll_max_leverage", filter_cfg.get("flip_bearish_normal_ema_max_leverage", 0.0)))),
-        flip_bearish_min_adx_1h=float(filter_cfg.get("flip_bearish_min_adx_1h", 18.0)),
-        flip_bearish_retest_reject_min_vwap_score=float(filter_cfg.get("flip_bearish_retest_reject_min_vwap_score", 0.0)),
-        flip_bearish_max_ema21_slope_1h=float(filter_cfg.get("flip_bearish_max_bb_middle_slope_1h", filter_cfg.get("flip_bearish_max_ema21_slope_1h", 0.0))),
-        flip_bearish_max_ema21_slope_4h=float(filter_cfg.get("flip_bearish_max_bb_middle_slope_4h", filter_cfg.get("flip_bearish_max_ema21_slope_4h", 0.0001))),
-        ema_slope_lookback_1h=int(float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h", 3)))),
-        ema_slope_lookback_4h=int(float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h", 2)))),
-        disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
-        disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
-        primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
-        require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
-        allow_neutral_1h_confirmation=bool(filter_cfg.get("allow_neutral_1h_confirmation", False)),
-        light_1h_confirmation_when_4h_primary=bool(filter_cfg.get("light_1h_confirmation_when_4h_primary", False)),
-        enable_soft_15m_confirmation_when_4h_primary=bool(filter_cfg.get("enable_soft_15m_confirmation_when_4h_primary", True)),
-        soft_15m_entry_score=float(filter_cfg.get("soft_15m_entry_score", 0.28)),
-        soft_15m_neutral_hist_multiple=float(filter_cfg.get("soft_15m_neutral_hist_multiple", 3.0)),
-        soft_15m_max_adverse_hist_multiple=float(filter_cfg.get("soft_15m_max_adverse_hist_multiple", 8.0)),
-        enable_green_bar_growing_short_adx_1h_range_filter=bool(filter_cfg.get("enable_green_bar_growing_short_adx_1h_range_filter", False)),
-        green_bar_growing_short_min_adx_1h=float(filter_cfg.get("green_bar_growing_short_min_adx_1h", 0.0)),
-        green_bar_growing_short_max_adx_1h=float(filter_cfg.get("green_bar_growing_short_max_adx_1h", 0.0)),
-        enable_4h_preflip_trial_entries=bool(filter_cfg.get("enable_4h_preflip_trial_entries", False)),
-        preflip_trial_min_shrink_pct_long=float(filter_cfg.get("preflip_trial_min_shrink_pct_long", 0.75)),
-        preflip_trial_min_shrink_pct_short=float(filter_cfg.get("preflip_trial_min_shrink_pct_short", 0.30)),
-        preflip_trial_min_signal_score=float(filter_cfg.get("preflip_trial_min_signal_score", 0.78)),
-        preflip_trial_min_vwap_score=float(filter_cfg.get("preflip_trial_min_vwap_score", 0.06)),
-        preflip_trial_entry_scale=float(filter_cfg.get("preflip_trial_entry_scale", 0.35)),
-        preflip_trial_max_leverage=int(float(filter_cfg.get("preflip_trial_max_leverage", 2))),
-        pocket_entry_overrides=copy.deepcopy(filter_cfg.get("pocket_entry_overrides", {}))
-        if isinstance(filter_cfg.get("pocket_entry_overrides"), dict) else {},
-        pocket_scoring_overrides=copy.deepcopy(v2_cfg.get("pocket_scoring_overrides", {}))
-        if isinstance(v2_cfg.get("pocket_scoring_overrides"), dict) else {},
-        overheat_growing_penalty=float(penalty_cfg.get("overheat_growing_penalty", 0.12)),
-        overheat_ema_multiplier_threshold=float(penalty_cfg.get("overheat_boll_multiplier_threshold", penalty_cfg.get("overheat_ema_multiplier_threshold", 1.2))),
-        overheat_vwap_score_threshold=float(penalty_cfg.get("overheat_vwap_score_threshold", 0.10)),
-        min_vwap_score_for_entry=float(filter_cfg.get("min_vwap_score_for_entry", penalty_cfg.get("min_vwap_score_for_entry", 0.12))),
-        use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
-        ema_stop_atr_multiplier=float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier", 0.5))),
-        max_stop_loss_pct=float(stop_cfg.get("max_stop_loss_pct", 0.025)),
-        vwap_alert_deviation=float(stop_cfg.get("vwap_alert_deviation", 0.005)),
-        enable_4h_shrink_exit=bool(stop_cfg.get("enable_4h_shrink_exit", False)),
-        exit_4h_shrink_bars=int(float(stop_cfg.get("exit_4h_shrink_bars", 2))),
-        exit_4h_min_shrink_pct=float(stop_cfg.get("exit_4h_min_shrink_pct", 0.20)),
-        exit_4h_require_profit=bool(stop_cfg.get("exit_4h_require_profit", True)),
-        exit_4h_weak_loss_threshold=float(stop_cfg.get("exit_4h_weak_loss_threshold", -1.0)),
-        shrink_exit_loss_mitigation_enabled=bool(
-            stop_cfg.get("shrink_exit_loss_mitigation_enabled", False)
-        ),
-        shrink_exit_loss_mitigation_pnl_threshold=float(
-            stop_cfg.get("shrink_exit_loss_mitigation_pnl_threshold", -0.005)
-        ),
-        shrink_exit_loss_mitigation_exit_ratio=float(
-            stop_cfg.get("shrink_exit_loss_mitigation_exit_ratio", 0.60)
-        ),
-        shrink_exit_loss_mitigation_ignore_if_pnl_gt=float(
-            stop_cfg.get("shrink_exit_loss_mitigation_ignore_if_pnl_gt", 0.01)
-        ),
-        session_risk_control_enabled=bool(session_risk_cfg.get("enabled", False)),
-        session_risk_high_risk_sessions=copy.deepcopy(session_risk_cfg.get("high_risk_sessions", [])) if isinstance(session_risk_cfg.get("high_risk_sessions"), list) else [],
-        session_risk_apply_to_states=[
-            str(x).strip() for x in (session_risk_cfg.get("apply_to_states", []) or []) if str(x).strip()
-        ] if isinstance(session_risk_cfg.get("apply_to_states"), list) else [],
-        vwap_score_tier_apply_to_states=[
-            str(x).strip() for x in (vwap_score_tier_cfg.get("apply_to_states", []) or []) if str(x).strip()
-        ] if isinstance(vwap_score_tier_cfg.get("apply_to_states"), list) else [],
-        vwap_score_position_tiers=copy.deepcopy(vwap_score_tier_cfg.get("tiers", [])) if isinstance(vwap_score_tier_cfg.get("tiers"), list) else [],
-        symbol_risk_watchlist_symbols=[
-            str(x).strip().upper() for x in (symbol_risk_cfg.get("watchlist_symbols", []) or []) if str(x).strip()
-        ] if isinstance(symbol_risk_cfg.get("watchlist_symbols"), list) else [],
-        symbol_risk_watchlist_max_position_portion=float(symbol_risk_cfg.get("watchlist_max_position_portion", 0.0)),
-        symbol_risk_watchlist_max_leverage=int(float(symbol_risk_cfg.get("watchlist_max_leverage", 0))),
-        symbol_risk_watchlist_apply_session_scale_double=bool(symbol_risk_cfg.get("watchlist_apply_session_scale_double", False)),
-        symbol_risk_watchlist_session_scale_multiplier=float(symbol_risk_cfg.get("watchlist_session_scale_multiplier", 0.80)),
-        dual_pressure_target_portion_bonus=float(leverage_cfg.get("dual_pressure_target_portion_bonus", 0.0)),
-        dual_pressure_max_symbol_position_portion=float(leverage_cfg.get("dual_pressure_max_symbol_position_portion", 0.0)),
-        use_cvd_bonus_filter=False if disable_cvd_decision_logic else bool(leverage_cfg.get("use_cvd_bonus_filter", False)),
-        cvd_1h_slope_lookback=int(float(leverage_cfg.get("cvd_1h_slope_lookback", 3))),
-        cvd_15m_slope_lookback=int(float(leverage_cfg.get("cvd_15m_slope_lookback", 3))),
-        cvd_positive_delta_ratio_threshold=float(leverage_cfg.get("cvd_positive_delta_ratio_threshold", 0.05)),
-        cvd_negative_delta_ratio_threshold=float(leverage_cfg.get("cvd_negative_delta_ratio_threshold", -0.05)),
-        cvd_bullish_bonus_multiplier=float(leverage_cfg.get("cvd_bullish_bonus_multiplier", 0.0)),
-        cvd_neutral_bonus_multiplier=float(leverage_cfg.get("cvd_neutral_bonus_multiplier", 0.7)),
-        cvd_bearish_bonus_multiplier=float(leverage_cfg.get("cvd_bearish_bonus_multiplier", 1.0)),
-        use_cvd_veto_filter=False if disable_cvd_decision_logic else bool(cvd_filter_cfg.get("enabled", False)),
-        cvd_veto_session_reset=str(cvd_filter_cfg.get("session_reset", "daily_utc0")),
-        cvd_veto_lookback_15m=int(float(cvd_filter_cfg.get("lookback_15m", 3))),
-        cvd_veto_positive_delta_ratio_threshold=float(cvd_filter_cfg.get("positive_delta_ratio_threshold", 0.10)),
-        cvd_veto_positive_pressure_threshold=float(cvd_filter_cfg.get("positive_pressure_threshold", 0.0)),
-        cvd_veto_session_ratio_change_threshold=float(cvd_filter_cfg.get("session_ratio_change_threshold", -0.003)),
-        cvd_veto_session_price_change_threshold=float(cvd_filter_cfg.get("session_price_change_threshold", -0.005)),
-        cvd_veto_strong_close_pos_threshold=float(cvd_filter_cfg.get("strong_close_pos_threshold", 0.72)),
-        cvd_veto_upper_wick_ratio_max=float(cvd_filter_cfg.get("upper_wick_ratio_max", 0.25)),
-        cvd_absorption_delta_ratio_threshold=float(cvd_filter_cfg.get("absorption_delta_ratio_threshold", 0.05)),
-        cvd_absorption_close_pos_threshold=float(cvd_filter_cfg.get("absorption_close_pos_threshold", 0.45)),
-        cvd_absorption_upper_wick_ratio_threshold=float(cvd_filter_cfg.get("absorption_upper_wick_ratio_threshold", 0.35)),
-        cvd_absorption_structure_gap_threshold=float(cvd_filter_cfg.get("absorption_structure_gap_threshold", 0.002)),
-        cvd_divergence_price_change_threshold=float(cvd_filter_cfg.get("divergence_price_change_threshold", 0.003)),
-        cvd_divergence_session_change_threshold=float(cvd_filter_cfg.get("divergence_session_change_threshold", -0.005)),
-        enable_short_quality_filter=bool(v2_cfg.get("short_quality_filter", {}).get("enabled", False)),
-        short_filter_min_funding_rate=float(v2_cfg.get("short_quality_filter", {}).get("min_funding_rate", 0.0005)),
-        short_filter_max_oi_delta_ratio=float(v2_cfg.get("short_quality_filter", {}).get("max_oi_delta_ratio", 0.0)),
-        short_filter_min_vwap_deviation=float(v2_cfg.get("short_quality_filter", {}).get("min_vwap_deviation", 0.005)),
+    return build_macd_v2_config_from_runtime(
+        runtime_cfg,
+        disable_cvd_decision_logic=disable_cvd_decision_logic,
     )
 
 
@@ -1140,29 +1070,122 @@ class BacktestEngine:
                 seconds=int(self.config.consecutive_loss_cooldown_seconds)
             )
 
+    def _entry_fill_decision(self, order: dict, row_15m: pd.Series) -> Tuple[Optional[float], dict]:
+        classification = classify_passive_limit_fill(
+            side=str(order.get('side', '')).lower(),
+            limit_price=float(order.get('limit_price', 0.0)),
+            open_price=float(row_15m['open']),
+            high_price=float(row_15m['high']),
+            low_price=float(row_15m['low']),
+            close_price=float(row_15m['close']),
+        )
+        classification["direct_ioc_fill_mode"] = str(getattr(self.config, "direct_ioc_fill_mode", "touch") or "touch")
+        classification["direct_ioc_min_penetration_bps"] = float(
+            getattr(self.config, "direct_ioc_min_penetration_bps", 0.0) or 0.0
+        )
+
+        if not bool(classification["touched"]):
+            classification["direct_ioc_fill_valid"] = False
+            classification["direct_ioc_fill_reason"] = "untouched"
+            return None, classification
+
+        tif = str(order.get('time_in_force', 'IOC')).upper()
+        if tif == "IOC":
+            direct_fill_valid, direct_fill_reason = direct_ioc_fill_is_valid(
+                classification,
+                mode=str(getattr(self.config, "direct_ioc_fill_mode", "touch") or "touch"),
+                min_penetration_bps=float(getattr(self.config, "direct_ioc_min_penetration_bps", 0.0) or 0.0),
+            )
+            classification["direct_ioc_fill_valid"] = bool(direct_fill_valid)
+            classification["direct_ioc_fill_reason"] = direct_fill_reason
+            if not direct_fill_valid:
+                return None, classification
+        else:
+            classification["direct_ioc_fill_valid"] = True
+            classification["direct_ioc_fill_reason"] = "non_ioc_touch"
+
+        if bool(classification["marketable_at_open"]):
+            return float(row_15m['open']), classification
+        return float(order.get('limit_price', 0.0)), classification
+
     @staticmethod
-    def _entry_fill_price(order: dict, row_15m: pd.Series) -> Optional[float]:
+    def _ioc_would_take_immediately(order: dict, row_15m: pd.Series) -> bool:
         order_side = str(order.get('side', '')).lower()
         limit_price = float(order.get('limit_price', 0.0))
         open_price = float(row_15m['open'])
-        high_price = float(row_15m['high'])
-        low_price = float(row_15m['low'])
-
         if order_side == 'long':
-            if open_price <= limit_price:
-                return open_price
-            if low_price <= limit_price:
-                return limit_price
-            return None
-
+            return open_price <= limit_price
         if order_side == 'short':
-            if open_price >= limit_price:
-                return open_price
-            if high_price >= limit_price:
-                return limit_price
-            return None
+            return open_price >= limit_price
+        return False
 
-        return None
+    @staticmethod
+    def _append_entry_degradation_step(order: dict, step: dict) -> None:
+        path = order.get('entry_degradation_path')
+        if not isinstance(path, list):
+            path = []
+        path.append(dict(step))
+        order['entry_degradation_path'] = path
+
+    def _resolve_entry_passive_offset_pct(self, analysis: dict) -> float:
+        reference_price = max(float(analysis.get('price', 0.0) or 0.0), 1e-9)
+        signal = analysis.get('signal')
+        row_1h = analysis.get('row_1h')
+        atr_value = 0.0
+        if isinstance(row_1h, pd.Series):
+            atr_value = float(row_1h.get('atr', 0.0) or 0.0)
+
+        base_offset = max(
+            0.0,
+            abs(
+                float(
+                    getattr(
+                        self.config,
+                        "entry_passive_offset_pct",
+                        getattr(self.config, "entry_slippage", 0.0015),
+                    ) or 0.0
+                )
+            ),
+        )
+        atr_fraction = max(
+            0.0,
+            float(getattr(self.config, "entry_passive_pricing_atr_fraction", 0.25) or 0.0),
+        )
+        min_offset = max(
+            0.0,
+            float(getattr(self.config, "entry_passive_pricing_min_offset_pct", base_offset) or 0.0),
+        )
+        max_offset = max(
+            min_offset,
+            float(getattr(self.config, "entry_passive_pricing_max_offset_pct", max(base_offset, min_offset)) or 0.0),
+        )
+
+        atr_offset = 0.0
+        if atr_value > 0 and reference_price > 0:
+            atr_offset = (atr_value / reference_price) * atr_fraction
+
+        signal_type = str(getattr(signal, 'signal_type_1h', '') or '')
+        vwap_state = str(getattr(signal, 'vwap_state', '') or '')
+        signal_type_mults = getattr(self.config, "entry_passive_pricing_signal_type_multipliers", {}) or {}
+        vwap_state_mults = getattr(self.config, "entry_passive_pricing_vwap_state_multipliers", {}) or {}
+        state_multiplier = 1.0
+        state_multiplier *= float(signal_type_mults.get(signal_type, 1.0) or 1.0)
+        state_multiplier *= float(vwap_state_mults.get(vwap_state, 1.0) or 1.0)
+        state_multiplier = max(0.1, state_multiplier)
+
+        effective_offset = max(base_offset * state_multiplier, atr_offset, min_offset)
+        return min(max_offset, effective_offset)
+
+    def _resolve_entry_limit_price_from_analysis(self, analysis: dict) -> float:
+        reference_price = max(float(analysis.get('price', 0.0) or 0.0), 1e-9)
+        signal = analysis.get('signal')
+        side_lower = str(getattr(signal, 'direction', '') or '').lower()
+        offset_pct = self._resolve_entry_passive_offset_pct(analysis)
+        if side_lower == 'long':
+            return reference_price * (1.0 - offset_pct)
+        if side_lower == 'short':
+            return reference_price * (1.0 + offset_pct)
+        return reference_price
 
     @staticmethod
     def _stop_fill_price(pos: dict, row_15m: pd.Series, stop_price: float) -> float:
@@ -1648,10 +1671,7 @@ class BacktestEngine:
             if required_margin < 100:
                 return
 
-        if signal.direction == 'long':
-            limit_price = price * (1.0 + self.config.entry_slippage)
-        else:
-            limit_price = price * (1.0 - self.config.entry_slippage)
+        limit_price = self._resolve_entry_limit_price_from_analysis(analysis)
 
         self.capital -= required_margin
         self.pending_orders[symbol] = {
@@ -1665,6 +1685,7 @@ class BacktestEngine:
             'take_profit_levels': take_profit_levels,
             'submit_time': time,
             'time_in_force': self.config.entry_time_in_force,
+            'entry_initial_time_in_force': self.config.entry_time_in_force,
             'bars_waited': 0,
             'signal_score': signal.signal_score,
             'signal_type_1h': signal.signal_type_1h,
@@ -1706,6 +1727,7 @@ class BacktestEngine:
             'breakeven_lock_ratio': breakeven_lock_ratio,
             'position_scale_override': position_scale_override,
             'vwap_structure_override_applied': bool(vwap_structure_override),
+            'entry_degradation_path': [],
         }
     
     def close_position(
@@ -1770,6 +1792,9 @@ class BacktestEngine:
             'exit_price': price,
             'entry_time': pos['entry_time'],
             'exit_time': time,
+            'entry_initial_time_in_force': str(pos.get('entry_initial_time_in_force', pos.get('entry_time_in_force', 'IOC'))),
+            'entry_time_in_force': str(pos.get('entry_time_in_force', 'IOC')),
+            'entry_degradation_path': list(pos.get('entry_degradation_path') or []),
             'leverage': pos['leverage'],
             'position_value': realized_position_value,
             'margin': realized_margin,
@@ -1810,6 +1835,14 @@ class BacktestEngine:
             'shrink_exit_ready': bool(pos.get('shrink_exit_ready', False)),
             'macd_4h_shrink_pct': float(pos.get('macd_4h_shrink_pct', 0.0)),
             'macd_4h_shrink_bars': int(pos.get('macd_4h_shrink_bars', 0) or 0),
+            'entry_fill_touch_class': str(pos.get('entry_fill_touch_class', '')),
+            'entry_fill_close_through': bool(pos.get('entry_fill_close_through', False)),
+            'entry_fill_wick_only_touch': bool(pos.get('entry_fill_wick_only_touch', False)),
+            'entry_fill_penetration_bps': float(pos.get('entry_fill_penetration_bps', 0.0)),
+            'entry_fill_range_bps': float(pos.get('entry_fill_range_bps', 0.0)),
+            'entry_fill_penetration_share_of_range': float(pos.get('entry_fill_penetration_share_of_range', 0.0)),
+            'entry_fill_direct_ioc_valid': bool(pos.get('entry_fill_direct_ioc_valid', False)),
+            'entry_fill_direct_ioc_reason': str(pos.get('entry_fill_direct_ioc_reason', '')),
             'remaining_margin_after': remaining_margin,
         })
 
@@ -1825,7 +1858,14 @@ class BacktestEngine:
         pos['remaining_fraction'] = remaining_margin / initial_margin if initial_margin > 0 else 0.0
         pos['realized_pnl_accum'] = total_trade_pnl
 
-    def _fill_pending_order(self, symbol: str, order: dict, fill_price: float, fill_time: float) -> bool:
+    def _fill_pending_order(
+        self,
+        symbol: str,
+        order: dict,
+        fill_price: float,
+        fill_time: float,
+        fill_details: Optional[dict] = None,
+    ) -> bool:
         entry_fee = float(order['margin']) * float(order['leverage']) * self.config.fee_rate
         if self.capital < entry_fee:
             self._cancel_pending_order(symbol, reason="insufficient_fee_cash")
@@ -1845,6 +1885,9 @@ class BacktestEngine:
             'take_profit': order['take_profit'],
             'take_profit_levels': list(order.get('take_profit_levels') or []),
             'entry_time': fill_time,
+            'entry_initial_time_in_force': str(order.get('entry_initial_time_in_force', order.get('time_in_force', 'IOC'))),
+            'entry_time_in_force': str(order.get('time_in_force', 'IOC')),
+            'entry_degradation_path': list(order.get('entry_degradation_path') or []),
             'signal_score': float(order['signal_score']),
             'signal_type_1h': order['signal_type_1h'],
             'is_trial_entry': bool(order.get('is_trial_entry', False)),
@@ -1883,6 +1926,16 @@ class BacktestEngine:
             'breakeven_lock_ratio': float(order.get('breakeven_lock_ratio', self.config.breakeven_lock_ratio)),
             'position_scale_override': float(order.get('position_scale_override', 1.0)),
             'vwap_structure_override_applied': bool(order.get('vwap_structure_override_applied', False)),
+            'entry_fill_touch_class': str((fill_details or {}).get('touch_class', '')),
+            'entry_fill_close_through': bool((fill_details or {}).get('close_through', False)),
+            'entry_fill_wick_only_touch': bool((fill_details or {}).get('wick_only_touch', False)),
+            'entry_fill_penetration_bps': float((fill_details or {}).get('penetration_bps', 0.0) or 0.0),
+            'entry_fill_range_bps': float((fill_details or {}).get('range_bps', 0.0) or 0.0),
+            'entry_fill_penetration_share_of_range': float(
+                (fill_details or {}).get('penetration_share_of_range', 0.0) or 0.0
+            ),
+            'entry_fill_direct_ioc_valid': bool((fill_details or {}).get('direct_ioc_fill_valid', False)),
+            'entry_fill_direct_ioc_reason': str((fill_details or {}).get('direct_ioc_fill_reason', '')),
             'trailing_stop': None,
             'realized_pnl_accum': 0.0,
         }
@@ -1916,13 +1969,37 @@ class BacktestEngine:
                 continue
 
             if str(signal.direction) != str(order.get('side')):
-                self._cancel_pending_order(symbol, reason="signal_reversed")
+                if tif == "IOC" or bool(getattr(self.config, "gtc_cancel_on_signal_reversal", False)):
+                    self._cancel_pending_order(symbol, reason="signal_reversed")
+                elif self.config.gtc_expire_bars > 0 and int(order['bars_waited']) >= self.config.gtc_expire_bars:
+                    self._cancel_pending_order(symbol, reason="gtc_signal_reversed_timeout")
                 continue
 
-            fill_price = self._entry_fill_price(order, analysis['row_15m'])
+            if tif == "IOC" and self._ioc_would_take_immediately(order, analysis['row_15m']):
+                if bool(getattr(self.config, "open_gtc_fallback_enabled", True)):
+                    self._append_entry_degradation_step(
+                        order,
+                        {
+                            'step': 'ioc_to_gtc_fallback',
+                            'time': pd.Timestamp(analysis['time']).strftime("%Y-%m-%d %H:%M:%S"),
+                            'reason': 'ioc_would_take_immediately',
+                            'from_tif': 'IOC',
+                            'to_tif': 'GTC',
+                            'open_price': float(analysis['row_15m']['open']),
+                            'limit_price': float(order.get('limit_price', 0.0)),
+                        },
+                    )
+                    order['time_in_force'] = 'GTC'
+                    continue
+                self._cancel_pending_order(symbol, reason="ioc_would_take_immediately")
+                continue
+
+            fill_price, fill_details = self._entry_fill_decision(order, analysis['row_15m'])
             if fill_price is not None:
-                if self._fill_pending_order(symbol, order, fill_price, analysis['time']):
+                if self._fill_pending_order(symbol, order, fill_price, analysis['time'], fill_details=fill_details):
                     filled_symbols.add(symbol)
+                    if self.config.entry_bar_same_bar_enabled and symbol in self.positions:
+                        self._handle_entry_bar_same_bar_after_fill(symbol, analysis)
                 continue
 
             if tif == "IOC":
@@ -1930,6 +2007,110 @@ class BacktestEngine:
             elif self.config.gtc_expire_bars > 0 and int(order['bars_waited']) >= self.config.gtc_expire_bars:
                 self._cancel_pending_order(symbol, reason="gtc_timeout")
         return filled_symbols
+
+    def _handle_entry_bar_same_bar_after_fill(self, symbol: str, analysis: dict) -> bool:
+        """新仓在成交当根 bar 上仅处理最基础的 TP/SL/partial，避免遗漏已证实的 same-bar 缺口。"""
+        if not bool(getattr(self.config, "entry_bar_same_bar_enabled", False)):
+            return False
+        if symbol not in self.positions:
+            return False
+
+        pos = self.positions[symbol]
+        row = analysis.get('row_15m')
+        time = analysis.get('time')
+        if row is None or time is None:
+            return False
+
+        high_price = float(row['high'])
+        low_price = float(row['low'])
+        stop_hit = False
+        target_hit = False
+        if pos['side'] == 'long':
+            stop_hit = low_price <= pos['stop_price']
+            target_hit = pos['take_profit'] is not None and high_price >= pos['take_profit']
+        else:
+            stop_hit = high_price >= pos['stop_price']
+            target_hit = pos['take_profit'] is not None and low_price <= pos['take_profit']
+
+        hit_levels: List[dict] = []
+        tp_levels = pos.get('take_profit_levels') or []
+        if tp_levels:
+            for level in tp_levels:
+                if not isinstance(level, dict) or bool(level.get('filled')):
+                    continue
+                level_price = float(level.get('price', 0.0) or 0.0)
+                if level_price <= 0:
+                    continue
+                if pos['side'] == 'long' and high_price >= level_price:
+                    hit_levels.append(level)
+                elif pos['side'] == 'short' and low_price <= level_price:
+                    hit_levels.append(level)
+            if hit_levels:
+                if pos['side'] == 'long':
+                    hit_levels.sort(key=lambda item: float(item.get('price', 0.0)))
+                else:
+                    hit_levels.sort(key=lambda item: float(item.get('price', 0.0)), reverse=True)
+
+        same_bar_tp_priority_mode = str(
+            getattr(self.config, "same_bar_tp_priority_mode", "stop_first") or "stop_first"
+        ).lower()
+        if stop_hit and hit_levels and same_bar_tp_priority_mode == "tp1_before_stop":
+            first_level = hit_levels[0]
+            reduce_pct_original = max(0.0, min(1.0, float(first_level.get('reduce_pct', 0.0) or 0.0)))
+            if reduce_pct_original > 0:
+                level_price = float(first_level.get('price', 0.0) or 0.0)
+                exit_price = self._target_fill_price(pos, row, level_price)
+                self.close_position(
+                    symbol,
+                    exit_price,
+                    time,
+                    "take_profit_level_intrabar",
+                    reduce_pct_original=reduce_pct_original,
+                )
+                first_level['filled'] = True
+                if symbol not in self.positions:
+                    return True
+                pos = self.positions[symbol]
+                stop_exit_price = self._stop_fill_price(pos, row, pos['stop_price'])
+                stop_reason = "stop_loss_intrabar_after_tp1_same_bar"
+                if target_hit:
+                    stop_reason = "stop_loss_intrabar_both_hit_after_tp1_same_bar"
+                self.close_position(symbol, stop_exit_price, time, stop_reason)
+                return True
+
+        if stop_hit:
+            exit_price = self._stop_fill_price(pos, row, pos['stop_price'])
+            reason = "stop_loss_intrabar"
+            if target_hit:
+                reason = "stop_loss_intrabar_both_hit"
+            self.close_position(symbol, exit_price, time, reason)
+            return True
+
+        if hit_levels:
+            for level in hit_levels:
+                if symbol not in self.positions:
+                    break
+                level_price = float(level.get('price', 0.0) or 0.0)
+                reduce_pct_original = max(0.0, min(1.0, float(level.get('reduce_pct', 0.0) or 0.0)))
+                if reduce_pct_original <= 0:
+                    continue
+                exit_price = self._target_fill_price(self.positions[symbol], row, level_price)
+                self.close_position(
+                    symbol,
+                    exit_price,
+                    time,
+                    "take_profit_level_intrabar",
+                    reduce_pct_original=reduce_pct_original,
+                )
+                level['filled'] = True
+            return symbol not in self.positions
+
+        if target_hit:
+            exit_price = self._target_fill_price(pos, row, float(pos['take_profit']))
+            self.close_position(symbol, exit_price, time, "take_profit_intrabar")
+            return True
+
+        return False
 
     def _resolve_effective_breakeven_trigger(self, pos: dict) -> float:
         base_trigger = float(pos.get('breakeven_trigger_pnl_ratio', self.config.breakeven_trigger_pnl_ratio) or 0.0)
@@ -2461,6 +2642,13 @@ def run_backtest(
         print(f"  take_profit_reduce_pct_levels: {config.take_profit_reduce_pct_levels}")
     print(f"  breakeven: enabled={int(config.breakeven_enabled)} trigger={config.breakeven_trigger_pnl_ratio:.2%} lock={config.breakeven_lock_ratio:.2%}")
     print(f"  entry_slippage: {config.entry_slippage:.2%}")
+    print(f"  entry_passive_offset_pct: {config.entry_passive_offset_pct:.2%}")
+    print(
+        "  passive_pricing:"
+        f" atr_fraction={config.entry_passive_pricing_atr_fraction:.2f}"
+        f" min={config.entry_passive_pricing_min_offset_pct:.2%}"
+        f" max={config.entry_passive_pricing_max_offset_pct:.2%}"
+    )
     print(f"  entry_tif: {config.entry_time_in_force}")
     
     # 初始化回测引擎

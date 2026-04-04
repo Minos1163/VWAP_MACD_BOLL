@@ -1853,7 +1853,7 @@ class TradingBot:
 
     def _should_allow_entries_this_cycle(self, now_ts: Optional[float] = None) -> bool:
         """
-        开仓窗口门控：
+        开仓窗口门控:
         - 对齐关闭: 每轮都允许开仓/加仓
         - 对齐开启: 仅在 flat_timeframe 收线延迟后的一个轮询窗口内放行一次
           例: 5m + delay=3s 时，仅在 xx:05:03 ~ xx:06:03（默认 interval=60s）放行一次
@@ -1986,7 +1986,7 @@ class TradingBot:
         if str(ff_cfg.get("protection_sla_pnl_grace_threshold", "")).strip().startswith("-"):
             pnl_grace_threshold = -abs(pnl_grace_threshold)
         api_health_check_before_force = bool(ff_cfg.get("protection_sla_api_health_check_before_force", False))
-        # 固定强平：保护单修复失败时始终按100%仓位执行减仓/平仓。
+        # 固定强平:保护单修复失败时始终按100%仓位执行减仓/平仓。
         reduce_ratio = 1.0
         return {
             "enabled": enabled,
@@ -6496,7 +6496,7 @@ class TradingBot:
                 val = float(value)
         except Exception:
             val = default_value
-        # 统一兼容：
+        # 统一兼容:
         # - 0.006 => 0.6%
         # - 0.6   => 0.6%
         # - 1     => 1%
@@ -6564,7 +6564,7 @@ class TradingBot:
         
         try:
             # 获取1H K线数据用于计算ATR和市场状态
-            # 注意：这里需要实际获取K线数据，简化处理使用模拟数据
+            # 注意:这里需要实际获取K线数据，简化处理使用模拟数据
             import numpy as np
             
             # 尝试获取真实的K线数据
@@ -7044,7 +7044,7 @@ class TradingBot:
         candidates.append(("reduce_only_market", p_reduce, True))
 
         if hedge_mode:
-            # 兜底：部分账户/模式下 positionSide 可能导致拒单，提供无 positionSide 变体
+            # 兜底:部分账户/模式下 positionSide 可能导致拒单，提供无 positionSide 变体
             if ratio >= 0.999:
                 p_close_no_ps = dict(base_params)
                 p_close_no_ps["closePosition"] = True
@@ -8075,7 +8075,7 @@ class TradingBot:
                 symbols = list(all_symbols)
                 if not symbols:
                     return None
-                print(f"📝 采样模式：刷新市场快照 {len(symbols)} symbols")
+                print(f"📝 采样模式:刷新市场快照 {len(symbols)} symbols")
             else:
                 symbols = [s for s in all_symbols if str(s).upper() in set(configured_position_symbols)]
                 symbols.extend([s for s in unconfigured_position_symbols if s not in symbols])
@@ -8095,14 +8095,14 @@ class TradingBot:
         risk_guard_enabled = bool(risk_guard.get("enabled", True))
         if risk_guard.get("blocked"):
             print(
-                "⏳ 账户级风控冷却中："
+                "⏳ 账户级风控冷却中:"
                 f"remaining={risk_guard.get('remaining_seconds')}s, "
                 f"reason={risk_guard.get('reason')}"
             )
         if ingestion_only:
-            print("⏱️ 采样模式：仅写入市场快照，不触发决策/执行")
+            print("⏱️ 采样模式:仅写入市场快照，不触发决策/执行")
         elif not allow_new_entries:
-            print("⏱️ 非开仓窗口：本轮仅评估平仓/持仓风控（跳过BUY/SELL/DCA）")
+            print("⏱️ 非开仓窗口:本轮仅评估平仓/持仓风控（跳过BUY/SELL/DCA）")
 
         return {
             "cycle_start_ts": cycle_start_ts,
@@ -8706,7 +8706,7 @@ class TradingBot:
                             "disabled": True,
                         }
                     except Exception as e:
-                        print(f"⚠️ {symbol} MA10+MACD 共振特征计算失败：{e}")
+                        print(f"⚠️ {symbol} MA10+MACD 共振特征计算失败:{e}")
             if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                 self._record_alpha_dilution_stage(
                     "after_entry_window",
@@ -8919,7 +8919,7 @@ class TradingBot:
                         )
                         continue
             
-                # DCA/马丁模式：已有持仓时仅按回撤阈值+阶梯倍数触发加仓
+                # DCA/马丁模式:已有持仓时仅按回撤阈值+阶梯倍数触发加仓
                 if bool(dca_cfg_local.get("enabled")) and decision.operation != FundFlowOperation.CLOSE:
                     dca_decision = self._build_dca_decision(
                         symbol=symbol,
@@ -9236,7 +9236,7 @@ class TradingBot:
                             print(f"⚠️ {symbol} 趋势 trailing 更新失败: {e}")
 
                     if protection_level == "conflict_hard":
-                        # 重度冲突：减仓、保本止损、禁止加仓
+                        # 重度冲突:减仓、保本止损、禁止加仓
                         k_open_hard = self._to_float(decision_md.get("last_open"), 0.0)
                         k_close_hard = self._to_float(decision_md.get("last_close"), 0.0)
                         price_change_hard = ((k_close_hard - k_open_hard) / k_open_hard) if k_open_hard > 0 else 0.0
@@ -9410,7 +9410,7 @@ class TradingBot:
                             except Exception as e:
                                 print(f"⚠️ {symbol} 保本止损失败: {e}")
                                 self.risk_manager.record_protection_action(symbol, current_side, "breakeven", "error", level=protection_level, detail={"error": str(e)})
-                        # 减仓：CLOSE 的 target_portion_of_balance 在 execution_router 中解释为"持仓比例"
+                        # 减仓:CLOSE 的 target_portion_of_balance 在 execution_router 中解释为"持仓比例"
                         if reduce_pct > 0 and reduce_confirmed:
                             # stats: reduce triggered
                             self.risk_manager.record_protection_action(symbol, current_side, "reduce", "triggered", level=protection_level, detail={"reduce_pct": reduce_pct})
@@ -9621,11 +9621,11 @@ class TradingBot:
                                     "mfe_threshold": light_min_mfe_ratio,
                                 },
                             )
-                        # 轻度冲突：冻结加仓/新开同向（保留持仓管理/止盈止损继续运行）
+                        # 轻度冲突:冻结加仓/新开同向（保留持仓管理/止盈止损继续运行）
                         continue
             
                     if protection_level == "confirm":
-                        # 确认增强：不放宽止损，只做"允许加仓/延后出场"的信号
+                        # 确认增强:不放宽止损，只做"允许加仓/延后出场"的信号
                         print(f"✅ {symbol} 方向确认增强: {protection.get('reason')}")
             
                 if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
@@ -9713,7 +9713,7 @@ class TradingBot:
             if decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL) and position is None:
                 if block_new_entries_due_to_protection_gap:
                     print(
-                        f"⛔ {symbol} 禁止新开仓：存在缺保护持仓 "
+                        f"⛔ {symbol} 禁止新开仓:存在缺保护持仓 "
                         f"symbols={','.join(protection_gap_symbols)}"
                     )
                     continue
@@ -9914,7 +9914,7 @@ class TradingBot:
 
         if block_new_entries_due_to_protection_gap and open_candidates:
             print(
-                "⛔ 本轮禁止新开仓：检测到持仓缺少保护单，已清空候选开仓队列 "
+                "⛔ 本轮禁止新开仓:检测到持仓缺少保护单，已清空候选开仓队列 "
                 f"symbols={','.join(protection_gap_symbols)}"
             )
             open_candidates = []
@@ -9986,7 +9986,7 @@ class TradingBot:
                 bypass_capacity_guard = bool(item.get("bypass_capacity_guard", False)) or is_close_candidate
                 if (not bypass_capacity_guard) and active_count >= item_max_active_symbols:
                     print(
-                        f"⏭️ {item.get('symbol')} 候选开仓被跳过："
+                        f"⏭️ {item.get('symbol')} 候选开仓被跳过:"
                         f"持仓交易对已满({active_count}/{item_max_active_symbols})，"
                         f"候选排名={rank}"
                     )

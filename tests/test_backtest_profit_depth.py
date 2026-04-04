@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from scripts.backtest_macd_v2 import BacktestConfig, BacktestEngine
+from scripts.backtest_macd_v2 import BacktestConfig, BacktestEngine, build_backtest_config
 from src.fund_flow.macd_strategy_v2 import MACDSignalV2, MACDStrategyV2Config
 
 
@@ -27,6 +27,44 @@ def _signal(
         ema_structure_status="normal",
         details={},
     )
+
+
+def _pending_order(
+    *,
+    side: str = "long",
+    limit_price: float = 100.0,
+    stop_price: float = 99.0,
+    take_profit: float = 104.0,
+    entry_time: pd.Timestamp | None = None,
+    time_in_force: str = "GTC",
+) -> dict:
+    return {
+        "side": side,
+        "limit_price": limit_price,
+        "margin": 400.0,
+        "leverage": 5,
+        "position_value": 400.0,
+        "stop_price": stop_price,
+        "take_profit": take_profit,
+        "take_profit_levels": [
+            {"price": 100.8, "reduce_pct": 0.25, "filled": False},
+            {"price": 101.2, "reduce_pct": 0.30, "filled": False},
+        ],
+        "signal_score": 0.91,
+        "signal_type_1h": "green_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 1.0,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "short_retest_reject",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "entry_time": entry_time or pd.Timestamp("2026-03-01 00:00:00"),
+        "time_in_force": time_in_force,
+        "entry_initial_time_in_force": time_in_force,
+        "bars_waited": 0,
+    }
 
 
 def test_execute_trade_applies_long_dual_support_risk_overrides() -> None:
@@ -127,6 +165,132 @@ def test_execute_trade_applies_take_profit_pct_override_without_tp_levels() -> N
     order = engine.pending_orders["SOLUSDT"]
     assert order["take_profit"] == pytest.approx(102.0, rel=1e-9)
     assert order["take_profit_levels"] == []
+
+
+def test_execute_trade_uses_passive_limit_below_reference_price_for_long() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+        entry_slippage=0.003,
+        entry_passive_offset_pct=0.002,
+        entry_passive_pricing_atr_fraction=0.0,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine._is_entry_cooldown_active = lambda _time: False
+    engine._strategy_engine_for_symbol = lambda _symbol: SimpleNamespace(
+        resolve_session_position_scale=lambda *_args, **_kwargs: 1.0,
+        resolve_symbol_risk_session_scale=lambda *_args, **_kwargs: 1.0,
+        is_watchlist_symbol=lambda _symbol: False,
+    )
+    engine.calculate_position_size = lambda **_kwargs: (1000.0, 2)
+
+    analysis = {
+        "signal": _signal(direction="long"),
+        "time": pd.Timestamp("2026-03-01 00:00:00"),
+        "price": 100.0,
+        "row_1h": pd.Series({"atr": 1.0}),
+        "cvd_veto_context": {},
+        "cvd_context": {},
+    }
+
+    engine.execute_trade("SOLUSDT", analysis, {})
+
+    order = engine.pending_orders["SOLUSDT"]
+    assert order["limit_price"] == pytest.approx(99.8, rel=1e-9)
+    assert order["limit_price"] < analysis["price"]
+
+
+def test_execute_trade_uses_passive_limit_above_reference_price_for_short() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+        entry_slippage=0.003,
+        entry_passive_offset_pct=0.002,
+        entry_passive_pricing_atr_fraction=0.0,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine._is_entry_cooldown_active = lambda _time: False
+    engine._strategy_engine_for_symbol = lambda _symbol: SimpleNamespace(
+        resolve_session_position_scale=lambda *_args, **_kwargs: 1.0,
+        resolve_symbol_risk_session_scale=lambda *_args, **_kwargs: 1.0,
+        is_watchlist_symbol=lambda _symbol: False,
+    )
+    engine.calculate_position_size = lambda **_kwargs: (1000.0, 2)
+
+    analysis = {
+        "signal": _signal(direction="short", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+        "time": pd.Timestamp("2026-03-01 00:00:00"),
+        "price": 100.0,
+        "row_1h": pd.Series({"atr": 1.0}),
+        "cvd_veto_context": {},
+        "cvd_context": {},
+    }
+
+    engine.execute_trade("SOLUSDT", analysis, {})
+
+    order = engine.pending_orders["SOLUSDT"]
+    assert order["limit_price"] == pytest.approx(100.2, rel=1e-9)
+    assert order["limit_price"] > analysis["price"]
+
+
+def test_execute_trade_passive_ioc_fills_on_intrabar_touch_not_open_take() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+        entry_passive_offset_pct=0.002,
+        entry_passive_pricing_atr_fraction=0.0,
+        entry_time_in_force="IOC",
+        open_gtc_fallback_enabled=True,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine._is_entry_cooldown_active = lambda _time: False
+    engine._strategy_engine_for_symbol = lambda _symbol: SimpleNamespace(
+        resolve_session_position_scale=lambda *_args, **_kwargs: 1.0,
+        resolve_symbol_risk_session_scale=lambda *_args, **_kwargs: 1.0,
+        is_watchlist_symbol=lambda _symbol: False,
+    )
+    engine.calculate_position_size = lambda **_kwargs: (1000.0, 2)
+
+    engine.execute_trade(
+        "SOLUSDT",
+        {
+            "signal": _signal(direction="long"),
+            "time": pd.Timestamp("2026-03-01 00:00:00"),
+            "price": 100.0,
+            "row_1h": pd.Series({"atr": 1.0}),
+            "cvd_veto_context": {},
+            "cvd_context": {},
+        },
+        {},
+    )
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long"),
+                "row_15m": pd.Series({"open": 99.9, "high": 100.3, "low": 99.79, "close": 100.1}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 100.1,
+            }
+        }
+    )
+
+    assert filled == {"SOLUSDT"}
+    assert "SOLUSDT" in engine.positions
+    assert engine.positions["SOLUSDT"]["entry_time_in_force"] == "IOC"
+    assert engine.positions["SOLUSDT"]["entry_price"] == pytest.approx(99.8, rel=1e-9)
 
 
 def test_check_stops_uses_position_specific_breakeven_override() -> None:
@@ -419,6 +583,470 @@ def test_same_bar_stop_first_mode_preserves_existing_behavior() -> None:
     assert "SOLUSDT" not in engine.positions
     assert len(engine.trades) == 1
     assert engine.trades[0]["reason"] == "stop_loss_intrabar"
+
+
+def test_process_pending_orders_applies_entry_bar_same_bar_tp1_before_stop_after_fill() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_bar_same_bar_enabled=True,
+        same_bar_tp_priority_mode="tp1_before_stop",
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order()
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 100.0, "high": 101.3, "low": 98.9, "close": 99.4}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 99.4,
+            }
+        }
+    )
+
+    assert "SOLUSDT" in filled
+    assert "SOLUSDT" not in engine.positions
+    assert len(engine.trades) == 2
+    assert engine.trades[0]["reason"] == "take_profit_level_intrabar"
+    assert engine.trades[1]["reason"] == "stop_loss_intrabar_after_tp1_same_bar"
+
+
+def test_process_pending_orders_without_entry_bar_same_bar_keeps_new_fill_open() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_bar_same_bar_enabled=False,
+        same_bar_tp_priority_mode="tp1_before_stop",
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order()
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 100.0, "high": 101.3, "low": 98.9, "close": 99.4}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 99.4,
+            }
+        }
+    )
+
+    assert "SOLUSDT" in filled
+    assert "SOLUSDT" in engine.positions
+    assert len(engine.trades) == 0
+
+
+def test_process_pending_orders_stop_first_preserves_conservative_fill_bar_branch() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_bar_same_bar_enabled=True,
+        same_bar_tp_priority_mode="stop_first",
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order()
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 100.0, "high": 101.3, "low": 98.9, "close": 99.4}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 99.4,
+            }
+        }
+    )
+
+    assert "SOLUSDT" in filled
+    assert "SOLUSDT" not in engine.positions
+    assert len(engine.trades) == 1
+    assert engine.trades[0]["reason"] == "stop_loss_intrabar"
+
+
+def test_build_backtest_config_prefers_nested_pending_order_settings() -> None:
+    runtime_cfg = {
+        "trading": {"symbols": ["SOLUSDT"]},
+        "fund_flow": {
+            "backtest": {
+                "entry_time_in_force": "GTC",
+                "gtc_expire_bars": 4,
+                "gtc_cancel_on_signal_reversal": False,
+            }
+        },
+    }
+
+    config = build_backtest_config(
+        runtime_cfg=runtime_cfg,
+        config_path="config/trading_config_fund_flow.json",
+    )
+
+    assert config.entry_time_in_force == "GTC"
+    assert config.gtc_expire_bars == 4
+    assert config.gtc_cancel_on_signal_reversal is False
+
+
+def test_process_pending_orders_gtc_preserves_runtime_like_open_order_on_signal_reversal() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="GTC",
+        gtc_expire_bars=3,
+        gtc_cancel_on_signal_reversal=False,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(side="long")
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="short", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 101.5, "high": 101.8, "low": 101.1, "close": 101.4}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 101.4,
+            }
+        }
+    )
+
+    assert filled == set()
+    assert "SOLUSDT" in engine.pending_orders
+    assert engine.pending_orders["SOLUSDT"]["bars_waited"] == 1
+
+
+def test_process_pending_orders_gtc_can_keep_legacy_reversal_cancel_when_enabled() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="GTC",
+        gtc_expire_bars=3,
+        gtc_cancel_on_signal_reversal=True,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(side="long")
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="short", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 101.5, "high": 101.8, "low": 101.1, "close": 101.4}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 101.4,
+            }
+        }
+    )
+
+    assert filled == set()
+    assert "SOLUSDT" not in engine.pending_orders
+
+
+def test_build_backtest_config_reads_nested_open_gtc_fallback_enabled() -> None:
+    runtime_cfg = {
+        "trading": {"symbols": ["SOLUSDT"]},
+        "fund_flow": {
+            "backtest": {
+                "open_gtc_fallback_enabled": False,
+            }
+        },
+    }
+
+    config = build_backtest_config(
+        runtime_cfg=runtime_cfg,
+        config_path="config/trading_config_fund_flow.json",
+    )
+
+    assert config.open_gtc_fallback_enabled is False
+
+
+def test_build_backtest_config_reads_direct_ioc_fill_model_settings() -> None:
+    runtime_cfg = {
+        "trading": {"symbols": ["SOLUSDT"]},
+        "fund_flow": {
+            "backtest": {
+                "direct_ioc_fill_mode": "close_through_or_penetration",
+                "direct_ioc_min_penetration_bps": 5.0,
+            }
+        },
+    }
+
+    config = build_backtest_config(
+        runtime_cfg=runtime_cfg,
+        config_path="config/trading_config_fund_flow.json",
+    )
+
+    assert config.direct_ioc_fill_mode == "close_through_or_penetration"
+    assert config.direct_ioc_min_penetration_bps == pytest.approx(5.0, rel=1e-9)
+
+
+def test_build_backtest_config_prefers_nested_entry_passive_offset_pct() -> None:
+    runtime_cfg = {
+        "trading": {"symbols": ["SOLUSDT"]},
+        "fund_flow": {
+            "entry_slippage": 0.003,
+            "backtest": {
+                "entry_passive_offset_pct": 0.0012,
+            },
+        },
+    }
+
+    config = build_backtest_config(
+        runtime_cfg=runtime_cfg,
+        config_path="config/trading_config_fund_flow.json",
+    )
+
+    assert config.entry_passive_offset_pct == pytest.approx(0.0012, rel=1e-9)
+
+
+def test_build_backtest_config_reads_nested_passive_pricing_model() -> None:
+    runtime_cfg = {
+        "trading": {"symbols": ["SOLUSDT"]},
+        "fund_flow": {
+            "backtest": {
+                "passive_pricing": {
+                    "atr_fraction": 0.25,
+                    "min_offset_pct": 0.0009,
+                    "max_offset_pct": 0.0045,
+                    "signal_type_multipliers": {"flip_bullish": 0.85},
+                    "vwap_state_multipliers": {"long_reclaim_confirmed": 1.2},
+                }
+            },
+        },
+    }
+
+    config = build_backtest_config(
+        runtime_cfg=runtime_cfg,
+        config_path="config/trading_config_fund_flow.json",
+    )
+
+    assert config.entry_passive_pricing_atr_fraction == pytest.approx(0.25, rel=1e-9)
+    assert config.entry_passive_pricing_min_offset_pct == pytest.approx(0.0009, rel=1e-9)
+    assert config.entry_passive_pricing_max_offset_pct == pytest.approx(0.0045, rel=1e-9)
+    assert config.entry_passive_pricing_signal_type_multipliers["flip_bullish"] == pytest.approx(0.85, rel=1e-9)
+    assert config.entry_passive_pricing_vwap_state_multipliers["long_reclaim_confirmed"] == pytest.approx(1.2, rel=1e-9)
+
+
+def test_resolve_entry_limit_price_uses_atr_floor_and_state_multiplier() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        entry_passive_offset_pct=0.0015,
+        entry_passive_pricing_atr_fraction=0.25,
+        entry_passive_pricing_min_offset_pct=0.0010,
+        entry_passive_pricing_max_offset_pct=0.0060,
+        entry_passive_pricing_signal_type_multipliers={"flip_bullish": 0.8},
+        entry_passive_pricing_vwap_state_multipliers={"long_reclaim_confirmed": 1.5},
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    analysis = {
+        "price": 100.0,
+        "row_1h": pd.Series({"atr": 1.2}),
+        "signal": _signal(direction="long", signal_type_1h="flip_bullish", vwap_state="long_reclaim_confirmed"),
+    }
+
+    limit_price = engine._resolve_entry_limit_price_from_analysis(analysis)
+
+    # base 0.15% * 0.8 * 1.5 = 0.18%; atr floor 1.2% * 0.25 = 0.30%; final uses atr floor
+    assert limit_price == pytest.approx(99.7, rel=1e-9)
+
+
+def test_resolve_entry_limit_price_clamps_to_max_offset_for_short() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        entry_passive_offset_pct=0.0015,
+        entry_passive_pricing_atr_fraction=0.5,
+        entry_passive_pricing_min_offset_pct=0.0010,
+        entry_passive_pricing_max_offset_pct=0.0040,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    analysis = {
+        "price": 100.0,
+        "row_1h": pd.Series({"atr": 3.0}),
+        "signal": _signal(direction="short", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+    }
+
+    limit_price = engine._resolve_entry_limit_price_from_analysis(analysis)
+
+    assert limit_price == pytest.approx(100.4, rel=1e-9)
+
+
+def test_process_pending_orders_ioc_would_take_immediately_degrades_to_gtc_without_fill() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="IOC",
+        open_gtc_fallback_enabled=True,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(time_in_force="IOC")
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 99.8, "high": 100.4, "low": 99.6, "close": 100.1}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 100.1,
+            }
+        }
+    )
+
+    assert filled == set()
+    assert "SOLUSDT" in engine.pending_orders
+    assert engine.pending_orders["SOLUSDT"]["time_in_force"] == "GTC"
+    assert engine.pending_orders["SOLUSDT"]["bars_waited"] == 1
+    assert engine.pending_orders["SOLUSDT"]["entry_degradation_path"][-1]["step"] == "ioc_to_gtc_fallback"
+    assert "SOLUSDT" not in engine.positions
+    assert len(engine.trades) == 0
+
+
+def test_process_pending_orders_ioc_degraded_gtc_can_fill_on_later_bar() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="IOC",
+        open_gtc_fallback_enabled=True,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(time_in_force="IOC")
+
+    first = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 99.8, "high": 100.4, "low": 99.6, "close": 100.1}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 100.1,
+            }
+        }
+    )
+    second = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 99.7, "high": 100.2, "low": 99.5, "close": 99.9}),
+                "time": pd.Timestamp("2026-03-01 00:30:00"),
+                "price": 99.9,
+            }
+        }
+    )
+
+    assert first == set()
+    assert second == {"SOLUSDT"}
+    assert "SOLUSDT" in engine.positions
+    assert engine.positions["SOLUSDT"]["entry_price"] == pytest.approx(99.7, rel=1e-9)
+    assert engine.positions["SOLUSDT"]["entry_initial_time_in_force"] == "IOC"
+    assert engine.positions["SOLUSDT"]["entry_time_in_force"] == "GTC"
+    assert engine.positions["SOLUSDT"]["entry_degradation_path"][-1]["step"] == "ioc_to_gtc_fallback"
+
+
+def test_process_pending_orders_ioc_would_take_immediately_can_cancel_without_gtc_fallback() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="IOC",
+        open_gtc_fallback_enabled=False,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(time_in_force="IOC")
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 99.8, "high": 100.4, "low": 99.6, "close": 100.1}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 100.1,
+            }
+        }
+    )
+
+    assert filled == set()
+    assert "SOLUSDT" not in engine.pending_orders
+
+
+def test_process_pending_orders_ioc_strict_fill_rejects_wick_only_touch() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="IOC",
+        direct_ioc_fill_mode="close_through_or_penetration",
+        direct_ioc_min_penetration_bps=5.0,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(time_in_force="IOC")
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 100.3, "high": 100.4, "low": 99.99, "close": 100.2}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 100.2,
+            }
+        }
+    )
+
+    assert filled == set()
+    assert "SOLUSDT" not in engine.pending_orders
+    assert "SOLUSDT" not in engine.positions
+
+
+def test_process_pending_orders_ioc_strict_fill_accepts_close_through() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=False,
+        entry_time_in_force="IOC",
+        direct_ioc_fill_mode="close_through_or_penetration",
+        direct_ioc_min_penetration_bps=5.0,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+    engine.pending_orders["SOLUSDT"] = _pending_order(time_in_force="IOC")
+
+    filled = engine.process_pending_orders(
+        {
+            "SOLUSDT": {
+                "signal": _signal(direction="long", signal_type_1h="green_bar_growing", vwap_state="short_retest_reject"),
+                "row_15m": pd.Series({"open": 100.3, "high": 100.4, "low": 99.92, "close": 99.95}),
+                "time": pd.Timestamp("2026-03-01 00:15:00"),
+                "price": 99.95,
+            }
+        }
+    )
+
+    assert filled == {"SOLUSDT"}
+    assert engine.positions["SOLUSDT"]["entry_price"] == pytest.approx(100.0, rel=1e-9)
+    assert engine.positions["SOLUSDT"]["entry_fill_wick_only_touch"] is False
+    assert engine.positions["SOLUSDT"]["entry_fill_close_through"] is True
 
 
 def test_partial_aware_breakeven_delays_trigger_before_any_partial() -> None:

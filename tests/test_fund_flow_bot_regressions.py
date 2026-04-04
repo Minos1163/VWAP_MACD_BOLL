@@ -20,6 +20,7 @@ def test_live_config_stage2_ablation_disables_outer_entry_filters_and_ai_review(
     assert ff["pretrade_risk_gate"]["enabled"] is True
     assert ff["pretrade_risk_gate"]["use_hard_rules_only"] is True
     assert "ai_review" not in ff or ff["ai_review"]["enabled"] is False
+    assert ff["pure_strategy_runtime"]["enabled"] is True
 
 
 def test_fund_flow_main_config_applies_optimization_guardrails():
@@ -34,11 +35,15 @@ def test_fund_flow_main_config_applies_optimization_guardrails():
 
     ff = cfg["fund_flow"]
     entry_filters = ff["macd_mtf_strategy_v2"]["entry_filters"]
+    pure_runtime = ff["pure_strategy_runtime"]
 
     assert ff["default_target_portion"] == 0.3
     assert ff["max_symbol_position_portion"] == 0.3
     assert ff["max_active_symbols"] == 4
     assert ff["max_leverage"] == 5
+    assert pure_runtime["bypass_signal_pool"] is True
+    assert pure_runtime["bypass_pretrade_risk_gate"] is True
+    assert pure_runtime["bypass_entry_hard_gate"] is True
     assert ff["pretrade_risk_gate"]["equity_usage_block"] == 0.85
     pocket_overrides = entry_filters["pocket_entry_overrides"]
     assert "red_bar_growing|long_dual_support" in pocket_overrides
@@ -263,3 +268,109 @@ def test_global_signal_pool_disable_skips_outer_pool_evaluation():
         pass
     else:
         raise AssertionError("expected to reach the next stage after signal_pool bypass")
+
+
+def test_pure_strategy_runtime_disables_ai_gate(monkeypatch):
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "pure_strategy_runtime": {
+                "enabled": True,
+                "bypass_ai_review": True,
+            },
+            "deepseek_weight_router": {"enabled": True, "ai_enabled": True},
+            "deepseek_ai": {"enabled": True, "api_key": "x"},
+        }
+    }
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "x")
+
+    assert bot._is_ai_gate_enabled() is False
+
+
+def test_pure_strategy_runtime_bypasses_pretrade_risk_gate():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "pure_strategy_runtime": {
+                "enabled": True,
+                "bypass_pretrade_risk_gate": True,
+            },
+            "pretrade_risk_gate": {"enabled": True},
+        }
+    }
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.1,
+        leverage=1.0,
+        reason="test",
+        metadata={},
+    )
+
+    out_decision, gate_meta = bot._apply_pretrade_risk_gate(
+        symbol="BTCUSDT",
+        decision=decision,
+        position=None,
+        flow_context={},
+        current_price=100.0,
+        account_summary={"equity": 1000.0},
+    )
+
+    assert out_decision.operation == FundFlowOperation.BUY
+    assert gate_meta["action"] == "BYPASS_PURE_RUNTIME"
+    assert out_decision.metadata["pretrade_risk_gate"]["action"] == "BYPASS_PURE_RUNTIME"
+
+
+def test_pure_strategy_runtime_bypasses_dynamic_max_active_symbols():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "pure_strategy_runtime": {
+                "enabled": True,
+                "bypass_dynamic_max_active_symbols": True,
+            }
+        }
+    }
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.1,
+        leverage=1.0,
+        reason="test",
+        metadata={"signal_score": 0.99, "vwap_score": 0.5, "engine": "TREND"},
+    )
+
+    cap, metadata = bot._resolve_dynamic_max_active_symbols(
+        decision=decision,
+        engine_override={"max_active_symbols": 4},
+        base_max_active_symbols=4,
+    )
+
+    assert cap == 4
+    assert metadata["reason"] == "pure_strategy_runtime_bypass"
+
+
+def test_pure_strategy_runtime_bypasses_ma10_macd_filter():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "pure_strategy_runtime": {
+                "enabled": True,
+                "bypass_ma10_macd_filter": True,
+            },
+            "ma10_macd_confluence": {"enabled": True, "entry_hard_filter": True},
+        }
+    }
+    decision = FundFlowDecision(
+        operation=FundFlowOperation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.1,
+        leverage=1.0,
+        reason="test",
+        metadata={},
+    )
+
+    out = bot._apply_ma10_macd_entry_filter("BTCUSDT", decision)
+
+    assert out.operation == FundFlowOperation.BUY
+    assert out.metadata["ma10_macd_pure_strategy_runtime_bypassed"] is True

@@ -52,6 +52,7 @@ def _make_bot():
         }
     }
     bot.logs_dir = "."
+    bot.log_root_dir = "."
     bot._position_first_seen_ts = {}
     bot._position_last_direction_eval_ts = {}
     bot._position_extrema_by_pos = {}
@@ -127,6 +128,9 @@ def test_bot_like_replay_clears_position_tracking_after_full_close(monkeypatch):
 
 def test_bot_like_replay_preserves_missing_microstructure_as_unknown():
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.replay_microstructure_enabled = True
+    engine.replay_microstructure_mode = "historical_proxy"
+    engine.replay_microstructure_stats = {}
 
     timestamps = pd.date_range("2026-03-30 00:00:00", periods=6, freq="15min")
     base_df = pd.DataFrame(
@@ -144,10 +148,31 @@ def test_bot_like_replay_preserves_missing_microstructure_as_unknown():
     data = {"15m": base_df.copy(), "1h": base_df.copy(), "4h": base_df.copy()}
     engine._find_tf_index = lambda data_map, timeframe, current_time: 5
 
-    flow_context = engine._build_flow_context(data, 5)
+    flow_context = engine._build_flow_context("BTCUSDT", data, 5)
 
     assert flow_context is not None
     assert flow_context["depth_ratio"] is None
     assert flow_context["imbalance"] is None
     assert flow_context["spread_bps"] is None
     assert flow_context["timeframes"]["15m"]["cvd_momentum"] is None
+    assert flow_context["replay_microstructure"]["mode"] == "historical_proxy"
+    assert flow_context["replay_microstructure"]["spread_gate_mode"] == "skip_if_missing"
+    assert flow_context["replay_microstructure"]["missing_fields"] == [
+        "depth_ratio",
+        "imbalance",
+        "spread_bps",
+    ]
+
+
+def test_bot_like_replay_prepares_runtime_config_without_mutating_live_config():
+    runtime_config = {
+        "fund_flow": {
+            "entry_hard_gates_enabled": True,
+        }
+    }
+
+    prepared = BotLikeReplayEngine._prepare_replay_runtime_config(runtime_config)
+
+    assert runtime_config["fund_flow"].get("entry_hard_gate_skip_spread_if_missing") is None
+    assert prepared["fund_flow"]["replay_microstructure"]["enabled"] is True
+    assert prepared["fund_flow"]["replay_microstructure"]["mode"] == "historical_proxy"

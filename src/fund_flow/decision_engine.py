@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from collections import deque
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from src.fund_flow.macd_strategy_v2 import (
     MACDStrategyV2Config,
     MACDSignalV2,
     VetoType,
+    build_macd_v2_config_from_runtime,
     check_pocket_entry_override,
 )
 from src.fund_flow.filters.symbol_signal_override import SymbolSignalOverrideRegistry
@@ -57,6 +59,26 @@ class FundFlowDecisionEngine:
         ff = self.config.get("fund_flow", {}) or {}
         risk = self.config.get("risk", {}) or {}
         leverage_cfg = ConfigLoader.get_leverage_settings(self.config, scope="fund_flow")
+        pure_runtime_cfg = (
+            ff.get("pure_strategy_runtime")
+            if isinstance(ff.get("pure_strategy_runtime"), dict)
+            else {}
+        )
+        self.pure_strategy_runtime_enabled = bool(pure_runtime_cfg.get("enabled", False))
+        self.pure_strategy_runtime_bypasses = {
+            "use_backtest_macd_v2_config": bool(
+                pure_runtime_cfg.get("use_backtest_macd_v2_config", self.pure_strategy_runtime_enabled)
+            ),
+            "entry_hard_gate": bool(
+                pure_runtime_cfg.get("bypass_entry_hard_gate", self.pure_strategy_runtime_enabled)
+            ),
+            "runtime_pocket_gate": bool(
+                pure_runtime_cfg.get("bypass_runtime_pocket_gate", self.pure_strategy_runtime_enabled)
+            ),
+            "signal_pool_metadata": bool(
+                pure_runtime_cfg.get("bypass_signal_pool_metadata", self.pure_strategy_runtime_enabled)
+            ),
+        }
 
         self.default_portion = float(ff.get("default_target_portion", risk.get("max_position_pct", 0.2)))
         self.max_active_symbols = max(1, int(ff.get("max_active_symbols", 1) or 1))
@@ -100,6 +122,12 @@ class FundFlowDecisionEngine:
         )
         self.entry_hard_gate_skip_spread_if_missing = bool(
             ff.get("entry_hard_gate_skip_spread_if_missing", False)
+        )
+        raw_spread_skip_rules = ff.get("entry_hard_gate_skip_spread_if_missing_rules", [])
+        self.entry_hard_gate_skip_spread_if_missing_rules = (
+            [rule for rule in raw_spread_skip_rules if isinstance(rule, dict)]
+            if isinstance(raw_spread_skip_rules, list)
+            else []
         )
         self.entry_hard_gate_flow_min_pass = max(
             1, int(self._to_float(ff.get("entry_hard_gate_flow_min_pass"), 2))
@@ -376,6 +404,21 @@ class FundFlowDecisionEngine:
         self._kdj_divergence_bonus = max(0.0, min(0.5, self._to_float(hybrid_cfg.get("kdj_divergence_bonus"), 0.10)))
         guide_neutral_zone = self._to_float(guide_cfg.get("neutral_zone"), 0.01)
         self._direction_guide_neutral_zone = max(0.0, min(0.20, guide_neutral_zone))
+        self._direction_price_action_override_enabled = bool(
+            guide_cfg.get("price_action_override_enabled", True)
+        )
+        self._direction_price_action_override_bars = max(
+            3,
+            int(self._to_float(guide_cfg.get("price_action_override_bars", 4), 4)),
+        )
+        self._direction_price_action_override_min_move = max(
+            0.0,
+            min(0.05, self._normalize_pct_ratio(guide_cfg.get("price_action_override_min_move", 0.004), 0.004)),
+        )
+        self._direction_price_action_override_max_guide_score = max(
+            0.0,
+            min(0.30, self._to_float(guide_cfg.get("price_action_override_max_guide_score", 0.12), 0.12)),
+        )
         self._trend_both_trial_enabled = bool(trend_capture_cfg.get("trend_both_trial_enabled", True))
         self._trend_both_trial_min_score = max(
             0.0,
@@ -820,6 +863,20 @@ class FundFlowDecisionEngine:
                 short_filter_max_oi_delta_ratio=self._to_float(v2_cfg.get("short_quality_filter", {}).get("max_oi_delta_ratio"), 0.0),
                 short_filter_min_vwap_deviation=self._to_float(v2_cfg.get("short_quality_filter", {}).get("min_vwap_deviation"), 0.005),
             )
+            if (
+                self.pure_strategy_runtime_enabled
+                and self.pure_strategy_runtime_bypasses.get("use_backtest_macd_v2_config", False)
+            ):
+                backtest_cfg = (
+                    self.config.get("fund_flow", {}).get("backtest", {})
+                    if isinstance(self.config.get("fund_flow", {}).get("backtest"), dict)
+                    else {}
+                )
+                disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
+                self.macd_v2_config = build_macd_v2_config_from_runtime(
+                    self.config,
+                    disable_cvd_decision_logic=disable_cvd_decision_logic,
+                )
             self.macd_v2_engine = MACDStrategyV2Engine(self.macd_v2_config)
             regime_state_cfg = v2_cfg.get("regime_state_machine", {}) if isinstance(v2_cfg.get("regime_state_machine"), dict) else {}
             self.macd_4h_regime_state_cfg = {
@@ -1051,6 +1108,18 @@ class FundFlowDecisionEngine:
         except Exception:
             return None
 
+    def _annotate_pure_strategy_runtime_decision(self, decision: FundFlowDecision) -> FundFlowDecision:
+        if not self.pure_strategy_runtime_enabled or not isinstance(decision, FundFlowDecision):
+            return decision
+        metadata = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+        metadata["pure_strategy_runtime_enabled"] = True
+        metadata["pure_strategy_runtime_bypasses"] = dict(self.pure_strategy_runtime_bypasses)
+        if self.pure_strategy_runtime_bypasses.get("signal_pool_metadata", False):
+            metadata["selected_pool_id"] = None
+            metadata["signal_pool_id"] = None
+        decision.metadata = metadata
+        return decision
+
     @staticmethod
     def _normalize_pct_ratio(value: Any, default_ratio: float) -> float:
         if value is None:
@@ -1088,6 +1157,147 @@ class FundFlowDecisionEngine:
         if abs(s) < z:
             return "BOTH"
         return "LONG_ONLY" if s > 0 else "SHORT_ONLY"
+
+    @staticmethod
+    def _extract_recent_float_series(values: Any, *, min_len: int) -> list[float]:
+        if not isinstance(values, (list, tuple)):
+            return []
+        cleaned: list[float] = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number):
+                cleaned.append(number)
+        if len(cleaned) < min_len:
+            return []
+        return cleaned
+
+    def _detect_direction_price_action_override(
+        self,
+        tf_ctx: Dict[str, Any],
+        guide_direction: str,
+        guide_score: float,
+    ) -> Dict[str, Any]:
+        result = {
+            "applied": False,
+            "direction": guide_direction,
+            "score": guide_score,
+            "reason": "",
+        }
+        if not self._direction_price_action_override_enabled:
+            return result
+        if guide_direction not in {"LONG_ONLY", "SHORT_ONLY"}:
+            return result
+        if abs(float(guide_score)) > self._direction_price_action_override_max_guide_score:
+            return result
+
+        min_bars = self._direction_price_action_override_bars
+        closes = self._extract_recent_float_series(
+            tf_ctx.get("close_series", tf_ctx.get("close_array")),
+            min_len=3,
+        )
+        if not closes:
+            return result
+        recent_closes = closes[-min_bars:] if len(closes) >= min_bars else closes[-3:]
+        start_close = recent_closes[0]
+        if start_close <= 0:
+            return result
+
+        descending_closes = len(recent_closes) >= min_bars and all(
+            recent_closes[i] > recent_closes[i + 1] for i in range(len(recent_closes) - 1)
+        )
+        ascending_closes = len(recent_closes) >= min_bars and all(
+            recent_closes[i] < recent_closes[i + 1] for i in range(len(recent_closes) - 1)
+        )
+        cumulative_move = (recent_closes[-1] / start_close) - 1.0
+        recent_peak = max(recent_closes)
+        recent_trough = min(recent_closes)
+        peak_drawdown = (recent_closes[-1] / recent_peak) - 1.0 if recent_peak > 0 else 0.0
+        trough_rebound = (recent_closes[-1] / recent_trough) - 1.0 if recent_trough > 0 else 0.0
+        early_reversal_min_move = self._direction_price_action_override_min_move * 0.5
+
+        peak_reversal_selloff = False
+        trough_reversal_rally = False
+        if len(recent_closes) >= 3:
+            tail3 = recent_closes[-3:]
+            peak_reversal_selloff = (
+                tail3[1] > tail3[0]
+                and tail3[1] > tail3[2]
+                and tail3[2] <= tail3[0]
+                and peak_drawdown <= -early_reversal_min_move
+            )
+            trough_reversal_rally = (
+                tail3[1] < tail3[0]
+                and tail3[1] < tail3[2]
+                and tail3[2] >= tail3[0]
+                and trough_rebound >= early_reversal_min_move
+            )
+
+        macd_series = self._extract_recent_float_series(
+            tf_ctx.get("macd_hist_series", tf_ctx.get("macd_hist_array")),
+            min_len=3,
+        )
+        recent_macd = macd_series[-3:] if macd_series else []
+        macd_descending = len(recent_macd) == 3 and recent_macd[0] > recent_macd[1] > recent_macd[2]
+        macd_ascending = len(recent_macd) == 3 and recent_macd[0] < recent_macd[1] < recent_macd[2]
+
+        last_open = self._to_float(tf_ctx.get("last_open"), 0.0)
+        last_close = self._to_float(tf_ctx.get("last_close"), 0.0)
+        current_red = last_open > 0 and last_close > 0 and last_close < last_open
+        current_green = last_open > 0 and last_close > 0 and last_close > last_open
+
+        bearish_override = (
+            guide_direction == "LONG_ONLY"
+            and (
+                (
+                    descending_closes
+                    and cumulative_move <= -self._direction_price_action_override_min_move
+                )
+                or peak_reversal_selloff
+            )
+            and (current_red or macd_descending)
+        )
+        bullish_override = (
+            guide_direction == "SHORT_ONLY"
+            and (
+                (
+                    ascending_closes
+                    and cumulative_move >= self._direction_price_action_override_min_move
+                )
+                or trough_reversal_rally
+            )
+            and (current_green or macd_ascending)
+        )
+
+        if bearish_override:
+            override_score = -max(abs(float(guide_score)), self._direction_neutral_zone + 1e-6)
+            override_label = "peak_reversal_selloff" if peak_reversal_selloff and not descending_closes else "monotonic_selloff"
+            return {
+                "applied": True,
+                "direction": "SHORT_ONLY",
+                "score": override_score,
+                "reason": (
+                    f"{override_label} bars={min_bars} move={cumulative_move:.4f} "
+                    f"peak_dd={peak_drawdown:.4f} macd_desc={1 if macd_descending else 0} "
+                    f"red={1 if current_red else 0}"
+                ),
+            }
+        if bullish_override:
+            override_score = max(abs(float(guide_score)), self._direction_neutral_zone + 1e-6)
+            override_label = "trough_reversal_rally" if trough_reversal_rally and not ascending_closes else "monotonic_rally"
+            return {
+                "applied": True,
+                "direction": "LONG_ONLY",
+                "score": override_score,
+                "reason": (
+                    f"{override_label} bars={min_bars} move={cumulative_move:.4f} "
+                    f"trough_rb={trough_rebound:.4f} macd_asc={1 if macd_ascending else 0} "
+                    f"green={1 if current_green else 0}"
+                ),
+            }
+        return result
 
     @staticmethod
     def _normalize_symbol_side_override_mode(value: Any) -> str:
@@ -1744,7 +1954,12 @@ class FundFlowDecisionEngine:
         regime_info: Dict[str, Any],
         tf_15m: Dict[str, Any],
         tf_1h: Dict[str, Any],
+        signal_type_1h: str = "",
+        vwap_state: str = "",
+        vwap_score: float = 0.0,
     ) -> Tuple[bool, str, Dict[str, Any]]:
+        if self.pure_strategy_runtime_enabled and self.pure_strategy_runtime_bypasses.get("entry_hard_gate", False):
+            return True, "", {"pure_strategy_runtime_entry_hard_gate_bypassed": True}
         if not self.entry_hard_gates_enabled:
             return True, "", {}
 
@@ -1760,6 +1975,15 @@ class FundFlowDecisionEngine:
         spread_ok = True
         if spread_bps is None:
             spread_ok = bool(self.entry_hard_gate_skip_spread_if_missing)
+            if (not spread_ok) and self.entry_hard_gate_skip_spread_if_missing_rules:
+                spread_ok, matched_rule = self._match_missing_spread_skip_rule(
+                    direction=direction,
+                    signal_type_1h=signal_type_1h,
+                    vwap_state=vwap_state,
+                    vwap_score=vwap_score,
+                )
+                if matched_rule is not None:
+                    gate_metadata["entry_hard_gate_spread_missing_bypass_rule"] = matched_rule
         else:
             spread_ok = spread_bps <= self.entry_hard_gate_spread_bps_max
         regime = str(regime_info.get("regime", "") or "").upper()
@@ -1843,6 +2067,37 @@ class FundFlowDecisionEngine:
             )
 
         return True, "", gate_metadata
+
+    def _match_missing_spread_skip_rule(
+        self,
+        *,
+        direction: str,
+        signal_type_1h: str,
+        vwap_state: str,
+        vwap_score: float,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        direction_norm = str(direction or "").strip().lower()
+        signal_type_norm = str(signal_type_1h or "").strip().lower()
+        vwap_state_norm = str(vwap_state or "").strip().lower()
+        vwap_score_value = max(0.0, self._to_float(vwap_score, 0.0))
+
+        for raw_rule in self.entry_hard_gate_skip_spread_if_missing_rules:
+            rule = dict(raw_rule)
+            rule_direction = str(rule.get("direction", "") or "").strip().lower()
+            rule_signal_type = str(rule.get("signal_type_1h", "") or "").strip().lower()
+            rule_vwap_state = str(rule.get("vwap_state", "") or "").strip().lower()
+            min_vwap_score = max(0.0, self._to_float(rule.get("min_vwap_score"), 0.0))
+
+            if rule_direction and rule_direction != direction_norm:
+                continue
+            if rule_signal_type and rule_signal_type != signal_type_norm:
+                continue
+            if rule_vwap_state and rule_vwap_state != vwap_state_norm:
+                continue
+            if vwap_score_value < min_vwap_score:
+                continue
+            return True, rule
+        return False, None
 
     def check_winner_pyramiding(
         self,
@@ -3339,6 +3594,16 @@ class FundFlowDecisionEngine:
                 guide_score = alt_score
                 guide_score_source = "enhanced_fallback"
 
+        price_action_override = self._detect_direction_price_action_override(
+            tf_ctx,
+            guide_direction,
+            guide_score,
+        )
+        if bool(price_action_override.get("applied", False)):
+            guide_direction = str(price_action_override.get("direction", guide_direction)).upper()
+            guide_score = self._to_float(price_action_override.get("score"), guide_score)
+            guide_score_source = "price_action_override"
+
         final_dir = guide_direction if self._direction_guide_enabled else ev_dir
         final_score = guide_score if self._direction_guide_enabled else ev_score
         if abs(final_score) < self._direction_neutral_zone:
@@ -3372,6 +3637,7 @@ class FundFlowDecisionEngine:
             "guide_model": guide_model,
             "guide_model_label": guide_model_map.get(guide_model, guide_model),
             "guide_score_source": guide_score_source,
+            "price_action_override": price_action_override,
             "legacy_direction": self._direction_from_score(self._to_float(lw_combo.get("macd_bb_score"), lw_score), effective_neutral_zone),
             "legacy_score": self._to_float(lw_combo.get("macd_bb_score"), lw_score),
             "combo_compare": {**lw_combo, **ev_combo},
@@ -4181,6 +4447,9 @@ class FundFlowDecisionEngine:
                 regime_info=regime_info,
                 tf_15m=tf_15m,
                 tf_1h=tf_1h,
+                signal_type_1h=signal.signal_type_1h,
+                vwap_state=signal.vwap_state,
+                vwap_score=signal.vwap_score,
             )
             metadata.update(gate_metadata)
             if not gates_passed:
@@ -4217,29 +4486,35 @@ class FundFlowDecisionEngine:
             )
             flow_check_results = gate_metadata.get("entry_hard_gate_flow_checks", {})
             micro_check_results = gate_metadata.get("entry_hard_gate_micro_checks", {})
-            _pocket_passed, _pocket_reason = check_pocket_entry_override(
-                signal_type=getattr(signal, "signal_type_1h", getattr(signal, "signal_type", "")),
-                vwap_state=getattr(signal, "vwap_state", ""),
-                is_trial_entry=bool(getattr(signal, "is_trial_entry", False)),
-                signal_score=float(getattr(signal, "signal_score", 0.0)),
-                vwap_score=float(getattr(signal, "vwap_score", 0.0)),
-                entry_score=float(getattr(signal, "entry_score_15m", 0.0)),
-                bar_1h_direction=bar_1h_direction,
-                flow_cvd_ok=bool(flow_check_results.get("cvd_ok", False)),
-                micro_cvd_momentum_ok=bool(micro_check_results.get("cvd_momentum_ok", False)),
-                pocket_entry_overrides=_pocket_overrides,
-            )
-            metadata["pocket_entry_gate"] = {
-                "passed": bool(_pocket_passed),
-                "reason": _pocket_reason,
-            }
-            if not _pocket_passed:
-                return FundFlowDecision(
-                    operation=Operation.HOLD,
-                    symbol=symbol,
-                    reason=_pocket_reason,
-                    metadata=metadata,
+            if self.pure_strategy_runtime_enabled and self.pure_strategy_runtime_bypasses.get("runtime_pocket_gate", False):
+                metadata["pocket_entry_gate"] = {
+                    "passed": True,
+                    "reason": "PURE_STRATEGY_RUNTIME_BYPASS",
+                }
+            else:
+                _pocket_passed, _pocket_reason = check_pocket_entry_override(
+                    signal_type=getattr(signal, "signal_type_1h", getattr(signal, "signal_type", "")),
+                    vwap_state=getattr(signal, "vwap_state", ""),
+                    is_trial_entry=bool(getattr(signal, "is_trial_entry", False)),
+                    signal_score=float(getattr(signal, "signal_score", 0.0)),
+                    vwap_score=float(getattr(signal, "vwap_score", 0.0)),
+                    entry_score=float(getattr(signal, "entry_score_15m", 0.0)),
+                    bar_1h_direction=bar_1h_direction,
+                    flow_cvd_ok=bool(flow_check_results.get("cvd_ok", False)),
+                    micro_cvd_momentum_ok=bool(micro_check_results.get("cvd_momentum_ok", False)),
+                    pocket_entry_overrides=_pocket_overrides,
                 )
+                metadata["pocket_entry_gate"] = {
+                    "passed": bool(_pocket_passed),
+                    "reason": _pocket_reason,
+                }
+                if not _pocket_passed:
+                    return FundFlowDecision(
+                        operation=Operation.HOLD,
+                        symbol=symbol,
+                        reason=_pocket_reason,
+                        metadata=metadata,
+                    )
             
             # 开多仓
             leverage = macd_v2_engine.calculate_leverage(
@@ -4347,6 +4622,9 @@ class FundFlowDecisionEngine:
                 regime_info=regime_info,
                 tf_15m=tf_15m,
                 tf_1h=tf_1h,
+                signal_type_1h=signal.signal_type_1h,
+                vwap_state=signal.vwap_state,
+                vwap_score=signal.vwap_score,
             )
             metadata.update(gate_metadata)
             if not gates_passed:
@@ -4383,29 +4661,35 @@ class FundFlowDecisionEngine:
             )
             flow_check_results = gate_metadata.get("entry_hard_gate_flow_checks", {})
             micro_check_results = gate_metadata.get("entry_hard_gate_micro_checks", {})
-            _pocket_passed, _pocket_reason = check_pocket_entry_override(
-                signal_type=signal.signal_type_1h,
-                vwap_state=signal.vwap_state,
-                is_trial_entry=bool(signal.is_trial_entry),
-                signal_score=signal.signal_score,
-                vwap_score=signal.vwap_score,
-                entry_score=signal.entry_score_15m,
-                bar_1h_direction=bar_1h_direction,
-                flow_cvd_ok=bool(flow_check_results.get("cvd_ok", False)),
-                micro_cvd_momentum_ok=bool(micro_check_results.get("cvd_momentum_ok", False)),
-                pocket_entry_overrides=_pocket_overrides,
-            )
-            metadata["pocket_entry_gate"] = {
-                "passed": bool(_pocket_passed),
-                "reason": _pocket_reason,
-            }
-            if not _pocket_passed:
-                return FundFlowDecision(
-                    operation=Operation.HOLD,
-                    symbol=symbol,
-                    reason=_pocket_reason,
-                    metadata=metadata,
+            if self.pure_strategy_runtime_enabled and self.pure_strategy_runtime_bypasses.get("runtime_pocket_gate", False):
+                metadata["pocket_entry_gate"] = {
+                    "passed": True,
+                    "reason": "PURE_STRATEGY_RUNTIME_BYPASS",
+                }
+            else:
+                _pocket_passed, _pocket_reason = check_pocket_entry_override(
+                    signal_type=signal.signal_type_1h,
+                    vwap_state=signal.vwap_state,
+                    is_trial_entry=bool(signal.is_trial_entry),
+                    signal_score=signal.signal_score,
+                    vwap_score=signal.vwap_score,
+                    entry_score=signal.entry_score_15m,
+                    bar_1h_direction=bar_1h_direction,
+                    flow_cvd_ok=bool(flow_check_results.get("cvd_ok", False)),
+                    micro_cvd_momentum_ok=bool(micro_check_results.get("cvd_momentum_ok", False)),
+                    pocket_entry_overrides=_pocket_overrides,
                 )
+                metadata["pocket_entry_gate"] = {
+                    "passed": bool(_pocket_passed),
+                    "reason": _pocket_reason,
+                }
+                if not _pocket_passed:
+                    return FundFlowDecision(
+                        operation=Operation.HOLD,
+                        symbol=symbol,
+                        reason=_pocket_reason,
+                        metadata=metadata,
+                    )
             
             # 开空仓
             leverage = macd_v2_engine.calculate_leverage(
@@ -6119,7 +6403,8 @@ class FundFlowDecisionEngine:
         # V2.0策略优先（VWAP + BOLL 增强版）
         if self.macd_v2_enabled and self.macd_v2_engine:
             decision = self._decide_macd_v2_strategy(symbol, portfolio, price, market_flow_context or {}, regime_info)
-            return self._enforce_direction_lock_on_decision(decision, regime_info, source="macd_v2")
+            decision = self._enforce_direction_lock_on_decision(decision, regime_info, source="macd_v2")
+            return self._annotate_pure_strategy_runtime_decision(decision)
         
         if self.macd_mtf_strategy_enabled:
             decision = self._decide_macd_strategy(symbol, portfolio, price, market_flow_context or {}, regime_info)
@@ -6226,8 +6511,12 @@ class FundFlowDecisionEngine:
             "legacy_direction": regime_info.get("legacy_direction", "BOTH"),
             "legacy_score": regime_info.get("legacy_score", 0.0),
             "combo_compare": regime_info.get("combo_compare", {}),
-            "selected_pool_id": engine_params.get("signal_pool_id"),
-            "signal_pool_id": engine_params.get("signal_pool_id"),
+            "selected_pool_id": None
+            if self.pure_strategy_runtime_bypasses.get("signal_pool_metadata", False)
+            else engine_params.get("signal_pool_id"),
+            "signal_pool_id": None
+            if self.pure_strategy_runtime_bypasses.get("signal_pool_metadata", False)
+            else engine_params.get("signal_pool_id"),
             "params_override": engine_params,
             "close_threshold": close_threshold,
             "range_quantile_ready": bool(range_quantiles.get("ready", False)),
