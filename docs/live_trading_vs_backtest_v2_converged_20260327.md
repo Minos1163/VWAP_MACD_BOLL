@@ -54,7 +54,7 @@
 - 实盘配置: `config/trading_config_fund_flow_live_production.json`
 - 回测脚本: `scripts/backtest_macd_v2.py`
 - 收敛 TODO: `docs/live_trading_convergence_todolist_20260327.md`
-- 部署前对齐检查: `scripts/validate_live_backtest_alignment.py`
+- 部署前对齐检查: `scripts/diagnostics/validate_live_backtest_alignment.py`
 
 ---
 
@@ -356,6 +356,6 @@
 - `config/trading_config_fund_flow_live_production.json`
 - `config/trading_config_fund_flow_live_backtest_converged_20260327.json`
 - `scripts/backtest_macd_v2.py`
-- `scripts/validate_live_backtest_alignment.py`
+- `scripts/diagnostics/validate_live_backtest_alignment.py`
 - `docs/live_trading_convergence_todolist_20260327.md`
 - `output/backtest/v2_summary_20260327_191149.json`

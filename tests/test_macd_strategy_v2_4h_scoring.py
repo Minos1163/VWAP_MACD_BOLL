@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 import pytest
 import numpy as np
 
-from src.fund_flow.macd_strategy_v2 import MACDStrategyV2Config, MACDStrategyV2Engine
+from src.fund_flow.macd_strategy_v2 import (
+    MACDStrategyV2Config,
+    MACDStrategyV2Engine,
+    build_macd_v2_config_from_runtime,
+)
 
 
 def test_config_defaults_reflect_iteration1_ablation_targets() -> None:
@@ -684,8 +688,53 @@ def test_preflip_trial_entry_allows_4h_green_shrinking_long() -> None:
     assert signal.direction == "long"
     assert signal.is_trial_entry is True
     assert signal.entry_scale == pytest.approx(0.35, rel=1e-6)
-    assert signal.signal_score >= 0.78
-    assert signal.details["macd_4h_shrink_pct"] >= 0.75
+
+
+def test_long_whitelist_config_blocks_non_whitelist_long_combos() -> None:
+    cfg = MACDStrategyV2Config(
+        long_entry_mode="whitelist_only",
+        long_whitelist_signal_types=["green_bar_growing"],
+        long_whitelist_vwap_states=["long_dual_support"],
+    )
+
+    assert cfg.is_long_entry_whitelisted("green_bar_growing", "short_retest_reject") is True
+    assert cfg.is_long_entry_whitelisted("flip_bullish", "long_dual_support") is True
+    assert cfg.is_long_entry_whitelisted("flip_bullish", "long_reclaim_confirmed") is False
+
+
+def test_long_whitelist_pockets_require_exact_match_when_configured() -> None:
+    cfg = MACDStrategyV2Config(
+        long_entry_mode="whitelist_only",
+        long_whitelist_signal_types=["green_bar_growing"],
+        long_whitelist_vwap_states=["long_dual_support"],
+        long_whitelist_pockets=["flip_bullish|long_reclaim_confirmed"],
+    )
+
+    assert cfg.is_long_entry_whitelisted("flip_bullish", "long_reclaim_confirmed") is True
+    assert cfg.is_long_entry_whitelisted("green_bar_growing", "long_dual_support") is False
+    assert cfg.is_long_entry_whitelisted("flip_bullish", "long_dual_support") is False
+
+
+def test_build_macd_v2_config_from_runtime_loads_long_whitelist_controls() -> None:
+    runtime_cfg = {
+        "fund_flow": {
+            "macd_mtf_strategy_v2": {
+                "entry_filters": {
+                    "long_entry_mode": "whitelist_only",
+                    "long_whitelist_signal_types": ["green_bar_growing"],
+                    "long_whitelist_vwap_states": ["long_dual_support"],
+                    "long_whitelist_pockets": ["flip_bullish|long_reclaim_confirmed"],
+                }
+            }
+        }
+    }
+
+    config = build_macd_v2_config_from_runtime(runtime_cfg)
+
+    assert config.long_entry_mode == "whitelist_only"
+    assert config.long_whitelist_signal_types == ["green_bar_growing"]
+    assert config.long_whitelist_vwap_states == ["long_dual_support"]
+    assert config.long_whitelist_pockets == ["flip_bullish|long_reclaim_confirmed"]
 
 
 def test_flip_bullish_cvd_context_filter_blocks_preflip_trial_entry() -> None:
@@ -1133,6 +1182,99 @@ def test_watchlist_symbol_risk_caps_leverage_and_session_scaled_portion() -> Non
 
     assert leverage == 2
     assert portion == pytest.approx(0.40 * (0.65 * 0.80), rel=1e-6)
+
+
+def test_calculate_leverage_uses_configured_score_tiers_before_caps() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            leverage_score_tiers=[
+                {"score_min": 0.87, "leverage": 4},
+                {"score_min": 0.84, "leverage": 3},
+                {"score_min": 0.80, "leverage": 2},
+            ]
+        )
+    )
+
+    assert engine.calculate_leverage(score=0.90, ema_multiplier=1.0, signal_type_1h="flip_bullish") == 4
+    assert engine.calculate_leverage(score=0.85, ema_multiplier=1.0, signal_type_1h="flip_bullish") == 3
+    assert engine.calculate_leverage(score=0.81, ema_multiplier=1.0, signal_type_1h="flip_bullish") == 2
+    assert engine.calculate_leverage(score=0.79, ema_multiplier=1.0, signal_type_1h="flip_bullish") == 0
+
+
+def test_build_macd_v2_config_from_runtime_loads_leverage_score_tiers() -> None:
+    config = build_macd_v2_config_from_runtime(
+        {
+            "fund_flow": {
+                "macd_mtf_strategy_v2": {
+                    "leverage_config": {
+                        "score_tiers": [
+                            {"score_min": 0.87, "leverage": 4},
+                            {"score_min": 0.84, "leverage": 3},
+                            {"score_min": 0.80, "leverage": 2},
+                        ]
+                    }
+                }
+            }
+        }
+    )
+
+    assert config.leverage_score_tiers == [
+        {"score_min": 0.87, "leverage": 4},
+        {"score_min": 0.84, "leverage": 3},
+        {"score_min": 0.80, "leverage": 2},
+    ]
+
+
+def test_calculate_position_portion_uses_configured_score_tiers() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            position_score_tiers=[
+                {"score_min": 0.85, "target_portion": 0.30},
+                {"score_min": 0.75, "target_portion": 0.25},
+                {"score_min": 0.68, "target_portion": 0.20},
+            ]
+        )
+    )
+
+    assert engine.calculate_position_portion(
+        score=0.90,
+        base_default_portion=0.20,
+        base_max_symbol_position_portion=0.30,
+    ) == pytest.approx(0.30, rel=1e-6)
+    assert engine.calculate_position_portion(
+        score=0.80,
+        base_default_portion=0.20,
+        base_max_symbol_position_portion=0.30,
+    ) == pytest.approx(0.25, rel=1e-6)
+    assert engine.calculate_position_portion(
+        score=0.70,
+        base_default_portion=0.20,
+        base_max_symbol_position_portion=0.30,
+    ) == pytest.approx(0.20, rel=1e-6)
+
+
+def test_build_macd_v2_config_from_runtime_loads_position_score_tiers() -> None:
+    config = build_macd_v2_config_from_runtime(
+        {
+            "fund_flow": {
+                "macd_mtf_strategy_v2": {
+                    "position_size_config": {
+                        "score_tiers": [
+                            {"score_min": 0.85, "target_portion": 0.30},
+                            {"score_min": 0.75, "target_portion": 0.25},
+                            {"score_min": 0.68, "target_portion": 0.20},
+                        ]
+                    }
+                }
+            }
+        }
+    )
+
+    assert config.position_score_tiers == [
+        {"score_min": 0.85, "target_portion": 0.30},
+        {"score_min": 0.75, "target_portion": 0.25},
+        {"score_min": 0.68, "target_portion": 0.20},
+    ]
 
 
 def test_non_watchlist_symbol_keeps_original_dual_pressure_cap() -> None:

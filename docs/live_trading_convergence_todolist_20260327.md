@@ -15,7 +15,7 @@
 - [x] 在 live production 配置中显式关闭 `entry_window`
 - [x] 在 live production 配置中显式关闭 CVD 相关外层 veto / context filter
 - [x] 在 live production 配置中显式写入与回测一致的关键阈值: `long_open_threshold / short_open_threshold / close_threshold / stop_loss_pct / take_profit_pct / entry_slippage / reverse_close_confirm_bars / max_active_symbols`
-- [x] 新增 `validate_live_backtest_alignment.py`，用于部署前对齐检查
+- [x] 新增 `scripts/diagnostics/validate_live_backtest_alignment.py`，用于部署前对齐检查
 - [ ] 运行一轮小资金实盘观察 alpha 稀释日志，确认主要损耗层不再集中在 outer filters
 - [ ] 基于 24h / 72h 实盘日志决定是否需要二阶段重新引入 soft filter
 
@@ -23,11 +23,11 @@
 
 - `src/app/fund_flow_bot.py`
 - `config/trading_config_fund_flow_live_production.json`
-- `scripts/validate_live_backtest_alignment.py`
+- `scripts/diagnostics/validate_live_backtest_alignment.py`
 
 ## 验证命令
 
 ```powershell
-python -m py_compile src/app/fund_flow_bot.py scripts/validate_live_backtest_alignment.py
-python scripts/validate_live_backtest_alignment.py
+python -m py_compile src/app/fund_flow_bot.py scripts/diagnostics/validate_live_backtest_alignment.py
+python scripts/diagnostics/validate_live_backtest_alignment.py
 ```

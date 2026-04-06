@@ -32,7 +32,7 @@
 
 执行工具：
 
-- [x] 使用 [run_strategy_ablation_20260327.py](/D:/AIDCA/AI8/scripts/run_strategy_ablation_20260327.py) 固化实验流程
+- [x] 使用 [scripts/backtests/run_strategy_ablation_20260327.py](/D:/AIDCA/AI8/scripts/backtests/run_strategy_ablation_20260327.py) 固化实验流程
 
 第一轮实测结果：
 

@@ -67,7 +67,7 @@ class MACDStrategyV2Config:
     vwap_deviation_optimal: float = 0.005  # 最优偏离区间 ±0.5%
     vwap_deviation_warning: float = 0.015  # 警告偏离 ±1.5%
     vwap_deviation_hard_block: float = 0.030  # 硬性否决偏离 ±3.0%
-    structural_vwap_mode: str = "anchored_weekly"
+    structural_vwap_mode: str = "anchored_daily"
     structural_vwap_rolling_window: int = 20
     vwap_retest_tolerance: float = 0.003
     
@@ -83,6 +83,7 @@ class MACDStrategyV2Config:
     min_entry_score: float = 0.25
     min_signal_score: float = 0.850
     red_bar_growing_min_signal_score: float = 0.870
+    red_bar_shrinking_min_signal_score: float = 0.870
     flip_bearish_min_signal_score: float = 0.840
     flip_bullish_min_signal_score: float = 0.840
 
@@ -224,6 +225,7 @@ class MACDStrategyV2Config:
         signal_type = str(signal_type_1h or "").strip().lower()
         thresholds = {
             "red_bar_growing": self.red_bar_growing_min_signal_score,
+            "red_bar_shrinking": self.red_bar_shrinking_min_signal_score,
             "flip_bearish": self.flip_bearish_min_signal_score,
             "flip_bullish": self.flip_bullish_min_signal_score,
         }
@@ -3172,10 +3174,12 @@ class MACDStrategyV2Engine:
         Returns:
             杠杆倍数
         """
-        if score >= 0.90:
-            base_leverage = 4
+        if score >= 0.95:
+            base_leverage = 5
+        elif score >= 0.90:
+            base_leverage = 5
         elif score >= 0.85:
-            base_leverage = 3
+            base_leverage = 5
         elif score >= 0.75:
             base_leverage = 2
         else:
@@ -3202,13 +3206,15 @@ class MACDStrategyV2Engine:
         return leverage
     
     def calculate_portion_multiplier(self, score: float) -> float:
-        """根据评分计算仓位乘数"""
-        if score >= 0.90:
+        """根据评分计算仓位乘数（高分信号仓位回落，避免过度集中）"""
+        if score >= 0.95:
+            return 1.2
+        elif score >= 0.90:
             return 1.2
         elif score >= 0.85:
             return 1.0
         elif score >= 0.75:
-            return 0.8
+            return 1.0
         return 0.0
 
     def calculate_position_portion(

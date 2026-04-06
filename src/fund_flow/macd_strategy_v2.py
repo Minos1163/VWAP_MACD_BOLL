@@ -154,13 +154,13 @@ class MACDStrategyV2Config:
     vwap_deviation_optimal: float = 0.005  # 最优偏离区间 ±0.5%
     vwap_deviation_warning: float = 0.015  # 警告偏离 ±1.5%
     vwap_deviation_hard_block: float = 0.030  # 硬性否决偏离 ±3.0%
-    structural_vwap_mode: str = "anchored_weekly"
+    structural_vwap_mode: str = "anchored_daily"
     structural_vwap_rolling_window: int = 20
     vwap_retest_tolerance: float = 0.003
     
     # 评分权重
-    weight_1h_direction: float = 0.20  # 1H方向辅助评分权重
-    weight_4h_direction: float = 0.40  # 4H主趋势评分权重
+    weight_1h_direction: float = 0.40  # 1H方向辅助评分权重
+    weight_4h_direction: float = 0.20  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
     weight_vwap: float = 0.20  # VWAP评分权重
     weight_15m_entry: float = 0.05  # 15M入场时机评分权重（软确认）
@@ -170,6 +170,7 @@ class MACDStrategyV2Config:
     min_entry_score: float = 0.25
     min_signal_score: float = 0.830
     red_bar_growing_min_signal_score: float = 0.845
+    red_bar_shrinking_min_signal_score: float = 0.845
     flip_bearish_min_signal_score: float = 0.825
     flip_bullish_min_signal_score: float = 0.825
 
@@ -199,6 +200,10 @@ class MACDStrategyV2Config:
     ema_slope_lookback_1h: int = 3  # 兼容旧配置：等价于BOLL中轨斜率lookback
     ema_slope_lookback_4h: int = 2  # 兼容旧配置：等价于BOLL中轨斜率lookback
     disable_red_bar_growing_long_entries: bool = False
+    long_entry_mode: str = "all"
+    long_whitelist_signal_types: List[str] = field(default_factory=list)
+    long_whitelist_vwap_states: List[str] = field(default_factory=list)
+    long_whitelist_pockets: List[str] = field(default_factory=list)
     disable_green_bar_growing_entries: bool = True
     disable_green_bar_shrinking_short_dual_pressure_entries: bool = True
     disable_red_bar_shrinking_long_dual_support_entries: bool = True
@@ -256,11 +261,13 @@ class MACDStrategyV2Config:
     session_risk_apply_to_states: List[str] = field(default_factory=list)
     vwap_score_tier_apply_to_states: List[str] = field(default_factory=list)
     vwap_score_position_tiers: List[Dict[str, Any]] = field(default_factory=list)
+    position_score_tiers: List[Dict[str, Any]] = field(default_factory=list)
     symbol_risk_watchlist_symbols: List[str] = field(default_factory=list)
     symbol_risk_watchlist_max_position_portion: float = 0.0
     symbol_risk_watchlist_max_leverage: int = 0
     symbol_risk_watchlist_apply_session_scale_double: bool = False
     symbol_risk_watchlist_session_scale_multiplier: float = 0.80
+    leverage_score_tiers: List[Dict[str, Any]] = field(default_factory=list)
 
     # 过热惩罚
     overheat_growing_penalty: float = 0.12
@@ -325,6 +332,7 @@ class MACDStrategyV2Config:
         signal_type = str(signal_type_1h or "").strip().lower()
         thresholds = {
             "red_bar_growing": self.red_bar_growing_min_signal_score,
+            "red_bar_shrinking": self.red_bar_shrinking_min_signal_score,
             "flip_bearish": self.flip_bearish_min_signal_score,
             "flip_bullish": self.flip_bullish_min_signal_score,
         }
@@ -343,6 +351,35 @@ class MACDStrategyV2Config:
         signal_key = str(signal_type_1h or "*").strip().lower() or "*"
         state_key = str(vwap_state or "*").strip().lower() or "*"
         return f"{signal_key}|{state_key}"
+
+    def is_long_entry_whitelisted(
+        self,
+        signal_type_1h: Optional[str],
+        vwap_state: Optional[str],
+    ) -> bool:
+        pocket_whitelist = {
+            self.normalize_pocket_key(*str(item or "").split("|", 1))
+            if "|" in str(item or "")
+            else self.normalize_pocket_key(str(item or "").strip(), "*")
+            for item in (self.long_whitelist_pockets or [])
+            if str(item or "").strip()
+        }
+        if pocket_whitelist:
+            return self.normalize_pocket_key(signal_type_1h, vwap_state) in pocket_whitelist
+
+        signal_type = str(signal_type_1h or "").strip().lower()
+        state = str(vwap_state or "").strip().lower()
+        signal_whitelist = {
+            str(item or "").strip().lower()
+            for item in (self.long_whitelist_signal_types or [])
+            if str(item or "").strip()
+        }
+        state_whitelist = {
+            str(item or "").strip().lower()
+            for item in (self.long_whitelist_vwap_states or [])
+            if str(item or "").strip()
+        }
+        return signal_type in signal_whitelist or state in state_whitelist
 
     def resolve_pocket_entry_override(
         self,
@@ -439,6 +476,7 @@ def build_macd_v2_config_from_runtime(
     stop_cfg = v2_cfg.get("stop_loss_config", {}) if isinstance(v2_cfg.get("stop_loss_config"), dict) else {}
     session_risk_cfg = v2_cfg.get("session_risk_control", {}) if isinstance(v2_cfg.get("session_risk_control"), dict) else {}
     vwap_score_tier_cfg = v2_cfg.get("vwap_score_position_tiers", {}) if isinstance(v2_cfg.get("vwap_score_position_tiers"), dict) else {}
+    position_size_cfg = v2_cfg.get("position_size_config", {}) if isinstance(v2_cfg.get("position_size_config"), dict) else {}
     symbol_risk_cfg = v2_cfg.get("symbol_risk_tiers", {}) if isinstance(v2_cfg.get("symbol_risk_tiers"), dict) else {}
     macd_cfg = v2_cfg.get("macd_config", {}) if isinstance(v2_cfg.get("macd_config"), dict) else {}
     filter_cfg = v2_cfg.get("entry_filters", {}) if isinstance(v2_cfg.get("entry_filters"), dict) else {}
@@ -468,7 +506,7 @@ def build_macd_v2_config_from_runtime(
         vwap_deviation_optimal=float(vwap_cfg.get("vwap_deviation_optimal", 0.005)),
         vwap_deviation_warning=float(vwap_cfg.get("vwap_deviation_warning", 0.015)),
         vwap_deviation_hard_block=float(vwap_cfg.get("vwap_deviation_hard_block", 0.030)),
-        structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_weekly")),
+        structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_daily")),
         structural_vwap_rolling_window=int(float(vwap_cfg.get("structural_vwap_rolling_window", 20))),
         vwap_retest_tolerance=float(vwap_cfg.get("vwap_retest_tolerance", 0.003)),
         weight_1h_direction=float(weights_cfg.get("weight_1h_direction", 0.00)),
@@ -480,6 +518,7 @@ def build_macd_v2_config_from_runtime(
         min_entry_score=float(thresholds_cfg.get("min_entry_score", 0.25)),
         min_signal_score=default_signal_threshold,
         red_bar_growing_min_signal_score=float(thresholds_cfg.get("red_bar_growing", default_signal_threshold)),
+        red_bar_shrinking_min_signal_score=float(thresholds_cfg.get("red_bar_shrinking", default_signal_threshold)),
         flip_bearish_min_signal_score=float(thresholds_cfg.get("flip_bearish", default_signal_threshold)),
         flip_bullish_min_signal_score=float(thresholds_cfg.get("flip_bullish", default_signal_threshold)),
         enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
@@ -523,6 +562,22 @@ def build_macd_v2_config_from_runtime(
         ema_slope_lookback_1h=int(float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h", 3)))),
         ema_slope_lookback_4h=int(float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h", 2)))),
         disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
+        long_entry_mode=str(filter_cfg.get("long_entry_mode", "all") or "all").strip().lower(),
+        long_whitelist_signal_types=[
+            str(x).strip().lower()
+            for x in (filter_cfg.get("long_whitelist_signal_types", []) or [])
+            if str(x).strip()
+        ] if isinstance(filter_cfg.get("long_whitelist_signal_types"), list) else [],
+        long_whitelist_vwap_states=[
+            str(x).strip().lower()
+            for x in (filter_cfg.get("long_whitelist_vwap_states", []) or [])
+            if str(x).strip()
+        ] if isinstance(filter_cfg.get("long_whitelist_vwap_states"), list) else [],
+        long_whitelist_pockets=[
+            MACDStrategyV2Config.normalize_pocket_key(*str(x).split("|", 1))
+            for x in (filter_cfg.get("long_whitelist_pockets", []) or [])
+            if str(x).strip() and "|" in str(x)
+        ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
         disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
         primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
         require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
@@ -609,6 +664,8 @@ def build_macd_v2_config_from_runtime(
         ] if isinstance(vwap_score_tier_cfg.get("apply_to_states"), list) else [],
         vwap_score_position_tiers=copy.deepcopy(vwap_score_tier_cfg.get("tiers", []))
         if isinstance(vwap_score_tier_cfg.get("tiers"), list) else [],
+        position_score_tiers=copy.deepcopy(position_size_cfg.get("score_tiers", []))
+        if isinstance(position_size_cfg.get("score_tiers"), list) else [],
         symbol_risk_watchlist_symbols=[
             str(x).strip().upper() for x in (symbol_risk_cfg.get("watchlist_symbols", []) or []) if str(x).strip()
         ] if isinstance(symbol_risk_cfg.get("watchlist_symbols"), list) else [],
@@ -616,6 +673,8 @@ def build_macd_v2_config_from_runtime(
         symbol_risk_watchlist_max_leverage=int(float(symbol_risk_cfg.get("watchlist_max_leverage", 0))),
         symbol_risk_watchlist_apply_session_scale_double=bool(symbol_risk_cfg.get("watchlist_apply_session_scale_double", False)),
         symbol_risk_watchlist_session_scale_multiplier=float(symbol_risk_cfg.get("watchlist_session_scale_multiplier", 0.80)),
+        leverage_score_tiers=copy.deepcopy(leverage_cfg.get("score_tiers", []))
+        if isinstance(leverage_cfg.get("score_tiers"), list) else [],
         dual_pressure_target_portion_bonus=float(leverage_cfg.get("dual_pressure_target_portion_bonus", 0.0)),
         dual_pressure_max_symbol_position_portion=float(leverage_cfg.get("dual_pressure_max_symbol_position_portion", 0.0)),
         use_cvd_bonus_filter=False if disable_cvd_decision_logic else bool(leverage_cfg.get("use_cvd_bonus_filter", False)),
@@ -3153,6 +3212,35 @@ class MACDStrategyV2Engine:
             )
 
         if (
+            trade_direction == "long"
+            and str(self.config.long_entry_mode or "all").strip().lower() == "whitelist_only"
+            and not self.config.is_long_entry_whitelisted(signal_type_1h, vwap_state)
+        ):
+            debug_details = self._set_stage(
+                debug_details,
+                "long_whitelist_blocked",
+                long_entry_mode=self.config.long_entry_mode,
+                long_whitelist_signal_types=list(self.config.long_whitelist_signal_types),
+                long_whitelist_vwap_states=list(self.config.long_whitelist_vwap_states),
+                long_whitelist_pockets=list(self.config.long_whitelist_pockets),
+            )
+            return self._neutral_signal(
+                reason="long_whitelist_blocked",
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+
+        if (
             signal_type_1h == 'flip_bullish'
             and is_trial_entry
             and self.config.disable_flip_bullish_trial_entries
@@ -3442,30 +3530,19 @@ class MACDStrategyV2Engine:
             vwap_state=vwap_state,
         )
         min_vwap_score_for_entry = float(pocket_entry_requirements["min_vwap_score_for_entry"])
+        # P0-A消融：VWAP评分低于阈值时改为软惩罚（降低signal_score），不再硬拒绝
+        vwap_soft_penalty = 0.0
         if min_vwap_score_for_entry > 0 and vwap_score < min_vwap_score_for_entry:
             debug_details = self._set_stage(
                 debug_details,
-                "vwap_score_filter",
+                "vwap_score_soft_penalty",
                 min_vwap_score_for_entry=min_vwap_score_for_entry,
-            )
-            return self._neutral_signal(
-                reason=f'vwap_hard_block({vwap_score:.2f}<{min_vwap_score_for_entry:.2f})',
-                score=0.0,
-                veto_type=VetoType.VWAP_SCORE_FILTER,
-                veto_reason="VWAP评分低于入场阈值",
-                signal_type_1h=signal_type_1h,
-                entry_type_15m=entry_type_15m,
-                entry_score_15m=entry_score_15m,
                 vwap_score=vwap_score,
-                vwap_deviation=vwap_deviation,
-                ema_multiplier=ema_multiplier,
-                ema_structure_status=ema_status,
-                enhancement_score=enhancement_score,
-                is_4h_enhanced=is_4h_enhanced,
-                details=self._build_debug_details(
-                    **debug_details,
-                ),
+                penalty_applied=True,
             )
+            # 惩罚比例：差距越大惩罚越重，最多扣减30%
+            gap_ratio = max(0, (min_vwap_score_for_entry - vwap_score) / max(min_vwap_score_for_entry, 0.01))
+            vwap_soft_penalty = min(0.30, gap_ratio * 0.50)
 
         if strict_1h_filters_enabled and signal_type_1h == 'red_bar_growing' and trade_direction == 'long':
             if ema_status == 'against':
@@ -3710,26 +3787,16 @@ class MACDStrategyV2Engine:
                 ),
             )
         
-        # ========== Step 7: 组合否决检查 ==========
-        # V6: 成交量 + VWAP 双低
+        # ========== Step 7: 组合否决检查（改为软惩罚） ==========
+        # V6: 成交量 + VWAP 双低 — 改为软惩罚而非硬拒绝
         if score_vol < 0.05 and vwap_score <= 0.10:
-            return self._neutral_signal(
-                reason='volume_vwap_both_low',
-                score=score,
-                veto_type=VetoType.VOLUME_VWAP_BOTH_LOW,
-                veto_reason="成交量与VWAP评分双低",
-                signal_type_1h=signal_type_1h,
-                entry_type_15m=entry_type_15m,
-                entry_score_15m=entry_score_15m,
+            vwap_soft_penalty = max(vwap_soft_penalty, 0.25)
+            debug_details = self._set_stage(
+                debug_details,
+                "volume_vwap_both_low_soft_penalty",
+                score_vol=score_vol,
                 vwap_score=vwap_score,
-                vwap_deviation=vwap_deviation,
-                ema_multiplier=ema_multiplier,
-                ema_structure_status=ema_status,
-                enhancement_score=enhancement_score,
-                is_4h_enhanced=is_4h_enhanced,
-                details=self._build_debug_details(
-                    **debug_details,
-                ),
+                penalty_applied=True,
             )
         
         # ========== Step 7.5: 空头质量过滤（V3专家组建议）==========
@@ -4108,7 +4175,7 @@ class MACDStrategyV2Engine:
         
         return MACDSignalV2(
             direction=trade_direction,
-            signal_score=final_score,
+            signal_score=max(0.0, final_score * (1.0 - vwap_soft_penalty)),
             signal_type_1h=signal_type_1h,
             signal_strength_1h=signal_strength_1h,
             is_4h_enhanced=is_4h_enhanced,
@@ -4152,10 +4219,45 @@ class MACDStrategyV2Engine:
         Returns:
             杠杆倍数
         """
-        if score >= 0.90:
-            base_leverage = 4
+        base_leverage = 0
+        raw_tiers = self.config.leverage_score_tiers or []
+        if raw_tiers:
+            normalized_tiers: List[Dict[str, float]] = []
+            for raw_tier in raw_tiers:
+                if not isinstance(raw_tier, dict):
+                    continue
+                try:
+                    tier_leverage = int(float(raw_tier.get("leverage", 0) or 0))
+                    tier_min = float(raw_tier.get("score_min", 0.0) or 0.0)
+                    tier_max_raw = raw_tier.get("score_max", None)
+                    tier_max = float(tier_max_raw) if tier_max_raw is not None else 1.0
+                except (TypeError, ValueError):
+                    continue
+                if tier_leverage <= 0 or tier_max < tier_min:
+                    continue
+                normalized_tiers.append(
+                    {
+                        "score_min": tier_min,
+                        "score_max": tier_max,
+                        "leverage": float(tier_leverage),
+                    }
+                )
+            normalized_tiers.sort(
+                key=lambda item: (item["score_min"], item["score_max"], item["leverage"]),
+                reverse=True,
+            )
+            for tier in normalized_tiers:
+                if float(score) >= float(tier["score_min"]) and float(score) <= float(tier["score_max"]):
+                    base_leverage = int(tier["leverage"])
+                    break
+            if base_leverage <= 0:
+                return 0
+        elif score >= 0.95:
+            base_leverage = 5
+        elif score >= 0.90:
+            base_leverage = 5
         elif score >= 0.85:
-            base_leverage = 3
+            base_leverage = 5
         elif score >= 0.75:
             base_leverage = 2
         else:
@@ -4182,13 +4284,15 @@ class MACDStrategyV2Engine:
         return leverage
     
     def calculate_portion_multiplier(self, score: float) -> float:
-        """根据评分计算仓位乘数"""
-        if score >= 0.90:
+        """根据评分计算仓位乘数（高分信号仓位回落，避免过度集中）"""
+        if score >= 0.95:
+            return 1.2
+        elif score >= 0.90:
             return 1.2
         elif score >= 0.85:
             return 1.0
         elif score >= 0.75:
-            return 0.8
+            return 1.0
         return 0.0
 
     def calculate_position_portion(
@@ -4205,11 +4309,47 @@ class MACDStrategyV2Engine:
         entry_scale: float = 1.0,
         session_scale: float = 1.0,
     ) -> float:
-        portion_mult = self.calculate_portion_multiplier(score)
-        if portion_mult <= 0:
-            return 0.0
-
         target_portion = float(base_default_portion)
+        raw_tiers = self.config.position_score_tiers or []
+        if raw_tiers:
+            normalized_tiers: List[Dict[str, float]] = []
+            for raw_tier in raw_tiers:
+                if not isinstance(raw_tier, dict):
+                    continue
+                try:
+                    tier_target = float(raw_tier.get("target_portion", 0.0) or 0.0)
+                    tier_min = float(raw_tier.get("score_min", 0.0) or 0.0)
+                    tier_max_raw = raw_tier.get("score_max", None)
+                    tier_max = float(tier_max_raw) if tier_max_raw is not None else 1.0
+                except (TypeError, ValueError):
+                    continue
+                if tier_target <= 0 or tier_max < tier_min:
+                    continue
+                normalized_tiers.append(
+                    {
+                        "score_min": tier_min,
+                        "score_max": tier_max,
+                        "target_portion": tier_target,
+                    }
+                )
+            normalized_tiers.sort(
+                key=lambda item: (item["score_min"], item["score_max"], item["target_portion"]),
+                reverse=True,
+            )
+            matched_target = None
+            for tier in normalized_tiers:
+                if float(score) >= float(tier["score_min"]) and float(score) <= float(tier["score_max"]):
+                    matched_target = float(tier["target_portion"])
+                    break
+            if matched_target is None:
+                return 0.0
+            target_portion = matched_target
+            portion_mult = 1.0
+        else:
+            portion_mult = self.calculate_portion_multiplier(score)
+            if portion_mult <= 0:
+                return 0.0
+
         max_symbol_position_portion = float(base_max_symbol_position_portion)
 
         if str(vwap_state or "").strip().lower() == "short_dual_pressure":

@@ -127,7 +127,7 @@ python scripts/backtest_macd_v2.py \
   --profile macd_v2_full_filters
 
 # 批量对比：同时跑多个 profile 并输出汇总表
-python scripts/compare_backtest_profiles.py \
+python scripts/diagnostics/compare_backtest_profiles.py \
   --config config/trading_config_fund_flow.json
 ```
 

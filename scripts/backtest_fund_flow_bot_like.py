@@ -31,7 +31,6 @@ try:
         build_backtest_config,
         build_backtest_summary,
         build_strategy_config,
-        filter_market_data_by_time_range,
         load_symbol_data,
     )
 except ModuleNotFoundError:
@@ -42,10 +41,10 @@ except ModuleNotFoundError:
         build_backtest_config,
         build_backtest_summary,
         build_strategy_config,
-        filter_market_data_by_time_range,
         load_symbol_data,
     )
 from src.app.fund_flow_bot import TradingBot
+from src.fund_flow.replay_window import apply_market_data_window, timestamp_in_trade_window
 from src.fund_flow.candidate_filter import pre_ai_candidate_filter
 from src.fund_flow.decision_engine import FundFlowDecisionEngine
 from src.fund_flow.dynamic_leverage import get_max_leverage_by_recent_performance
@@ -64,6 +63,13 @@ class BotLikeReplayEngine(BacktestEngine):
 
     MIN_15M_WARMUP_BARS = 50
     MIN_HIGHER_TF_INDEX = 5
+
+    def _decision_timeframe(self) -> str:
+        config = getattr(self, "config", None)
+        tf = str(getattr(config, "decision_timeframe", "") or "15m").strip().lower()
+        if tf in {"1m", "3m", "5m", "15m"}:
+            return tf
+        return "15m"
 
     def __init__(self, config: BacktestConfig, strategy_config, runtime_config: Dict[str, Any]):
         super().__init__(config, strategy_config, runtime_config)
@@ -243,14 +249,18 @@ class BotLikeReplayEngine(BacktestEngine):
         )
         return ctx
 
-    def _build_flow_context(self, symbol: str, data: Dict[str, pd.DataFrame], idx_15m: int) -> Optional[Dict[str, Any]]:
-        tf_15m = data["15m"]
-        current_time = tf_15m.iloc[idx_15m]["timestamp"]
+    def _build_flow_context(self, symbol: str, data: Dict[str, pd.DataFrame], idx_active: int) -> Optional[Dict[str, Any]]:
+        active_tf = self._decision_timeframe()
+        if active_tf not in data:
+            active_tf = "15m"
+        tf_active = data[active_tf]
+        current_time = tf_active.iloc[idx_active]["timestamp"]
+        idx_15m = self._find_tf_index(data, "15m", current_time)
         idx_1h = self._find_tf_index(data, "1h", current_time)
         idx_4h = self._find_tf_index(data, "4h", current_time)
-        if idx_1h < self.MIN_HIGHER_TF_INDEX or idx_4h < self.MIN_HIGHER_TF_INDEX:
+        if idx_15m < 0 or idx_1h < self.MIN_HIGHER_TF_INDEX or idx_4h < self.MIN_HIGHER_TF_INDEX:
             return None
-
+        tf_active_ctx = self._timeframe_context(tf_active, idx_active)
         tf15 = self._timeframe_context(data["15m"], idx_15m)
         tf1h = self._timeframe_context(data["1h"], idx_1h)
         tf4h = self._timeframe_context(data["4h"], idx_4h)
@@ -261,8 +271,10 @@ class BotLikeReplayEngine(BacktestEngine):
                 "1h": tf1h,
                 "4h": tf4h,
             },
-            "active_timeframe": "15m",
+            "active_timeframe": active_tf,
         }
+        if active_tf != "15m":
+            flow_context["timeframes"][active_tf] = tf_active_ctx
 
         for key in (
             "cvd_ratio",
@@ -275,7 +287,7 @@ class BotLikeReplayEngine(BacktestEngine):
             "liquidity_delta_norm",
             "signal_strength",
         ):
-            flow_context[key] = self._safe_optional_float(tf15.get(key))
+            flow_context[key] = self._safe_optional_float(tf_active_ctx.get(key, tf15.get(key)))
 
         missing_fields = [
             field_name
@@ -310,28 +322,31 @@ class BotLikeReplayEngine(BacktestEngine):
 
         return flow_context
 
-    def _build_analysis(self, symbol: str, data: Dict[str, pd.DataFrame], idx_15m: int) -> Optional[Dict[str, Any]]:
-        analysis, _ = self._build_analysis_with_status(symbol, data, idx_15m)
+    def _build_analysis(self, symbol: str, data: Dict[str, pd.DataFrame], idx_active: int) -> Optional[Dict[str, Any]]:
+        analysis, _ = self._build_analysis_with_status(symbol, data, idx_active)
         return analysis
 
     def _build_analysis_with_status(
         self,
         symbol: str,
         data: Dict[str, pd.DataFrame],
-        idx_15m: int,
+        idx_active: int,
     ) -> tuple[Optional[Dict[str, Any]], str]:
-        if idx_15m < self.MIN_15M_WARMUP_BARS:
-            return None, "warmup_15m"
-        flow_context = self._build_flow_context(symbol, data, idx_15m)
+        active_tf = self._decision_timeframe()
+        if active_tf not in data:
+            active_tf = "15m"
+        if idx_active < self.MIN_15M_WARMUP_BARS:
+            return None, f"warmup_{active_tf}"
+        flow_context = self._build_flow_context(symbol, data, idx_active)
         if flow_context is None:
             return None, "missing_flow_context"
-        row_15m = data["15m"].iloc[idx_15m]
+        row_active = data[active_tf].iloc[idx_active]
         return (
             {
                 "symbol": symbol,
-                "time": row_15m["timestamp"],
-                "price": self._safe_float(row_15m.get("close"), 0.0),
-                "row_15m": row_15m,
+                "time": row_active["timestamp"],
+                "price": self._safe_float(row_active.get("close"), 0.0),
+                "row_15m": row_active,
                 "flow_context": flow_context,
             },
             "ready",
@@ -1621,15 +1636,17 @@ class BotLikeReplayEngine(BacktestEngine):
 
         timeline: set[int] = set()
         idx_maps: Dict[str, Dict[int, int]] = {}
+        active_tf = self._decision_timeframe()
         for symbol, data in market_data_map.items():
-            tf_15m = data["15m"]
-            ts_values = [self._timestamp_key(ts) for ts in tf_15m["timestamp"].tolist()]
+            symbol_tf = active_tf if active_tf in data else "15m"
+            tf_active = data[symbol_tf]
+            ts_values = [self._timestamp_key(ts) for ts in tf_active["timestamp"].tolist()]
             idx_maps[symbol] = {ts: idx for idx, ts in enumerate(ts_values)}
             timeline.update(ts_values)
-            print(f"  Bot-like回放 {symbol}: {len(tf_15m)} 根15M K线")
+            print(f"  Bot-like回放 {symbol}: {len(tf_active)} 根{symbol_tf} K线")
 
         ordered_timeline = sorted(timeline)
-        print(f"\n统一时间轴 Bot-like 回放: {len(ordered_timeline)} 个15M时间点")
+        print(f"\n统一时间轴 Bot-like 回放: {len(ordered_timeline)} 个{active_tf}时间点")
 
         signals_generated = 0
         open_candidates_seen = 0
@@ -1644,15 +1661,18 @@ class BotLikeReplayEngine(BacktestEngine):
         replay_micro_proxy_samples = 0
         replay_spread_missing_samples = 0
         funnel = self._ensure_signal_funnel()
+        config = getattr(self, "config", None)
+        window_start_iso = getattr(config, "window_start_iso", "")
+        window_end_iso = getattr(config, "window_end_iso", "")
 
         for current_ts in ordered_timeline:
             analyses: Dict[str, Dict[str, Any]] = {}
             for symbol, data in market_data_map.items():
-                idx_15m = idx_maps[symbol].get(current_ts)
-                if idx_15m is None:
+                idx_active = idx_maps[symbol].get(current_ts)
+                if idx_active is None:
                     continue
                 analysis_attempts += 1
-                analysis, analysis_status = self._build_analysis_with_status(symbol, data, idx_15m)
+                analysis, analysis_status = self._build_analysis_with_status(symbol, data, idx_active)
                 if analysis is None:
                     analysis_skipped[analysis_status] += 1
                     continue
@@ -1674,6 +1694,14 @@ class BotLikeReplayEngine(BacktestEngine):
                             replay_micro_proxy_fields[str(field_name)] += 1
                     if "spread_bps" in missing_fields:
                         replay_spread_missing_samples += 1
+
+            current_time = pd.Timestamp(current_ts)
+            if not timestamp_in_trade_window(
+                current_time,
+                trade_window_start_iso=window_start_iso,
+                trade_window_end_iso=window_end_iso,
+            ):
+                continue
 
             for symbol in list(self.positions.keys()):
                 analysis = analyses.get(symbol)
@@ -1850,7 +1878,9 @@ def run_backtest(
     print("Bot-Like Fund Flow Replay")
     print("=" * 70)
     print(f"config_path: {config_path}")
-    print(f"time_window: {start_time or '(open)'} -> {end_time or '(open)'}")
+    print(f"trade_window: {config.window_start_iso or '(open)'} -> {config.window_end_iso or '(open)'}")
+    print(f"data_window: {config.data_window_start_iso or '(open)'} -> {config.data_window_end_iso or '(open)'}")
+    print(f"warmup_hours: {config.warmup_hours}")
     print(f"symbols: {len(config.symbols)}")
     print(f"max_positions: {config.max_positions}")
 
@@ -1860,7 +1890,12 @@ def run_backtest(
     missing_symbols: List[str] = []
 
     for symbol in config.symbols:
-        data = load_symbol_data(config.data_dir, symbol, strategy_config)
+        data = load_symbol_data(
+            config.data_dir,
+            symbol,
+            strategy_config,
+            decision_timeframe=config.decision_timeframe,
+        )
         if data:
             available_symbols.append(symbol)
             market_data_map[symbol] = data
@@ -1868,11 +1903,13 @@ def run_backtest(
             missing_symbols.append(symbol)
 
     dropped_by_window: List[str] = []
-    if market_data_map and (start_time or end_time):
-        market_data_map, dropped_by_window = filter_market_data_by_time_range(
+    data_window_start = config.data_window_start_iso or start_time
+    data_window_end = config.data_window_end_iso or end_time
+    if market_data_map and (data_window_start or data_window_end):
+        market_data_map, dropped_by_window = apply_market_data_window(
             market_data_map,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=data_window_start,
+            end_time=data_window_end,
         )
         available_symbols = list(market_data_map.keys())
         if dropped_by_window:

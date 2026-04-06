@@ -508,6 +508,53 @@ def test_build_analysis_with_status_reports_15m_warmup_block():
     assert status == "warmup_15m"
 
 
+def test_build_analysis_with_status_uses_5m_decision_timeframe():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.config = SimpleNamespace(decision_timeframe="5m")
+    engine.replay_microstructure_enabled = False
+    engine.replay_microstructure_mode = "historical_proxy"
+    engine._safe_float = lambda value, default=0.0: BotLikeReplayEngine._safe_float(value, default)
+    engine._safe_optional_float = lambda value: BotLikeReplayEngine._safe_optional_float(value)
+    data = {
+        "5m": pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-04-01 04:00:00", periods=60, freq="5min"),
+                "open": [100.0] * 60,
+                "high": [101.0] * 60,
+                "low": [99.0] * 60,
+                "close": [100.5] * 60,
+                "atr": [0.5] * 60,
+                "ema21": [100.2] * 60,
+                "ema55": [100.0] * 60,
+                "macd_hist": [0.1] * 60,
+            }
+        ),
+        "15m": pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-04-01 00:00:00", periods=30, freq="15min"),
+                "open": [100.0] * 30,
+                "high": [101.0] * 30,
+                "low": [99.0] * 30,
+                "close": [100.5] * 30,
+                "atr": [0.5] * 30,
+                "ema21": [100.2] * 30,
+                "ema55": [100.0] * 30,
+                "macd_hist": [0.1] * 30,
+            }
+        ),
+        "1h": pd.DataFrame({"timestamp": pd.date_range("2026-04-01 00:00:00", periods=20, freq="1h"), "open": [100.0] * 20, "high": [101.0] * 20, "low": [99.0] * 20, "close": [100.5] * 20, "atr": [0.5] * 20, "ema21": [100.2] * 20, "ema55": [100.0] * 20, "macd_hist": [0.1] * 20}),
+        "4h": pd.DataFrame({"timestamp": pd.date_range("2026-03-31 00:00:00", periods=20, freq="4h"), "open": [100.0] * 20, "high": [101.0] * 20, "low": [99.0] * 20, "close": [100.5] * 20, "atr": [0.5] * 20, "ema21": [100.2] * 20, "ema55": [100.0] * 20, "macd_hist": [0.1] * 20}),
+    }
+
+    analysis, status = engine._build_analysis_with_status("BTCUSDT", data, 55)
+
+    assert status == "ready"
+    assert analysis is not None
+    assert analysis["flow_context"]["active_timeframe"] == "5m"
+    assert analysis["time"] == data["5m"].iloc[55]["timestamp"]
+    assert analysis["row_15m"]["timestamp"] == data["5m"].iloc[55]["timestamp"]
+
+
 def test_run_backtest_reports_early_analysis_skip_counters():
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
     engine.positions = {}
@@ -528,6 +575,29 @@ def test_run_backtest_reports_early_analysis_skip_counters():
     assert result["analysis_ready"] == 0
     assert result["analysis_skipped"]["warmup_15m"] == 3
     assert result["decision_counts"] == {}
+
+
+def test_run_backtest_uses_5m_timeline_when_configured():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.config = SimpleNamespace(window_start_iso="", window_end_iso="", decision_timeframe="5m")
+    engine.positions = {}
+    engine.ai_advice_logs = []
+    engine._last_price_map = {}
+    engine._timestamp_key = lambda ts: int(pd.Timestamp(ts).timestamp())
+    engine._record_equity_snapshot = lambda *args, **kwargs: None
+    engine._finalize_drawdown_recovery = lambda: None
+    engine.signal_funnel = None
+    engine._build_analysis_with_status = lambda symbol, data, idx: (None, "warmup_5m")
+
+    tf_5m = pd.DataFrame({"timestamp": pd.date_range("2026-04-01 04:00:00", periods=5, freq="5min")})
+    tf_15m = pd.DataFrame({"timestamp": pd.date_range("2026-04-01 04:00:00", periods=2, freq="15min")})
+    market_data_map = {"BTCUSDT": {"5m": tf_5m, "15m": tf_15m, "1h": tf_15m.copy(), "4h": tf_15m.copy()}}
+
+    result = engine.run_backtest(market_data_map)
+
+    assert result["timeline_points"] == 5
+    assert result["analysis_attempts"] == 5
+    assert result["analysis_skipped"]["warmup_5m"] == 5
 
 
 def test_bot_like_replay_decide_annotates_replay_microstructure_downgrade():

@@ -99,7 +99,7 @@ entry_hard_gate_block:      0 次   ← 不是问题
 ### 诊断脚本（Codex 必须先跑这个，再动参数）
 
 ```python
-# scripts/diagnose_vwap_hard_block.py
+# scripts/diagnostics/diagnose_vwap_layers.py
 # 输出：触发 vwap_hard_block 时的 vwap_score 分布
 
 import json

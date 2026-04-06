@@ -111,6 +111,19 @@ def test_trading_symbols_respect_symbol_blacklist() -> None:
     assert ConfigLoader.get_trading_symbols(runtime_cfg) == ["BTCUSDT", "ETHUSDT"]
 
 
+def test_trading_symbols_merge_trading_and_fund_flow_blacklists() -> None:
+    runtime_cfg = {
+        "trading": {
+            "symbols": ["BTCUSDT", "QNTUSDT", "ETHUSDT", "KASUSDT"],
+            "symbol_blacklist": ["kasusdt", "uniusdt"],
+        },
+        "fund_flow": {"symbol_blacklist": ["qntusdt", "XMRUSDT"]},
+    }
+
+    assert ConfigLoader.get_symbol_blacklist(runtime_cfg) == ["QNTUSDT", "XMRUSDT", "KASUSDT", "UNIUSDT"]
+    assert ConfigLoader.get_trading_symbols(runtime_cfg) == ["BTCUSDT", "ETHUSDT"]
+
+
 def test_apply_backtest_profile_filters_blacklisted_symbols() -> None:
     runtime_cfg = {
         "trading": {"symbols": ["BTCUSDT"]},

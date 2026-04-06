@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from src.fund_flow.decision_engine import FundFlowDecisionEngine
 from src.fund_flow.models import FundFlowDecision, Operation
 from src.fund_flow.macd_strategy_v2 import MACDSignalV2
+from scripts.backtest_macd_v2 import build_strategy_config
 
 
 def _cfg():
@@ -98,6 +99,31 @@ def test_macd_v2_engine_for_symbol_applies_trial_specific_overrides() -> None:
     assert override["disable_flip_bullish_trial"] is True
     assert local_engine.config.disable_flip_bullish_trial_entries is True
     assert local_engine.config.preflip_trial_min_signal_score == 0.90
+
+
+def test_macd_v2_config_keeps_long_whitelist_controls_in_decision_engine() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "long_entry_mode": "whitelist_only",
+            "long_whitelist_signal_types": ["green_bar_growing"],
+            "long_whitelist_vwap_states": ["long_dual_support"],
+            "long_whitelist_pockets": ["flip_bullish|long_reclaim_confirmed"],
+        }
+    }
+
+    engine = FundFlowDecisionEngine(cfg)
+    strategy_config = build_strategy_config(cfg)
+
+    assert engine.macd_v2_config.long_entry_mode == "whitelist_only"
+    assert engine.macd_v2_config.long_whitelist_signal_types == ["green_bar_growing"]
+    assert engine.macd_v2_config.long_whitelist_vwap_states == ["long_dual_support"]
+    assert engine.macd_v2_config.long_whitelist_pockets == ["flip_bullish|long_reclaim_confirmed"]
+    assert engine.macd_v2_config.long_entry_mode == strategy_config.long_entry_mode
+    assert engine.macd_v2_config.long_whitelist_signal_types == strategy_config.long_whitelist_signal_types
+    assert engine.macd_v2_config.long_whitelist_vwap_states == strategy_config.long_whitelist_vwap_states
+    assert engine.macd_v2_config.long_whitelist_pockets == strategy_config.long_whitelist_pockets
 
 
 def test_decide_hold_when_long_score_lacks_breakout_or_pullback():

@@ -1182,7 +1182,7 @@ python scripts/backtest_macd_v2.py \
 |----------|------|
 | 实盘配置 | `config/trading_config_fund_flow_live_production.json` |
 | 回测脚本 | `scripts/backtest_macd_v2.py` |
-| 对齐验证 | `scripts/validate_live_backtest_alignment.py` |
+| 对齐验证 | `scripts/diagnostics/validate_live_backtest_alignment.py` |
 | 决策引擎 | `src/fund_flow/decision_engine.py` |
 | 策略引擎 | `src/fund_flow/macd_strategy_v2.py` |
 | 风控引擎 | `src/fund_flow/risk_engine.py` |

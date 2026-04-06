@@ -61,7 +61,7 @@
   - 禁止 `1h neutral`
   - 必要时禁用 pocket trial
 - [ ] 单独核对 live/backtest 的 trailing 执行顺序与 intrabar 命中逻辑
-- [x] 将 `validate_live_backtest_alignment.py` 升级为“配置一致性 + 执行语义审计”脚本
+- [x] 将 `scripts/diagnostics/validate_live_backtest_alignment.py` 升级为“配置一致性 + 执行语义审计”脚本
 - [x] 为对齐审计补单测，覆盖 trailing / intrabar / 优先级矩阵
 - [x] 产出 live/backtest 平仓一致性 Markdown 审计报告
 - [x] 为 live 增加 `trailing_activated / breakeven_activated / protection_priority_applied` 显式事件日志

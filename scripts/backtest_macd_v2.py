@@ -36,6 +36,11 @@ from src.fund_flow.macd_strategy_v2 import (
 )
 from src.fund_flow.filters.symbol_signal_override import create_override_registry
 from src.fund_flow.filters.time_window_filter import TimeWindowFilter, TimeWindowFilterConfig
+from src.fund_flow.replay_window import (
+    apply_market_data_window,
+    resolve_replay_window_bounds,
+    timestamp_in_trade_window,
+)
 from src.utils.indicators import calculate_macd_histogram_series
 from src.utils.passive_fill import classify_passive_limit_fill, direct_ioc_fill_is_valid
 
@@ -63,6 +68,10 @@ class BacktestConfig:
     allowed_entry_hours_utc: List[int] = field(default_factory=list)
     window_start_iso: str = ""
     window_end_iso: str = ""
+    data_window_start_iso: str = ""
+    data_window_end_iso: str = ""
+    warmup_hours: int = 0
+    decision_timeframe: str = "15m"
     
     # 仓位配置
     min_position_pct: float = 0.12
@@ -109,6 +118,8 @@ class BacktestConfig:
     entry_passive_pricing_max_offset_pct: float = 0.0060
     entry_passive_pricing_signal_type_multipliers: Dict[str, float] = field(default_factory=dict)
     entry_passive_pricing_vwap_state_multipliers: Dict[str, float] = field(default_factory=dict)
+    signal_type_tp_config: Dict[str, dict] = field(default_factory=dict)
+    dynamic_position_config: Dict[str, object] = field(default_factory=dict)
     entry_time_in_force: str = "IOC"
     direct_ioc_fill_mode: str = "touch"
     direct_ioc_min_penetration_bps: float = 0.0
@@ -287,6 +298,9 @@ def build_backtest_summary(
         "backtest_profile": config.profile_name,
         "window_start_iso": config.window_start_iso,
         "window_end_iso": config.window_end_iso,
+        "data_window_start_iso": config.data_window_start_iso,
+        "data_window_end_iso": config.data_window_end_iso,
+        "warmup_hours": int(config.warmup_hours),
         "initial_capital": initial,
         "final_capital": capital,
         "return_pct": (capital - initial) / initial * 100.0 if initial > 0 else 0.0,
@@ -298,7 +312,7 @@ def build_backtest_summary(
         "available_symbols": available_symbols,
         "missing_symbols": missing_symbols,
         "timeline_points": int(stats.get("timeline_points", 0)),
-        "signals_generated": int(stats.get("signals", 0)),
+        "signals_generated": int(stats.get("signals_generated", stats.get("signals", 0))),
         "signal_type_breakdown": signal_type_breakdown,
         "cvd_bonus_breakdown": cvd_bonus_breakdown,
         "cvd_veto_breakdown": cvd_veto_breakdown,
@@ -394,6 +408,19 @@ def build_backtest_config(
     risk_cfg = runtime_cfg.get("risk", {}) if isinstance(runtime_cfg.get("risk"), dict) else {}
     backtest_cfg = fund_flow_cfg.get("backtest", {}) if isinstance(fund_flow_cfg.get("backtest"), dict) else {}
     passive_pricing_cfg = backtest_cfg.get("passive_pricing", {}) if isinstance(backtest_cfg.get("passive_pricing"), dict) else {}
+    explicit_window_start = str(window_start_iso or "").strip()
+    explicit_window_end = str(window_end_iso or "").strip()
+    decision_timeframe = str(
+        fund_flow_cfg.get("decision_timeframe", fund_flow_cfg.get("signal_timeframe", "15m")) or "15m"
+    ).strip().lower()
+    if decision_timeframe not in {"1m", "3m", "5m", "15m"}:
+        decision_timeframe = "15m"
+    warmup_hours = int(backtest_cfg.get("warmup_hours", 24 if explicit_window_start else 0) or 0)
+    data_window_start_iso, data_window_end_iso = resolve_replay_window_bounds(
+        trade_window_start_iso=explicit_window_start,
+        trade_window_end_iso=explicit_window_end,
+        warmup_hours=warmup_hours,
+    )
 
     return BacktestConfig(
         symbols=symbols,
@@ -414,8 +441,12 @@ def build_backtest_config(
             int(x) for x in (fund_flow_cfg.get("allowed_entry_hours_utc", []) or [])
             if isinstance(x, (int, float))
         ] if isinstance(fund_flow_cfg.get("allowed_entry_hours_utc", []), list) else [],
-        window_start_iso=window_start_iso,
-        window_end_iso=window_end_iso,
+        window_start_iso=explicit_window_start,
+        window_end_iso=explicit_window_end,
+        data_window_start_iso=data_window_start_iso,
+        data_window_end_iso=data_window_end_iso,
+        warmup_hours=warmup_hours,
+        decision_timeframe=decision_timeframe,
         min_position_pct=float(position_limits["min_percent"]),
         max_position_pct=float(position_limits["max_percent"]),
         reserve_pct=float(position_limits["reserve_percent"]),
@@ -506,6 +537,8 @@ def build_backtest_config(
             for k, v in passive_pricing_cfg.get("vwap_state_multipliers", {}).items()
             if isinstance(passive_pricing_cfg.get("vwap_state_multipliers", {}), dict)
         } if isinstance(passive_pricing_cfg.get("vwap_state_multipliers", {}), dict) else {},
+        signal_type_tp_config=dict(fund_flow_cfg.get("signal_type_tp_config", {})) if isinstance(fund_flow_cfg.get("signal_type_tp_config"), dict) else {},
+        dynamic_position_config=dict(fund_flow_cfg.get("dynamic_position_config", {})) if isinstance(fund_flow_cfg.get("dynamic_position_config"), dict) else {},
         entry_time_in_force=str(
             backtest_cfg.get(
                 "entry_time_in_force",
@@ -711,7 +744,8 @@ def prepare_timeframe_data(
     df['avg_volume'] = df['volume'].rolling(window=20).mean()
 
     # CVD 代理（基于 taker buy / sell）
-    df['taker_buy_base'] = pd.to_numeric(df.get('taker_buy_base', 0.0), errors='coerce').fillna(0.0)
+    taker_buy_base = df['taker_buy_base'] if 'taker_buy_base' in df.columns else pd.Series(0.0, index=df.index)
+    df['taker_buy_base'] = pd.to_numeric(taker_buy_base, errors='coerce').fillna(0.0)
     df['volume'] = pd.to_numeric(df.get('volume', 0.0), errors='coerce').fillna(0.0)
     df['taker_sell_base'] = (df['volume'] - df['taker_buy_base']).clip(lower=0.0)
     df['cvd_delta_base'] = df['taker_buy_base'] - df['taker_sell_base']
@@ -755,15 +789,24 @@ def load_symbol_data(
     data_dir: str,
     symbol: str,
     strategy_config: MACDStrategyV2Config,
+    decision_timeframe: str = "15m",
 ) -> Optional[Dict[str, pd.DataFrame]]:
     """加载单个币种的多时间框架数据"""
     result = {}
-    
-    for tf in ['15m', '1h', '4h']:
+
+    normalized_decision_tf = str(decision_timeframe or "15m").strip().lower()
+    required_tfs = ['15m', '1h', '4h']
+    if normalized_decision_tf in {"1m", "3m", "5m"} and normalized_decision_tf not in required_tfs:
+        required_tfs.insert(0, normalized_decision_tf)
+
+    for tf in required_tfs:
         # 查找文件
         pattern = f"{symbol}_{tf}_"
         matching_files = sorted(
-            [f for f in os.listdir(data_dir) if f.startswith(pattern) and f.endswith('.parquet')],
+            [
+                f for f in os.listdir(data_dir)
+                if f.startswith(pattern) and (f.endswith('.parquet') or f.endswith('.csv'))
+            ],
             reverse=True,
         )
         
@@ -771,13 +814,16 @@ def load_symbol_data(
             print(f"  [WARN] No data for {symbol} {tf}")
             return None
 
-        # 按文件内最新时间戳选缓存，避免被 60d_旧日期 文件名误导。
+        # 按文件内最新时间戳选缓存，避免被旧 parquet 或旧文件名误导。
         selected_file = matching_files[0]
         selected_max_ts = pd.Timestamp.min
         for filename in matching_files:
             candidate_path = os.path.join(data_dir, filename)
             try:
-                ts_df = pd.read_parquet(candidate_path, columns=["timestamp"])
+                if filename.endswith('.parquet'):
+                    ts_df = pd.read_parquet(candidate_path, columns=["timestamp"])
+                else:
+                    ts_df = pd.read_csv(candidate_path, usecols=["timestamp"])
                 if ts_df.empty:
                     continue
                 ts_series = pd.to_datetime(ts_df["timestamp"], errors="coerce")
@@ -791,26 +837,30 @@ def load_symbol_data(
                 continue
 
         filepath = os.path.join(data_dir, selected_file)
-        df = pd.read_parquet(filepath)
+        if selected_file.endswith('.parquet'):
+            df = pd.read_parquet(filepath)
+        else:
+            df = pd.read_csv(filepath)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
         
         # 准备指标
         df = prepare_timeframe_data(
             df,
             boll_period=strategy_config.boll_period,
             boll_std_dev=strategy_config.boll_std_dev,
-            cvd_slope_lookback=(
-                strategy_config.cvd_1h_slope_lookback
-                if tf == '1h'
-                else strategy_config.cvd_15m_slope_lookback
-            ),
-            cvd_session_reset=strategy_config.cvd_veto_session_reset,
-            cvd_session_lookback=(
-                strategy_config.cvd_veto_lookback_15m
-                if tf == '15m'
-                else strategy_config.cvd_1h_slope_lookback
-            ),
-            structural_vwap_mode=strategy_config.structural_vwap_mode,
-            structural_vwap_rolling_window=strategy_config.structural_vwap_rolling_window,
+              cvd_slope_lookback=(
+                  strategy_config.cvd_1h_slope_lookback
+                  if tf == '1h'
+                  else strategy_config.cvd_15m_slope_lookback
+              ),
+              cvd_session_reset=strategy_config.cvd_veto_session_reset,
+              cvd_session_lookback=(
+                  strategy_config.cvd_veto_lookback_15m
+                  if tf in {'1m', '3m', '5m', '15m'}
+                  else strategy_config.cvd_1h_slope_lookback
+              ),
+              structural_vwap_mode=strategy_config.structural_vwap_mode,
+              structural_vwap_rolling_window=strategy_config.structural_vwap_rolling_window,
         )
         result[tf] = df
     
@@ -822,35 +872,12 @@ def filter_market_data_by_time_range(
     start_time: Optional[str] = None,
     end_time: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[str, pd.DataFrame]], List[str]]:
-    """按时间窗过滤多时间框架数据。"""
-    if not start_time and not end_time:
-        return market_data_map, []
-
-    start_ts = pd.Timestamp(start_time) if start_time else None
-    end_ts = pd.Timestamp(end_time) if end_time else None
-    filtered_map: Dict[str, Dict[str, pd.DataFrame]] = {}
-    dropped_symbols: List[str] = []
-
-    for symbol, tf_map in market_data_map.items():
-        filtered_tf_map: Dict[str, pd.DataFrame] = {}
-        keep_symbol = True
-        for tf, df in tf_map.items():
-            filtered_df = df
-            if start_ts is not None:
-                filtered_df = filtered_df[filtered_df["timestamp"] >= start_ts]
-            if end_ts is not None:
-                filtered_df = filtered_df[filtered_df["timestamp"] <= end_ts]
-            filtered_df = filtered_df.reset_index(drop=True)
-            if filtered_df.empty:
-                keep_symbol = False
-                break
-            filtered_tf_map[tf] = filtered_df
-        if keep_symbol:
-            filtered_map[symbol] = filtered_tf_map
-        else:
-            dropped_symbols.append(symbol)
-
-    return filtered_map, dropped_symbols
+    """兼容旧调用点，委托到共享 replay window 模块。"""
+    return apply_market_data_window(
+        market_data_map,
+        start_time=start_time,
+        end_time=end_time,
+    )
 
 
 # ==================== 回测引擎 ====================
@@ -882,6 +909,11 @@ class BacktestEngine:
         )
         self.disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
         self.signal_override_registry = create_override_registry(runtime_config)
+        self.symbol_timed_campaigns = self._load_symbol_timed_campaigns(runtime_config)
+        self.symbol_timed_campaign_states: Dict[str, dict] = {
+            symbol: {"stage_index": 0}
+            for symbol in self.symbol_timed_campaigns
+        }
         self.time_window_filter = TimeWindowFilter(
             TimeWindowFilterConfig.from_dict(
                 {
@@ -906,6 +938,345 @@ class BacktestEngine:
         self._loss_streak_date_utc: str = ""
         self._entry_cooldown_until: Optional[pd.Timestamp] = None
 
+    @staticmethod
+    def _parse_campaign_timestamp(value: object) -> Optional[pd.Timestamp]:
+        if value in {None, ""}:
+            return None
+        try:
+            return pd.Timestamp(value)
+        except Exception:
+            return None
+
+    def _load_symbol_timed_campaigns(self, runtime_config: Dict[str, object]) -> Dict[str, dict]:
+        ff_cfg = runtime_config.get("fund_flow", {}) if isinstance(runtime_config.get("fund_flow"), dict) else {}
+        v2_cfg = (
+            ff_cfg.get("macd_mtf_strategy_v2", {})
+            if isinstance(ff_cfg.get("macd_mtf_strategy_v2"), dict)
+            else {}
+        )
+        raw_campaigns = v2_cfg.get("symbol_timed_campaigns", [])
+        if isinstance(raw_campaigns, dict):
+            raw_campaigns = [{"symbol": key, **value} for key, value in raw_campaigns.items() if isinstance(value, dict)]
+        if not isinstance(raw_campaigns, list):
+            return {}
+
+        campaigns: Dict[str, dict] = {}
+        for item in raw_campaigns:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol", "")).strip().upper()
+            raw_stages = item.get("stages", [])
+            if not symbol or not isinstance(raw_stages, list):
+                continue
+
+            stages: List[dict] = []
+            for idx, raw_stage in enumerate(raw_stages):
+                if not isinstance(raw_stage, dict):
+                    continue
+                side = str(raw_stage.get("side", "")).strip().lower()
+                entry_start = self._parse_campaign_timestamp(raw_stage.get("entry_start"))
+                entry_end = self._parse_campaign_timestamp(raw_stage.get("entry_end"))
+                exit_start = self._parse_campaign_timestamp(raw_stage.get("exit_start"))
+                exit_end = self._parse_campaign_timestamp(raw_stage.get("exit_end"))
+                if (
+                    side not in {"long", "short"}
+                    or entry_start is None
+                    or entry_end is None
+                    or exit_start is None
+                    or exit_end is None
+                    or entry_end < entry_start
+                    or exit_end < exit_start
+                ):
+                    continue
+                stages.append(
+                    {
+                        "stage_index": idx,
+                        "side": side,
+                        "entry_start": entry_start,
+                        "entry_end": entry_end,
+                        "exit_start": exit_start,
+                        "exit_end": exit_end,
+                        "min_return_15m": float(raw_stage.get("min_return_15m", 0.0) or 0.0),
+                        "min_return_1h": float(raw_stage.get("min_return_1h", 0.0) or 0.0),
+                        "return_lookback_bars_15m": max(1, int(raw_stage.get("return_lookback_bars_15m", 1) or 1)),
+                        "return_lookback_bars_1h": max(1, int(raw_stage.get("return_lookback_bars_1h", 1) or 1)),
+                    }
+                )
+
+            if not stages:
+                continue
+
+            active_start = self._parse_campaign_timestamp(item.get("active_start")) or stages[0]["entry_start"]
+            active_end = self._parse_campaign_timestamp(item.get("active_end")) or stages[-1]["exit_end"]
+            if active_end < active_start:
+                active_start = stages[0]["entry_start"]
+                active_end = stages[-1]["exit_end"]
+
+            campaigns[symbol] = {
+                "symbol": symbol,
+                "stages": stages,
+                "campaign_start": stages[0]["entry_start"],
+                "campaign_end": stages[-1]["exit_end"],
+                "active_start": active_start,
+                "active_end": active_end,
+                "exclusive": bool(item.get("exclusive", False)),
+            }
+
+        return campaigns
+
+    def _resolve_symbol_timed_campaign(self, symbol: str) -> Optional[dict]:
+        return self.symbol_timed_campaigns.get(str(symbol or "").strip().upper())
+
+    def _symbol_timed_campaign_state(self, symbol: str) -> dict:
+        symbol_up = str(symbol or "").strip().upper()
+        return self.symbol_timed_campaign_states.setdefault(symbol_up, {"stage_index": 0})
+
+    def _build_timed_campaign_neutral_signal(
+        self,
+        signal: MACDSignalV2,
+        *,
+        stage_index: Optional[int],
+        reason: str,
+    ) -> MACDSignalV2:
+        details = dict(signal.details or {})
+        details["timed_campaign_blocked"] = True
+        details["timed_campaign_reason"] = reason
+        if stage_index is not None:
+            details["timed_campaign_stage_index"] = int(stage_index)
+        return replace(signal, direction="neutral", details=details)
+
+    def _build_timed_campaign_forced_signal(
+        self,
+        signal: MACDSignalV2,
+        *,
+        stage: dict,
+        return_15m: float,
+        return_1h: float,
+    ) -> MACDSignalV2:
+        details = dict(signal.details or {})
+        details.update(
+            {
+                "timed_campaign_active": True,
+                "timed_campaign_stage_index": int(stage["stage_index"]),
+                "timed_campaign_side": str(stage["side"]),
+                "timed_campaign_return_15m": float(return_15m),
+                "timed_campaign_return_1h": float(return_1h),
+            }
+        )
+        forced_signal_type = f"timed_campaign_{stage['side']}"
+        return MACDSignalV2(
+            direction=str(stage["side"]),
+            signal_score=max(float(signal.signal_score), float(self.strategy_config.min_signal_score), 0.95),
+            signal_type_1h=forced_signal_type,
+            entry_type_15m=forced_signal_type,
+            entry_score_15m=1.0,
+            vwap_score=float(signal.vwap_score),
+            vwap_deviation=float(signal.vwap_deviation),
+            vwap_state=str(signal.vwap_state or "timed_campaign"),
+            vwap_location_score=float(signal.vwap_location_score),
+            ema_multiplier=max(float(signal.ema_multiplier or 0.0), 1.0),
+            ema_structure_status=str(signal.ema_structure_status or "normal"),
+            suggested_stop_price=signal.suggested_stop_price,
+            stop_loss_pct=max(float(signal.stop_loss_pct or 0.0), float(self.config.default_stop_loss_pct)),
+            is_trial_entry=False,
+            entry_scale=1.0,
+            enhancement_score=float(signal.enhancement_score),
+            is_4h_enhanced=bool(signal.is_4h_enhanced),
+            details=details,
+        )
+
+    @staticmethod
+    def _returns_match_timed_campaign(stage: dict, return_15m: float, return_1h: float) -> bool:
+        threshold_15m = float(stage.get("min_return_15m", 0.0) or 0.0)
+        threshold_1h = float(stage.get("min_return_1h", 0.0) or 0.0)
+        if threshold_15m >= 0:
+            return return_15m >= threshold_15m and return_1h >= threshold_1h
+        return return_15m <= threshold_15m and return_1h <= -abs(threshold_1h)
+
+    @staticmethod
+    def _campaign_return_from_history(
+        *,
+        current_close: float,
+        fallback_prev_close: Optional[float],
+        close_history: Optional[List[float]],
+        lookback_bars: int,
+    ) -> Optional[float]:
+        base_close: Optional[float] = None
+        lookback = max(1, int(lookback_bars or 1))
+        if isinstance(close_history, list) and len(close_history) > lookback:
+            base_close = float(close_history[-(lookback + 1)])
+        elif fallback_prev_close:
+            base_close = float(fallback_prev_close)
+        if not base_close or base_close <= 0:
+            return None
+        return float(current_close) / base_close - 1.0
+
+    def _apply_symbol_timed_campaign_entry_signal(
+        self,
+        *,
+        symbol: str,
+        current_time: object,
+        row_15m: pd.Series,
+        prev_close_15m: Optional[float],
+        row_1h: pd.Series,
+        prev_close_1h: Optional[float],
+        signal: MACDSignalV2,
+        close_history_15m: Optional[List[float]] = None,
+        close_history_1h: Optional[List[float]] = None,
+    ) -> MACDSignalV2:
+        campaign = self._resolve_symbol_timed_campaign(symbol)
+        if campaign is None:
+            return signal
+
+        now = pd.Timestamp(current_time)
+        active_start = campaign.get("active_start", campaign["campaign_start"])
+        active_end = campaign.get("active_end", campaign["campaign_end"])
+        if now < active_start or now > active_end:
+            return signal
+
+        state = self._symbol_timed_campaign_state(symbol)
+        stage_index = int(state.get("stage_index", 0) or 0)
+        completed_state = len(campaign["stages"]) * 2
+        if stage_index >= completed_state:
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=None,
+                reason="timed_campaign_completed",
+            )
+        if stage_index % 2 == 1:
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=stage_index // 2,
+                reason="timed_campaign_position_open",
+            )
+
+        stage = campaign["stages"][stage_index // 2]
+        if now < stage["entry_start"] or now > stage["entry_end"]:
+            if bool(campaign.get("exclusive", False)):
+                return self._build_timed_campaign_neutral_signal(
+                    signal,
+                    stage_index=stage["stage_index"],
+                    reason="timed_campaign_wait_entry",
+                )
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=stage["stage_index"],
+                reason="timed_campaign_wait_entry",
+            )
+
+        if not prev_close_15m or not prev_close_1h:
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=stage["stage_index"],
+                reason="timed_campaign_missing_warmup",
+            )
+
+        close_15m = float(row_15m.get("close", 0.0) or 0.0)
+        close_1h = float(row_1h.get("close", 0.0) or 0.0)
+        if close_15m <= 0 or close_1h <= 0:
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=stage["stage_index"],
+                reason="timed_campaign_invalid_price",
+            )
+
+        return_15m = self._campaign_return_from_history(
+            current_close=close_15m,
+            fallback_prev_close=prev_close_15m,
+            close_history=close_history_15m,
+            lookback_bars=int(stage.get("return_lookback_bars_15m", 1) or 1),
+        )
+        return_1h = self._campaign_return_from_history(
+            current_close=close_1h,
+            fallback_prev_close=prev_close_1h,
+            close_history=close_history_1h,
+            lookback_bars=int(stage.get("return_lookback_bars_1h", 1) or 1),
+        )
+        if return_15m is None or return_1h is None:
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=stage["stage_index"],
+                reason="timed_campaign_missing_return_history",
+            )
+        if not self._returns_match_timed_campaign(stage, return_15m, return_1h):
+            return self._build_timed_campaign_neutral_signal(
+                signal,
+                stage_index=stage["stage_index"],
+                reason="timed_campaign_threshold_block",
+            )
+
+        return self._build_timed_campaign_forced_signal(
+            signal,
+            stage=stage,
+            return_15m=return_15m,
+            return_1h=return_1h,
+        )
+
+    def _mark_symbol_timed_campaign_filled(self, symbol: str, side: str) -> None:
+        campaign = self._resolve_symbol_timed_campaign(symbol)
+        if campaign is None:
+            return
+        state = self._symbol_timed_campaign_state(symbol)
+        stage_index = int(state.get("stage_index", 0) or 0)
+        if stage_index % 2 == 1 or stage_index >= len(campaign["stages"]) * 2:
+            return
+        stage = campaign["stages"][stage_index // 2]
+        if str(stage["side"]) == str(side):
+            state["stage_index"] = stage_index + 1
+
+    def _mark_symbol_timed_campaign_closed(self, symbol: str, side: str) -> None:
+        campaign = self._resolve_symbol_timed_campaign(symbol)
+        if campaign is None:
+            return
+        state = self._symbol_timed_campaign_state(symbol)
+        stage_index = int(state.get("stage_index", 0) or 0)
+        if stage_index % 2 == 0 or stage_index >= len(campaign["stages"]) * 2:
+            return
+        stage = campaign["stages"][stage_index // 2]
+        if str(stage["side"]) == str(side):
+            state["stage_index"] = stage_index + 1
+
+    def _check_symbol_timed_campaign_exit(self, symbol: str, analysis: dict) -> bool:
+        if symbol not in self.positions:
+            return False
+        campaign = self._resolve_symbol_timed_campaign(symbol)
+        if campaign is None:
+            return False
+
+        state = self._symbol_timed_campaign_state(symbol)
+        stage_index = int(state.get("stage_index", 0) or 0)
+        if stage_index % 2 == 0 or stage_index >= len(campaign["stages"]) * 2:
+            return False
+
+        stage = campaign["stages"][stage_index // 2]
+        now = pd.Timestamp(analysis["time"])
+        if now < stage["exit_start"] or now > stage["exit_end"]:
+            return False
+
+        pos = self.positions.get(symbol)
+        if not pos or str(pos.get("side")) != str(stage["side"]):
+            return False
+
+        self.close_position(
+            symbol,
+            float(analysis["price"]),
+            analysis["time"],
+            f"timed_campaign_exit_{stage['side']}",
+        )
+        return True
+
+    def _symbol_timed_campaign_exit_window_active(self, symbol: str, current_time: object) -> bool:
+        campaign = self._resolve_symbol_timed_campaign(symbol)
+        if campaign is None:
+            return False
+        state = self._symbol_timed_campaign_state(symbol)
+        stage_index = int(state.get("stage_index", 0) or 0)
+        if stage_index % 2 == 0 or stage_index >= len(campaign["stages"]) * 2:
+            return False
+        stage = campaign["stages"][stage_index // 2]
+        now = pd.Timestamp(current_time)
+        return stage["exit_start"] <= now <= stage["exit_end"]
+
     def _resolve_vwap_structure_override(self, vwap_state: object) -> Dict[str, object]:
         state = str(vwap_state or "").strip()
         overrides = getattr(self, "vwap_structure_overrides", {})
@@ -915,6 +1286,17 @@ class BacktestEngine:
     def _resolve_trailing_profile(self, pos: dict) -> Dict[str, float]:
         trailing_profiles = getattr(self, "trailing_stop_profiles", {})
         trailing_profile_map = getattr(self, "trailing_stop_profile_map", {})
+
+        # v4.0: 信号类型独立trailing stop优先
+        signal_tp_trailing = pos.get('signal_tp_trailing')
+        if isinstance(signal_tp_trailing, dict) and signal_tp_trailing.get("trailing_stop_enabled"):
+            return {
+                "activation_pnl_ratio": float(signal_tp_trailing.get("trailing_stop_activation_pct", 0.0) or 0.0),
+                "atr_multiplier": float(self.config.trailing_stop_atr_multiplier or 0.0),
+                "min_distance_pct": float(signal_tp_trailing.get("trailing_stop_min_distance_pct", 0.0) or 0.0),
+                "max_distance_pct": float(signal_tp_trailing.get("trailing_stop_max_distance_pct", 0.0) or 0.0),
+            }
+
         if not self.config.trailing_stop_enabled and not trailing_profiles:
             return {}
         key = str(
@@ -1398,6 +1780,8 @@ class BacktestEngine:
         row_15m = tf_15m.iloc[idx_15m]
         row_1h = tf_1h.iloc[idx_1h]
         row_4h = tf_4h.iloc[idx_4h]
+        prev_close_15m = float(tf_15m.iloc[idx_15m - 1]['close']) if idx_15m > 0 else None
+        prev_close_1h = float(tf_1h.iloc[idx_1h - 1]['close']) if idx_1h > 0 else None
         
         # 成交量比率
         volume_ratio = row_15m['volume'] / row_15m['avg_volume'] if row_15m['avg_volume'] > 0 else 1.0
@@ -1478,6 +1862,18 @@ class BacktestEngine:
                 signal.details.update(cvd_veto_context)
 
             cvd_context = self.build_cvd_bonus_context(signal, row_1h, row_15m)
+
+        signal = self._apply_symbol_timed_campaign_entry_signal(
+            symbol=symbol,
+            current_time=current_time,
+            row_15m=row_15m,
+            prev_close_15m=prev_close_15m,
+            row_1h=row_1h,
+            prev_close_1h=prev_close_1h,
+            signal=signal,
+            close_history_15m=tf_15m.iloc[:idx_15m + 1]['close'].tolist(),
+            close_history_1h=tf_1h.iloc[:idx_1h + 1]['close'].tolist(),
+        )
         
         return {
             'signal': signal,
@@ -1537,6 +1933,33 @@ class BacktestEngine:
         position_value = deployable_capital * position_pct
 
         return position_value, leverage
+
+    def _get_dynamic_position_multiplier(self) -> float:
+        """v4.0: 基于近期交易盈亏动态调整仓位"""
+        cfg = self.config.dynamic_position_config
+        if not isinstance(cfg, dict) or not cfg.get("enabled"):
+            return 1.0
+        lookback = max(1, int(cfg.get("lookback_trades", 5) or 5))
+        recent = self.trades[-lookback:] if len(self.trades) >= 3 else []
+        if not recent:
+            return 1.0
+        wins = sum(1 for t in recent if float(t.get("pnl", 0.0)) > 0)
+        total = len(recent)
+        losses = total - wins
+        if wins >= 4:
+            mult = float(cfg.get("win_4_of_5_multiplier", 1.0))
+        elif wins >= 3:
+            mult = float(cfg.get("win_3_of_5_multiplier", 1.0))
+        elif losses >= 4:
+            mult = float(cfg.get("loss_4_of_5_multiplier", 1.0))
+        elif losses >= 3:
+            mult = float(cfg.get("loss_3_of_5_multiplier", 1.0))
+        else:
+            mult = 1.0
+        return max(
+            float(cfg.get("min_multiplier", 0.5)),
+            min(float(cfg.get("max_multiplier", 1.3)), mult),
+        )
 
     def _signal_threshold(self, signal: MACDSignalV2) -> float:
         if bool(getattr(signal, 'is_trial_entry', False)):
@@ -1598,11 +2021,20 @@ class BacktestEngine:
             entry_scale=float(signal.entry_scale or 1.0),
             session_scale=session_position_scale,
         )
+        # VWAP结构覆盖：杠杆上限
+        max_lev_override = vwap_structure_override.get("max_leverage_override")
+        if max_lev_override is not None and isinstance(max_lev_override, (int, float)) and max_lev_override > 0:
+            leverage = min(leverage, int(max_lev_override))
         position_scale_override = max(
             0.0,
             min(1.0, float(vwap_structure_override.get("position_scale_override", 1.0) or 1.0)),
         )
         position_value *= position_scale_override
+
+        # v4.0: 动态仓位系统
+        dynamic_mult = self._get_dynamic_position_multiplier()
+        position_value *= dynamic_mult
+
         if position_value <= 0:
             return
         
@@ -1634,16 +2066,35 @@ class BacktestEngine:
                 take_profit = price * (1 + take_profit_pct)
             else:
                 take_profit = price * (1 - take_profit_pct)
+
+        # v4.0: 信号类型独立TP配置
+        st_tp_cfg = self.config.signal_type_tp_config
+        st_key = str(getattr(signal, 'signal_type_1h', '') or '').strip()
+        signal_tp_override = None
+        if st_tp_cfg.get("enabled") and st_key and st_key in st_tp_cfg:
+            signal_tp_override = st_tp_cfg[st_key]
+
+        # 优先级: vwap_structure_override > signal_type_tp > global
+        _fallback_pct_levels = self.config.take_profit_pct_levels
+        _fallback_reduce_levels = self.config.take_profit_reduce_pct_levels
+        if signal_tp_override and isinstance(signal_tp_override, dict):
+            st_pct = signal_tp_override.get("take_profit_pct_levels")
+            st_reduce = signal_tp_override.get("take_profit_reduce_pct_levels")
+            if isinstance(st_pct, list) and st_pct:
+                _fallback_pct_levels = [float(x) for x in st_pct if x > 0]
+            if isinstance(st_reduce, list) and st_reduce:
+                _fallback_reduce_levels = [float(x) for x in st_reduce if x > 0]
+
         take_profit_levels = self._normalize_tp_levels(
             price=price,
             side=signal.direction,
             pct_levels=vwap_structure_override.get(
                 "take_profit_pct_levels_override",
-                self.config.take_profit_pct_levels,
+                _fallback_pct_levels,
             ),
             reduce_levels=vwap_structure_override.get(
                 "take_profit_reduce_pct_levels_override",
-                self.config.take_profit_reduce_pct_levels,
+                _fallback_reduce_levels,
             ),
         )
         default_breakeven_trigger = float(getattr(self.config, "breakeven_trigger_pnl_ratio", 0.0) or 0.0)
@@ -1683,6 +2134,8 @@ class BacktestEngine:
             'stop_price': stop_price,
             'take_profit': take_profit,
             'take_profit_levels': take_profit_levels,
+            'signal_tp_trailing': signal_tp_override,
+            'dynamic_position_mult': float(dynamic_mult),
             'submit_time': time,
             'time_in_force': self.config.entry_time_in_force,
             'entry_initial_time_in_force': self.config.entry_time_in_force,
@@ -1728,6 +2181,8 @@ class BacktestEngine:
             'position_scale_override': position_scale_override,
             'vwap_structure_override_applied': bool(vwap_structure_override),
             'entry_degradation_path': [],
+            'timed_campaign_force_fill': bool((signal.details or {}).get('timed_campaign_active', False)),
+            'timed_campaign_hold_until_exit': bool((signal.details or {}).get('timed_campaign_active', False)),
         }
     
     def close_position(
@@ -1843,12 +2298,14 @@ class BacktestEngine:
             'entry_fill_penetration_share_of_range': float(pos.get('entry_fill_penetration_share_of_range', 0.0)),
             'entry_fill_direct_ioc_valid': bool(pos.get('entry_fill_direct_ioc_valid', False)),
             'entry_fill_direct_ioc_reason': str(pos.get('entry_fill_direct_ioc_reason', '')),
+            'dynamic_position_mult': float(pos.get('dynamic_position_mult', 1.0)),
             'remaining_margin_after': remaining_margin,
         })
 
         total_trade_pnl = realized_pnl_accum + pnl
         if remaining_margin <= 1e-12:
             self._update_loss_streak_after_trade_close(time, total_trade_pnl)
+            self._mark_symbol_timed_campaign_closed(symbol, str(pos.get('side', '')))
             del self.positions[symbol]
             return
 
@@ -1884,6 +2341,8 @@ class BacktestEngine:
             'stop_price': float(order['stop_price']),
             'take_profit': order['take_profit'],
             'take_profit_levels': list(order.get('take_profit_levels') or []),
+            'signal_tp_trailing': order.get('signal_tp_trailing'),
+            'dynamic_position_mult': float(order.get('dynamic_position_mult', 1.0)),
             'entry_time': fill_time,
             'entry_initial_time_in_force': str(order.get('entry_initial_time_in_force', order.get('time_in_force', 'IOC'))),
             'entry_time_in_force': str(order.get('time_in_force', 'IOC')),
@@ -1938,8 +2397,10 @@ class BacktestEngine:
             'entry_fill_direct_ioc_reason': str((fill_details or {}).get('direct_ioc_fill_reason', '')),
             'trailing_stop': None,
             'realized_pnl_accum': 0.0,
+            'timed_campaign_hold_until_exit': bool(order.get('timed_campaign_hold_until_exit', False)),
         }
         self.pending_orders.pop(symbol, None)
+        self._mark_symbol_timed_campaign_filled(symbol, str(order.get('side', '')))
         return True
 
     def process_pending_orders(self, analyses: Dict[str, dict]) -> set[str]:
@@ -1956,9 +2417,28 @@ class BacktestEngine:
             signal = analysis['signal']
             tif = str(order.get('time_in_force', 'IOC')).upper()
             order['bars_waited'] = int(order.get('bars_waited', 0)) + 1
+            timed_campaign_force_fill = bool(order.get('timed_campaign_force_fill', False))
 
             if symbol in self.positions:
                 self._cancel_pending_order(symbol, reason="position_exists")
+                continue
+
+            if timed_campaign_force_fill:
+                fill_price = float(analysis['row_15m']['open'])
+                fill_details = {
+                    'touch_class': 'timed_campaign_next_open',
+                    'close_through': False,
+                    'wick_only_touch': False,
+                    'penetration_bps': 0.0,
+                    'range_bps': 0.0,
+                    'penetration_share_of_range': 0.0,
+                    'direct_ioc_fill_valid': True,
+                    'direct_ioc_fill_reason': 'timed_campaign_force_fill',
+                }
+                if self._fill_pending_order(symbol, order, fill_price, analysis['time'], fill_details=fill_details):
+                    filled_symbols.add(symbol)
+                    if self.config.entry_bar_same_bar_enabled and symbol in self.positions:
+                        self._handle_entry_bar_same_bar_after_fill(symbol, analysis)
                 continue
 
             if signal.direction == 'neutral' or signal.signal_score < self._signal_threshold(signal):
@@ -2151,6 +2631,9 @@ class BacktestEngine:
         """用同一根15m的OHLC近似 intrabar 触发，返回是否已平仓"""
         if symbol not in self.positions:
             return False
+
+        if self._check_symbol_timed_campaign_exit(symbol, analysis):
+            return True
         
         pos = self.positions[symbol]
         signal = analysis['signal']
@@ -2159,6 +2642,8 @@ class BacktestEngine:
         time = analysis['time']
         high_price = float(row['high'])
         low_price = float(row['low'])
+        timed_campaign_hold = bool(pos.get('timed_campaign_hold_until_exit', False))
+        timed_campaign_exit_window_active = self._symbol_timed_campaign_exit_window_active(symbol, time)
 
         # 计算当前盈亏比例
         if pos['side'] == 'long':
@@ -2167,7 +2652,7 @@ class BacktestEngine:
             pnl_pct = (pos['entry_price'] - price) / pos['entry_price']
         
         # 保本止损：与实盘配置对齐
-        if self.config.breakeven_enabled:
+        if self.config.breakeven_enabled and not timed_campaign_hold:
             breakeven_trigger = self._resolve_effective_breakeven_trigger(pos)
             breakeven_lock = float(pos.get('breakeven_lock_ratio', self.config.breakeven_lock_ratio))
             if pos['side'] == 'long':
@@ -2187,7 +2672,7 @@ class BacktestEngine:
 
         trailing_profile = self._resolve_trailing_profile(pos)
         activation_pnl_ratio = float(trailing_profile.get("activation_pnl_ratio", 0.0) or 0.0)
-        if activation_pnl_ratio > 0 and self._runner_only_trailing_ready(pos):
+        if activation_pnl_ratio > 0 and self._runner_only_trailing_ready(pos) and not timed_campaign_hold:
             if pos['side'] == 'long':
                 best_pnl_pct = (high_price - pos['entry_price']) / pos['entry_price']
             else:
@@ -2275,6 +2760,10 @@ class BacktestEngine:
             self.close_position(symbol, exit_price, time, reason)
             return True
 
+        if timed_campaign_hold and not timed_campaign_exit_window_active:
+            hit_levels = []
+            target_hit = False
+
         if hit_levels:
             for level in hit_levels:
                 if symbol not in self.positions:
@@ -2335,6 +2824,8 @@ class BacktestEngine:
         
         # 反向有效信号触发离场，但不在同一根K线立即反手
         if (
+            not timed_campaign_hold
+            and
             signal.direction in ('long', 'short')
             and signal.signal_score >= self._signal_threshold(signal)
             and signal.direction != pos['side']
@@ -2343,7 +2834,7 @@ class BacktestEngine:
             return True
         
         # 最大持仓时间限制（默认关闭，避免偏离实盘）
-        if self.config.max_hold_hours > 0 and 'entry_time' in pos:
+        if self.config.max_hold_hours > 0 and 'entry_time' in pos and not timed_campaign_hold:
             hold_time = time - pos['entry_time']
             # 时间戳可能是Timedelta或数值
             if hasattr(hold_time, 'total_seconds'):
@@ -2446,7 +2937,6 @@ class BacktestEngine:
         signals_generated = 0
         vetoes = {v: 0 for v in VetoType}
         last_price_map: Dict[str, float] = {}
-
         for current_ts in ordered_timeline:
             analyses: Dict[str, dict] = {}
             for symbol, data in market_data_map.items():
@@ -2458,6 +2948,16 @@ class BacktestEngine:
                     continue
                 analyses[symbol] = analysis
                 last_price_map[symbol] = float(analysis["price"])
+
+            current_time = pd.Timestamp(current_ts)
+            if not timestamp_in_trade_window(
+                current_time,
+                trade_window_start_iso=self.config.window_start_iso,
+                trade_window_end_iso=self.config.window_end_iso,
+            ):
+                continue
+
+            for analysis in analyses.values():
                 signal = analysis['signal']
                 if signal.veto_type and signal.veto_type != VetoType.NONE:
                     vetoes[signal.veto_type] += 1
@@ -2508,7 +3008,6 @@ class BacktestEngine:
                 self.execute_trade(symbol, analysis, market_data_map[symbol])
 
             if analyses or self.positions or self.pending_orders:
-                current_time = pd.Timestamp(current_ts)
                 self._record_equity_snapshot(current_time, last_price_map)
 
         for symbol in list(self.pending_orders.keys()):
@@ -2623,7 +3122,11 @@ def run_backtest(
     print(f"  config_path: {config.config_path}")
     print(f"  backtest_profile: {config.profile_name or '(none)'}")
     if config.window_start_iso or config.window_end_iso:
-        print(f"  time_window: {config.window_start_iso or '(open)'} -> {config.window_end_iso or '(open)'}")
+        print(f"  trade_window: {config.window_start_iso or '(open)'} -> {config.window_end_iso or '(open)'}")
+    if config.data_window_start_iso or config.data_window_end_iso:
+        print(f"  data_window: {config.data_window_start_iso or '(open)'} -> {config.data_window_end_iso or '(open)'}")
+    if config.warmup_hours > 0:
+        print(f"  warmup_hours: {config.warmup_hours}")
     print(f"  symbols: {len(config.symbols)}")
     print(f"  max_positions: {config.max_positions}")
     print(f"  default_target_portion: {config.default_target_portion:.2%}")
@@ -2671,11 +3174,13 @@ def run_backtest(
             missing_symbols.append(symbol)
 
     dropped_by_window: List[str] = []
-    if market_data_map and (start_time or end_time):
+    data_window_start = config.data_window_start_iso or start_time
+    data_window_end = config.data_window_end_iso or end_time
+    if market_data_map and (data_window_start or data_window_end):
         market_data_map, dropped_by_window = filter_market_data_by_time_range(
             market_data_map,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=data_window_start,
+            end_time=data_window_end,
         )
         available_symbols = list(market_data_map.keys())
         if dropped_by_window:

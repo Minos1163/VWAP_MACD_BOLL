@@ -1024,7 +1024,7 @@ pretrade_risk_gate (ATR 极端值/资金占用)
 - 回测脚本：`scripts/backtest_macd_v2.py`
 - 回测结果：`output/backtest/v2_summary_20260331_151807.json`
 - 亏损归因：`output/backtest/loss_attribution_20260331.json`
-- 对齐验证脚本：`scripts/validate_live_backtest_alignment.py`
+- 对齐验证脚本：`scripts/diagnostics/validate_live_backtest_alignment.py`
 - 收敛文档：`docs/live_trading_convergence_todolist_20260327.md`
 
 ---

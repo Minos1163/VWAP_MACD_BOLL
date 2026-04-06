@@ -198,8 +198,20 @@ class ConfigLoader:
     @staticmethod
     def get_symbol_blacklist(config: Dict[str, Any]) -> list:
         """获取黑名单交易对列表。"""
+        trading = config.get("trading", {}) if isinstance(config.get("trading"), dict) else {}
         fund_flow = config.get("fund_flow", {}) if isinstance(config.get("fund_flow"), dict) else {}
-        return ConfigLoader._normalize_symbol_list(fund_flow.get("symbol_blacklist", []))
+        merged: list[str] = []
+        seen: set[str] = set()
+        for raw in (
+            fund_flow.get("symbol_blacklist", []),
+            trading.get("symbol_blacklist", []),
+        ):
+            for symbol in ConfigLoader._normalize_symbol_list(raw):
+                if symbol in seen:
+                    continue
+                merged.append(symbol)
+                seen.add(symbol)
+        return merged
 
     @staticmethod
     def filter_symbols_with_blacklist(symbols: Any, config: Dict[str, Any]) -> list:

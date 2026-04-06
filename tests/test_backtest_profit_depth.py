@@ -774,6 +774,85 @@ def test_build_backtest_config_reads_nested_open_gtc_fallback_enabled() -> None:
     assert config.open_gtc_fallback_enabled is False
 
 
+def test_build_backtest_config_uses_24h_warmup_data_window() -> None:
+    runtime_cfg = {
+        "trading": {"symbols": ["SOLUSDT"]},
+        "fund_flow": {
+            "backtest": {
+                "warmup_hours": 24,
+            }
+        },
+    }
+
+    config = build_backtest_config(
+        runtime_cfg=runtime_cfg,
+        config_path="config/trading_config_fund_flow.json",
+        window_start_iso="2026-03-05T03:00:00",
+        window_end_iso="2026-04-04T03:00:00",
+    )
+
+    assert config.window_start_iso == "2026-03-05T03:00:00"
+    assert config.window_end_iso == "2026-04-04T03:00:00"
+    assert config.warmup_hours == 24
+    assert config.data_window_start_iso == "2026-03-04 03:00:00"
+    assert config.data_window_end_iso == "2026-04-04T03:00:00"
+
+
+def test_run_backtest_skips_trade_execution_during_warmup_window() -> None:
+    config = BacktestConfig(
+        symbols=["SOLUSDT"],
+        initial_capital=10000.0,
+        window_start_iso="2026-03-05T03:00:00",
+        window_end_iso="2026-03-05T03:30:00",
+        data_window_start_iso="2026-03-04 03:00:00",
+        data_window_end_iso="2026-03-05T03:30:00",
+        warmup_hours=24,
+    )
+    engine = BacktestEngine(config, MACDStrategyV2Config(), runtime_config={})
+
+    executed_times: list[pd.Timestamp] = []
+
+    def _fake_analyze_bar(symbol: str, data: dict, idx_15m: int):
+        row = data["15m"].iloc[idx_15m]
+        return {
+            "signal": _signal(direction="long"),
+            "time": row["timestamp"],
+            "price": float(row["close"]),
+            "row_15m": row,
+            "row_1h": data["1h"].iloc[min(idx_15m, len(data["1h"]) - 1)],
+            "row_4h": data["4h"].iloc[min(idx_15m, len(data["4h"]) - 1)],
+            "cvd_veto_context": {},
+            "cvd_context": {},
+        }
+
+    engine.analyze_bar = _fake_analyze_bar  # type: ignore[assignment]
+    engine.process_pending_orders = lambda analyses: set()  # type: ignore[assignment]
+    engine.check_stops = lambda symbol, analysis: False  # type: ignore[assignment]
+    engine.execute_trade = lambda symbol, analysis, data: executed_times.append(pd.Timestamp(analysis["time"]))  # type: ignore[assignment]
+
+    timestamps = pd.date_range("2026-03-04 14:30:00", periods=53, freq="15min")
+    tf_15m = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": [100.0 + i for i in range(len(timestamps))],
+            "high": [101.0 + i for i in range(len(timestamps))],
+            "low": [99.0 + i for i in range(len(timestamps))],
+            "close": [100.5 + i for i in range(len(timestamps))],
+            "volume": [1000.0 for _ in range(len(timestamps))],
+        }
+    )
+    tf_1h = tf_15m.copy()
+    tf_4h = tf_15m.copy()
+
+    engine.run_backtest({"SOLUSDT": {"15m": tf_15m, "1h": tf_1h, "4h": tf_4h}})
+
+    assert executed_times == [
+        pd.Timestamp("2026-03-05 03:00:00"),
+        pd.Timestamp("2026-03-05 03:15:00"),
+        pd.Timestamp("2026-03-05 03:30:00"),
+    ]
+
+
 def test_build_backtest_config_reads_direct_ioc_fill_model_settings() -> None:
     runtime_cfg = {
         "trading": {"symbols": ["SOLUSDT"]},

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import math
 from collections import deque
 from dataclasses import replace
@@ -25,6 +26,8 @@ from src.fund_flow.macd_strategy_v2 import (
 from src.fund_flow.filters.symbol_signal_override import SymbolSignalOverrideRegistry
 from src.fund_flow.filters.time_window_filter import TimeWindowFilter, TimeWindowFilterConfig
 from src.fund_flow.v3_filter_integration import V3FilterManager
+
+logger = logging.getLogger(__name__)
 
 
 def get_vwap_structure_position_scale(
@@ -109,13 +112,13 @@ class FundFlowDecisionEngine:
         self.stop_loss_pct = self._normalize_pct_ratio(stop_loss_raw, 0.01)
         self.take_profit_pct = self._normalize_pct_ratio(take_profit_raw, 0.03)
         self.entry_hard_gates_enabled = bool(ff.get("entry_hard_gates_enabled", False))
-        self.entry_hard_gate_adx_min = max(0.0, self._to_float(ff.get("entry_hard_gate_adx_min"), 22.0))
+        self.entry_hard_gate_adx_min = max(0.0, self._to_float(ff.get("entry_hard_gate_adx_min"), 18.0))
         self.entry_hard_gate_atr_min = max(
-            0.0, self._normalize_pct_ratio(ff.get("entry_hard_gate_atr_min"), 0.006)
+            0.0, self._normalize_pct_ratio(ff.get("entry_hard_gate_atr_min"), 0.003)
         )
         self.entry_hard_gate_atr_max = max(
             self.entry_hard_gate_atr_min,
-            self._normalize_pct_ratio(ff.get("entry_hard_gate_atr_max"), 0.020),
+            self._normalize_pct_ratio(ff.get("entry_hard_gate_atr_max"), 0.025),
         )
         self.entry_hard_gate_spread_bps_max = max(
             0.0, self._normalize_pct_ratio(ff.get("entry_hard_gate_spread_bps_max"), 0.0008)
@@ -176,6 +179,10 @@ class FundFlowDecisionEngine:
         self.direction_lock_soft_adx_buffer = max(
             0.0,
             self._to_float(regime_cfg.get("direction_lock_soft_adx_buffer"), 4.0),
+        )
+        self.direction_lock_max_bars = max(
+            0,
+            int(self._to_float(regime_cfg.get("direction_lock_max_bars"), 48))
         )
         self.trend_pending_adx_min = max(
             0.0,
@@ -572,6 +579,7 @@ class FundFlowDecisionEngine:
             penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
             session_risk_cfg = v2_cfg.get("session_risk_control", {}) if isinstance(v2_cfg.get("session_risk_control"), dict) else {}
             vwap_score_tier_cfg = v2_cfg.get("vwap_score_position_tiers", {}) if isinstance(v2_cfg.get("vwap_score_position_tiers"), dict) else {}
+            position_size_cfg = v2_cfg.get("position_size_config", {}) if isinstance(v2_cfg.get("position_size_config"), dict) else {}
             symbol_risk_cfg = v2_cfg.get("symbol_risk_tiers", {}) if isinstance(v2_cfg.get("symbol_risk_tiers"), dict) else {}
             default_signal_threshold = self._to_float(
                 thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score")),
@@ -614,7 +622,7 @@ class FundFlowDecisionEngine:
                 vwap_deviation_optimal=self._to_float(vwap_cfg.get("vwap_deviation_optimal"), 0.005),
                 vwap_deviation_warning=self._to_float(vwap_cfg.get("vwap_deviation_warning"), 0.015),
                 vwap_deviation_hard_block=self._to_float(vwap_cfg.get("vwap_deviation_hard_block"), 0.030),
-                structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_weekly")),
+                structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_daily")),
                 structural_vwap_rolling_window=int(self._to_float(vwap_cfg.get("structural_vwap_rolling_window"), 20)),
                 vwap_retest_tolerance=self._to_float(vwap_cfg.get("vwap_retest_tolerance"), 0.003),
                 # 评分权重
@@ -628,6 +636,7 @@ class FundFlowDecisionEngine:
                 min_entry_score=self._to_float(thresholds_cfg.get("min_entry_score"), 0.25),
                 min_signal_score=default_signal_threshold,
                 red_bar_growing_min_signal_score=self._to_float(thresholds_cfg.get("red_bar_growing"), default_signal_threshold),
+                red_bar_shrinking_min_signal_score=self._to_float(thresholds_cfg.get("red_bar_shrinking"), default_signal_threshold),
                 flip_bearish_min_signal_score=self._to_float(thresholds_cfg.get("flip_bearish"), default_signal_threshold),
                 flip_bullish_min_signal_score=self._to_float(thresholds_cfg.get("flip_bullish"), default_signal_threshold),
                 enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
@@ -674,6 +683,22 @@ class FundFlowDecisionEngine:
                 ema_slope_lookback_1h=int(self._to_float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h")), 3)),
                 ema_slope_lookback_4h=int(self._to_float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h")), 2)),
                 disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
+                long_entry_mode=str(filter_cfg.get("long_entry_mode", "all") or "all").strip().lower(),
+                long_whitelist_signal_types=[
+                    str(x).strip().lower()
+                    for x in (filter_cfg.get("long_whitelist_signal_types", []) or [])
+                    if str(x).strip()
+                ] if isinstance(filter_cfg.get("long_whitelist_signal_types"), list) else [],
+                long_whitelist_vwap_states=[
+                    str(x).strip().lower()
+                    for x in (filter_cfg.get("long_whitelist_vwap_states", []) or [])
+                    if str(x).strip()
+                ] if isinstance(filter_cfg.get("long_whitelist_vwap_states"), list) else [],
+                long_whitelist_pockets=[
+                    MACDStrategyV2Config.normalize_pocket_key(*str(x).split("|", 1))
+                    for x in (filter_cfg.get("long_whitelist_pockets", []) or [])
+                    if str(x).strip() and "|" in str(x)
+                ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
                 disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
                 primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
                 require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
@@ -831,6 +856,8 @@ class FundFlowDecisionEngine:
                     str(x).strip() for x in (vwap_score_tier_cfg.get("apply_to_states", []) or []) if str(x).strip()
                 ] if isinstance(vwap_score_tier_cfg.get("apply_to_states"), list) else [],
                 vwap_score_position_tiers=copy.deepcopy(vwap_score_tier_cfg.get("tiers", [])) if isinstance(vwap_score_tier_cfg.get("tiers"), list) else [],
+                position_score_tiers=copy.deepcopy(position_size_cfg.get("score_tiers", []))
+                if isinstance(position_size_cfg.get("score_tiers"), list) else [],
                 symbol_risk_watchlist_symbols=[
                     str(x).strip().upper() for x in (symbol_risk_cfg.get("watchlist_symbols", []) or []) if str(x).strip()
                 ] if isinstance(symbol_risk_cfg.get("watchlist_symbols"), list) else [],
@@ -849,6 +876,8 @@ class FundFlowDecisionEngine:
                     symbol_risk_cfg.get("watchlist_session_scale_multiplier"),
                     0.80,
                 ),
+                leverage_score_tiers=copy.deepcopy(leverage_cfg.get("score_tiers", []))
+                if isinstance(leverage_cfg.get("score_tiers"), list) else [],
                 dual_pressure_target_portion_bonus=self._to_float(
                     leverage_cfg.get("dual_pressure_target_portion_bonus"),
                     0.0,
@@ -1943,6 +1972,83 @@ class FundFlowDecisionEngine:
             return "trap_with_flow_reversal"
 
         return ""
+
+    def _log_gate_check_report(
+        self,
+        symbol: str,
+        signal: Any,
+        metadata: Dict[str, Any],
+        regime_info: Dict[str, Any],
+        market_flow_context: Dict[str, Any],
+        *,
+        gate_label: str = "GATE_CHECK",
+        passed: bool = False,
+        hold_reason: str = "",
+    ):
+        """输出完整的15m门槛检查报告，记录每个门槛的通过/拒绝状态"""
+        regime = regime_info.get("regime", "?")
+        adx = regime_info.get("adx", 0)
+        atr_pct = regime_info.get("atr_pct", 0)
+        direction_lock = regime_info.get("direction", "BOTH")
+
+        signal_score = signal.signal_score or 0.0
+        vwap_score = signal.vwap_score or 0.0
+        vwap_deviation = signal.vwap_deviation or 0.0
+        vwap_state = signal.vwap_state or "?"
+        signal_type = signal.signal_type_1h or "none"
+        veto_type = signal.veto_type.value if signal.veto_type else "none"
+
+        flow = market_flow_context or {}
+        cvd_ratio = flow.get("cvd_ratio", 0)
+        oi_delta = flow.get("oi_delta_ratio", 0)
+        depth_ratio = flow.get("depth_ratio", 0)
+        imbalance = flow.get("imbalance", 0)
+        cvd_momentum = flow.get("cvd_momentum", 0)
+        trap_score = flow.get("trap_score", 0)
+        spread_bps = flow.get("spread_bps", 0)
+
+        # debug details
+        debug = {}
+        if isinstance(signal.details, dict):
+            debug = signal.details
+
+        dir_1h = debug.get("direction_1h", "neutral")
+        dir_4h = debug.get("direction_4h", "neutral")
+        dir_primary = debug.get("primary_timeframe", "?")
+        type_1h = debug.get("signal_type_1h", signal_type)
+        type_4h = debug.get("signal_type_4h", "?")
+        ema_status = signal.ema_structure_status or "?"
+        ema_mult = signal.ema_multiplier or 0
+        ema_veto = debug.get("ema_veto", "none")
+        deviation_veto = debug.get("deviation_veto", "none")
+
+        # 4H regime
+        regime_state = metadata.get("macd_4h_regime_state", {})
+        regime_side = regime_state.get("side", "neutral")
+        regime_phase = regime_state.get("phase", "?")
+
+        # 15m entry
+        entry_type_15m = signal.entry_type_15m or "none"
+        entry_score_15m = debug.get("entry_score_15m", 0)
+        entry_passed = debug.get("entry_confirmation_passed", False)
+
+        status = "PASS" if passed else "BLOCK"
+        logger.info(
+            "[GATE_REPORT] %s %s | %s | dir_lock=%s regime=%s adx=%.1f atr=%.4f | "
+            "1h=%s(%s) 4h=%s(%s) primary=%s | signal=%s score=%.3f vwap=%.3f dev=%.4f state=%s | "
+            "ema=%s mult=%.2f veto=%s dev_veto=%s | "
+            "15m_type=%s 15m_score=%.2f 15m_pass=%s | "
+            "cvd=%.3f oi=%.4f depth=%.3f imb=%.3f cvd_mom=%.3f trap=%.2f spread=%.1f | "
+            "regime_side=%s regime_phase=%s | reason=%s",
+            status, gate_label, symbol, direction_lock, regime, adx, atr_pct,
+            dir_1h, type_1h, dir_4h, type_4h, dir_primary,
+            signal_type, signal_score, vwap_score, vwap_deviation, vwap_state,
+            ema_status, ema_mult, ema_veto, deviation_veto,
+            entry_type_15m, entry_score_15m, entry_passed,
+            cvd_ratio, oi_delta, depth_ratio, imbalance, cvd_momentum, trap_score, spread_bps,
+            regime_side, regime_phase,
+            hold_reason or veto_type,
+        )
 
     def _validate_macd_v2_entry_hard_gates(
         self,
@@ -4276,8 +4382,12 @@ class FundFlowDecisionEngine:
                 metadata=metadata,
             )
         
-        # 无明确信号
+        # 无明确信号 — 输出详细门槛检查日志
         if signal.direction == 'neutral':
+            self._log_gate_check_report(
+                symbol, signal, metadata, regime_info, market_flow_context,
+                gate_label="NEUTRAL_SIGNAL", passed=False,
+            )
             if (
                 pos_side in {"LONG", "SHORT"}
                 and bool(regime_state.get("close_on_reverse", False))
@@ -4382,16 +4492,12 @@ class FundFlowDecisionEngine:
             hold_reason = ""
             if isinstance(signal.details, dict):
                 hold_reason = str(signal.details.get("reason", "") or "")
-            if hold_reason:
-                logger.info(
-                    "[MACD_V2_HOLD] %s | type=%s dir=%s score=%.4f vwap=%.3f reason=%s",
-                    symbol,
-                    signal.signal_type_1h or "",
-                    signal.direction,
-                    signal.signal_score,
-                    signal.vwap_score,
-                    hold_reason,
-                )
+            # 每次HOLD都输出详细门槛检查报告
+            self._log_gate_check_report(
+                symbol, signal, metadata, regime_info, market_flow_context,
+                gate_label=f"HOLD({signal.veto_type.value if signal.veto_type else 'no_signal'})",
+                passed=False, hold_reason=hold_reason,
+            )
             if not pos_side:
                 regime_entry = self._build_macd_v2_regime_entry_decision(
                     symbol=symbol,
@@ -4455,6 +4561,11 @@ class FundFlowDecisionEngine:
             if not gates_passed:
                 metadata["entry_hard_gate_blocked"] = True
                 metadata["entry_hard_gate_reason"] = gate_reason
+                self._log_gate_check_report(
+                    symbol, signal, metadata, regime_info, market_flow_context,
+                    gate_label=f"ENTRY_HARD_GATE_LONG({gate_reason})", passed=False,
+                    hold_reason=gate_reason,
+                )
                 return FundFlowDecision(
                     operation=Operation.HOLD,
                     symbol=symbol,
@@ -4630,6 +4741,11 @@ class FundFlowDecisionEngine:
             if not gates_passed:
                 metadata["entry_hard_gate_blocked"] = True
                 metadata["entry_hard_gate_reason"] = gate_reason
+                self._log_gate_check_report(
+                    symbol, signal, metadata, regime_info, market_flow_context,
+                    gate_label=f"ENTRY_HARD_GATE_SHORT({gate_reason})", passed=False,
+                    hold_reason=gate_reason,
+                )
                 return FundFlowDecision(
                     operation=Operation.HOLD,
                     symbol=symbol,
@@ -5238,6 +5354,13 @@ class FundFlowDecisionEngine:
             return False
         if self.direction_lock_mode == "off":
             return False
+        # 方向锁定最大时长检查：超过max_bars根K线后自动解锁
+        if self.direction_lock_max_bars > 0:
+            confirmed_bars = int(
+                self._to_float(regime_info.get("direction_lock_confirmed_bars"), 0.0)
+            )
+            if confirmed_bars > self.direction_lock_max_bars:
+                return False
         if self.direction_lock_mode == "hard":
             return True
 

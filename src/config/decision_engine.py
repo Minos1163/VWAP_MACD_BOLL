@@ -475,6 +475,7 @@ class FundFlowDecisionEngine:
             penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
             session_risk_cfg = v2_cfg.get("session_risk_control", {}) if isinstance(v2_cfg.get("session_risk_control"), dict) else {}
             vwap_score_tier_cfg = v2_cfg.get("vwap_score_position_tiers", {}) if isinstance(v2_cfg.get("vwap_score_position_tiers"), dict) else {}
+            position_size_cfg = v2_cfg.get("position_size_config", {}) if isinstance(v2_cfg.get("position_size_config"), dict) else {}
             symbol_risk_cfg = v2_cfg.get("symbol_risk_tiers", {}) if isinstance(v2_cfg.get("symbol_risk_tiers"), dict) else {}
             default_signal_threshold = self._to_float(
                 thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score")),
@@ -517,7 +518,7 @@ class FundFlowDecisionEngine:
                 vwap_deviation_optimal=self._to_float(vwap_cfg.get("vwap_deviation_optimal"), 0.005),
                 vwap_deviation_warning=self._to_float(vwap_cfg.get("vwap_deviation_warning"), 0.015),
                 vwap_deviation_hard_block=self._to_float(vwap_cfg.get("vwap_deviation_hard_block"), 0.030),
-                structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_weekly")),
+                structural_vwap_mode=str(vwap_cfg.get("structural_vwap_mode", "anchored_daily")),
                 structural_vwap_rolling_window=int(self._to_float(vwap_cfg.get("structural_vwap_rolling_window"), 20)),
                 vwap_retest_tolerance=self._to_float(vwap_cfg.get("vwap_retest_tolerance"), 0.003),
                 # 评分权重
@@ -531,6 +532,7 @@ class FundFlowDecisionEngine:
                 min_entry_score=self._to_float(thresholds_cfg.get("min_entry_score"), 0.25),
                 min_signal_score=default_signal_threshold,
                 red_bar_growing_min_signal_score=self._to_float(thresholds_cfg.get("red_bar_growing"), default_signal_threshold),
+                red_bar_shrinking_min_signal_score=self._to_float(thresholds_cfg.get("red_bar_shrinking"), default_signal_threshold),
                 flip_bearish_min_signal_score=self._to_float(thresholds_cfg.get("flip_bearish"), default_signal_threshold),
                 flip_bullish_min_signal_score=self._to_float(thresholds_cfg.get("flip_bullish"), default_signal_threshold),
                 enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
@@ -566,6 +568,22 @@ class FundFlowDecisionEngine:
                 ema_slope_lookback_1h=int(self._to_float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h")), 3)),
                 ema_slope_lookback_4h=int(self._to_float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h")), 2)),
                 disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
+                long_entry_mode=str(filter_cfg.get("long_entry_mode", "all") or "all").strip().lower(),
+                long_whitelist_signal_types=[
+                    str(x).strip().lower()
+                    for x in (filter_cfg.get("long_whitelist_signal_types", []) or [])
+                    if str(x).strip()
+                ] if isinstance(filter_cfg.get("long_whitelist_signal_types"), list) else [],
+                long_whitelist_vwap_states=[
+                    str(x).strip().lower()
+                    for x in (filter_cfg.get("long_whitelist_vwap_states", []) or [])
+                    if str(x).strip()
+                ] if isinstance(filter_cfg.get("long_whitelist_vwap_states"), list) else [],
+                long_whitelist_pockets=[
+                    MACDStrategyV2Config.normalize_pocket_key(*str(x).split("|", 1))
+                    for x in (filter_cfg.get("long_whitelist_pockets", []) or [])
+                    if str(x).strip() and "|" in str(x)
+                ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
                 disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
                 primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "1h")),
                 require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
@@ -686,6 +704,8 @@ class FundFlowDecisionEngine:
                     str(x).strip() for x in (vwap_score_tier_cfg.get("apply_to_states", []) or []) if str(x).strip()
                 ] if isinstance(vwap_score_tier_cfg.get("apply_to_states"), list) else [],
                 vwap_score_position_tiers=copy.deepcopy(vwap_score_tier_cfg.get("tiers", [])) if isinstance(vwap_score_tier_cfg.get("tiers"), list) else [],
+                position_score_tiers=copy.deepcopy(position_size_cfg.get("score_tiers", []))
+                if isinstance(position_size_cfg.get("score_tiers"), list) else [],
                 symbol_risk_watchlist_symbols=[
                     str(x).strip().upper() for x in (symbol_risk_cfg.get("watchlist_symbols", []) or []) if str(x).strip()
                 ] if isinstance(symbol_risk_cfg.get("watchlist_symbols"), list) else [],
@@ -704,6 +724,8 @@ class FundFlowDecisionEngine:
                     symbol_risk_cfg.get("watchlist_session_scale_multiplier"),
                     0.80,
                 ),
+                leverage_score_tiers=copy.deepcopy(leverage_cfg.get("score_tiers", []))
+                if isinstance(leverage_cfg.get("score_tiers"), list) else [],
                 dual_pressure_target_portion_bonus=self._to_float(
                     leverage_cfg.get("dual_pressure_target_portion_bonus"),
                     0.0,
