@@ -285,6 +285,9 @@ class TradingBot:
         self._volatility_last_bucket_by_symbol: Dict[str, str] = {}
         self._volatility_cooldown_until_by_symbol: Dict[str, datetime] = {}
         self._volatility_cooldown_reason_by_symbol: Dict[str, str] = {}
+        self._volatility_cooldown_trigger_count_by_symbol: Dict[str, int] = {}
+        self._volatility_atr_pct_history_by_symbol: Dict[str, Deque[float]] = {}
+        self._volatility_cooldown_applied_seconds_by_symbol: Dict[str, int] = {}
         self._conflict_exit_streak_by_symbol: Dict[str, int] = {}
         self._conflict_cooldown_until_by_symbol: Dict[str, datetime] = {}
         self._conflict_cooldown_reason_by_symbol: Dict[str, str] = {}
@@ -2784,6 +2787,19 @@ class TradingBot:
             "enabled": bool(ff_cfg.get("extreme_volatility_cooldown_enabled", True)),
             "timeframe": timeframe,
             "atr_pct_threshold": max(0.0, float(atr_threshold)),
+            "quantile_enabled": bool(ff_cfg.get("extreme_volatility_cooldown_quantile_enabled", False)),
+            "quantile_value": min(
+                0.999,
+                max(0.0, self._to_float(ff_cfg.get("extreme_volatility_cooldown_quantile_value"), 0.95)),
+            ),
+            "quantile_window": max(
+                1,
+                int(ff_cfg.get("extreme_volatility_cooldown_quantile_window", 96) or 96),
+            ),
+            "quantile_min_samples": max(
+                1,
+                int(ff_cfg.get("extreme_volatility_cooldown_quantile_min_samples", 24) or 24),
+            ),
             "consecutive_bars": max(
                 1,
                 int(ff_cfg.get("extreme_volatility_cooldown_consecutive_bars", 2) or 2),
@@ -2792,7 +2808,35 @@ class TradingBot:
                 0,
                 int(ff_cfg.get("extreme_volatility_cooldown_seconds", 30 * 60) or 30 * 60),
             ),
+            "first_trigger_seconds": max(
+                0,
+                int(
+                    ff_cfg.get(
+                        "extreme_volatility_cooldown_first_trigger_seconds",
+                        ff_cfg.get("extreme_volatility_cooldown_seconds", 30 * 60) or 30 * 60,
+                    )
+                    or 0
+                ),
+            ),
         }
+
+    @staticmethod
+    def _rolling_quantile(values: List[float], quantile: float) -> float:
+        cleaned = sorted(float(v) for v in values if v is not None)
+        if not cleaned:
+            return 0.0
+        if len(cleaned) == 1:
+            return float(cleaned[0])
+        q = min(1.0, max(0.0, float(quantile)))
+        position = (len(cleaned) - 1) * q
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return float(cleaned[lower])
+        lower_value = float(cleaned[lower])
+        upper_value = float(cleaned[upper])
+        weight = position - lower
+        return lower_value + (upper_value - lower_value) * weight
 
     def _ma10_macd_confluence_config(self) -> Dict[str, Any]:
         ff_cfg = self.config.get("fund_flow", {}) or {}
@@ -3374,16 +3418,26 @@ class TradingBot:
         cfg = self._extreme_volatility_cooldown_config()
         symbol_up = str(symbol).upper()
         now = datetime.now(timezone.utc)
+        if not hasattr(self, "_volatility_cooldown_trigger_count_by_symbol"):
+            self._volatility_cooldown_trigger_count_by_symbol = {}
+        if not hasattr(self, "_volatility_atr_pct_history_by_symbol"):
+            self._volatility_atr_pct_history_by_symbol = {}
+        if not hasattr(self, "_volatility_cooldown_applied_seconds_by_symbol"):
+            self._volatility_cooldown_applied_seconds_by_symbol = {}
         expiry = self._volatility_cooldown_until_by_symbol.get(symbol_up)
         if isinstance(expiry, datetime) and expiry <= now:
             self._volatility_cooldown_until_by_symbol.pop(symbol_up, None)
             self._volatility_cooldown_reason_by_symbol.pop(symbol_up, None)
+            self._volatility_cooldown_trigger_count_by_symbol.pop(symbol_up, None)
+            self._volatility_cooldown_applied_seconds_by_symbol.pop(symbol_up, None)
 
         if not bool(cfg.get("enabled", True)):
             self._volatility_spike_streak_by_symbol.pop(symbol_up, None)
             self._volatility_last_bucket_by_symbol.pop(symbol_up, None)
             self._volatility_cooldown_until_by_symbol.pop(symbol_up, None)
             self._volatility_cooldown_reason_by_symbol.pop(symbol_up, None)
+            self._volatility_cooldown_trigger_count_by_symbol.pop(symbol_up, None)
+            self._volatility_cooldown_applied_seconds_by_symbol.pop(symbol_up, None)
             return {"enabled": False, "blocked": False}
 
         tf = str(cfg.get("timeframe", "15m"))
@@ -3394,8 +3448,21 @@ class TradingBot:
                 tf_data = timeframes.get(tf) if isinstance(timeframes.get(tf), dict) else {}
 
         atr_pct = abs(self._to_float((tf_data or {}).get("atr_pct"), 0.0))
-        threshold = float(cfg.get("atr_pct_threshold", 0.02) or 0.02)
+        fixed_threshold = float(cfg.get("atr_pct_threshold", 0.02) or 0.02)
+        quantile_window = max(1, int(cfg.get("quantile_window", 96) or 96))
+        quantile_min_samples = max(1, int(cfg.get("quantile_min_samples", 24) or 24))
+        history = self._volatility_atr_pct_history_by_symbol.get(symbol_up)
+        if not isinstance(history, deque) or int(getattr(history, "maxlen", 0) or 0) != quantile_window:
+            history = deque(list(history or []), maxlen=quantile_window)
+            self._volatility_atr_pct_history_by_symbol[symbol_up] = history
+        history_values = list(history)
+        threshold = fixed_threshold
+        if bool(cfg.get("quantile_enabled", False)) and len(history_values) >= quantile_min_samples:
+            threshold = max(0.0, self._rolling_quantile(history_values, float(cfg.get("quantile_value", 0.95) or 0.95)))
         bucket_key = self._timeframe_bucket_key(tf)
+        effective_cooldown_seconds = int(
+            self._volatility_cooldown_applied_seconds_by_symbol.get(symbol_up, 0) or 0
+        )
         if self._volatility_last_bucket_by_symbol.get(symbol_up) != bucket_key:
             self._volatility_last_bucket_by_symbol[symbol_up] = bucket_key
             if threshold > 0 and atr_pct >= threshold:
@@ -3404,6 +3471,8 @@ class TradingBot:
                 ) + 1
             else:
                 self._volatility_spike_streak_by_symbol[symbol_up] = 0
+                self._volatility_cooldown_trigger_count_by_symbol.pop(symbol_up, None)
+                self._volatility_cooldown_applied_seconds_by_symbol.pop(symbol_up, None)
 
             streak = int(self._volatility_spike_streak_by_symbol.get(symbol_up, 0) or 0)
             if (
@@ -3411,19 +3480,30 @@ class TradingBot:
                 and streak >= int(cfg.get("consecutive_bars", 2))
                 and int(cfg.get("cooldown_seconds", 0)) > 0
             ):
-                until = now + timedelta(seconds=int(cfg.get("cooldown_seconds", 0)))
+                trigger_count = int(self._volatility_cooldown_trigger_count_by_symbol.get(symbol_up, 0) or 0) + 1
+                self._volatility_cooldown_trigger_count_by_symbol[symbol_up] = trigger_count
+                cooldown_seconds = int(cfg.get("cooldown_seconds", 0))
+                first_trigger_seconds = int(cfg.get("first_trigger_seconds", cooldown_seconds) or cooldown_seconds)
+                effective_cooldown_seconds = first_trigger_seconds if trigger_count == 1 else cooldown_seconds
+                self._volatility_cooldown_applied_seconds_by_symbol[symbol_up] = effective_cooldown_seconds
+                until = now + timedelta(seconds=effective_cooldown_seconds)
                 prev_until = self._volatility_cooldown_until_by_symbol.get(symbol_up)
                 if not isinstance(prev_until, datetime) or prev_until < until:
                     self._volatility_cooldown_until_by_symbol[symbol_up] = until
                 self._volatility_cooldown_reason_by_symbol[symbol_up] = (
                     f"extreme_volatility atr_pct={atr_pct:.4f} >= {threshold:.4f}, "
-                    f"streak={streak}"
+                    f"streak={streak}, trigger_count={trigger_count}, cooldown={effective_cooldown_seconds}s, "
+                    f"quantile_window={len(history_values)}"
                 )
                 print(
                     f"⚠️ {symbol_up} 极端波动冷却触发: "
                     f"atr_pct={atr_pct:.4f}, threshold={threshold:.4f}, "
-                    f"streak={streak}, until={self._volatility_cooldown_until_by_symbol[symbol_up].isoformat()}"
+                    f"streak={streak}, trigger_count={trigger_count}, "
+                    f"quantile_window={len(history_values)}, "
+                    f"cooldown={effective_cooldown_seconds}s, "
+                    f"until={self._volatility_cooldown_until_by_symbol[symbol_up].isoformat()}"
                 )
+            history.append(float(atr_pct))
 
         expire_at_raw = self._volatility_cooldown_until_by_symbol.get(symbol_up)
         expire_at: Optional[datetime] = expire_at_raw if isinstance(expire_at_raw, datetime) else None
@@ -3433,9 +3513,17 @@ class TradingBot:
             "enabled": True,
             "blocked": bool(blocked),
             "remaining_seconds": max(0, remaining),
+            "atr_pct_current": atr_pct,
             "atr_pct": atr_pct,
+            "atr_pct_quantile_threshold": threshold,
             "threshold": threshold,
+            "quantile_window_size": len(history_values),
             "streak": int(self._volatility_spike_streak_by_symbol.get(symbol_up, 0) or 0),
+            "trigger_count": int(self._volatility_cooldown_trigger_count_by_symbol.get(symbol_up, 0) or 0),
+            "cooldown_trigger_count": int(self._volatility_cooldown_trigger_count_by_symbol.get(symbol_up, 0) or 0),
+            "cooldown_seconds_applied": int(
+                self._volatility_cooldown_applied_seconds_by_symbol.get(symbol_up, effective_cooldown_seconds) or 0
+            ),
             "reason": self._volatility_cooldown_reason_by_symbol.get(symbol_up),
             "timeframe": tf,
         }
@@ -3687,6 +3775,105 @@ class TradingBot:
             ),
         }
 
+    def _runner_time_exit_config(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
+        return {
+            "enabled": bool(ff_cfg.get("runner_time_exit_enabled", False)),
+            "minutes": max(1, int(self._to_float(ff_cfg.get("runner_time_exit_minutes", 15), 15))),
+            "min_completed_levels": max(
+                1,
+                int(self._to_float(ff_cfg.get("runner_time_exit_min_completed_levels", 1), 1)),
+            ),
+        }
+
+    @staticmethod
+    def _pocket_management_override(base_decision: Optional[FundFlowDecision]) -> Dict[str, Any]:
+        md = dict(getattr(base_decision, "metadata", None) or {})
+        override = md.get("pocket_management_override")
+        return dict(override) if isinstance(override, dict) else {}
+
+    def _resolve_time_exit_config(
+        self,
+        base_decision: Optional[FundFlowDecision] = None,
+    ) -> Dict[str, Any]:
+        cfg = self._time_exit_config()
+        override = self._pocket_management_override(base_decision)
+        if not override:
+            return cfg
+        resolved = dict(cfg)
+        if "time_exit_enabled" in override:
+            resolved["enabled"] = bool(override.get("time_exit_enabled"))
+        if "time_exit_minutes" in override:
+            resolved["minutes"] = max(1, int(self._to_float(override.get("time_exit_minutes"), resolved["minutes"])))
+        if "time_exit_min_profit_pct" in override:
+            resolved["min_profit_pct"] = self._normalize_percent_to_ratio(
+                override.get("time_exit_min_profit_pct"),
+                resolved["min_profit_pct"],
+            )
+        return resolved
+
+    def _resolve_runner_time_exit_config(
+        self,
+        base_decision: Optional[FundFlowDecision] = None,
+    ) -> Dict[str, Any]:
+        cfg = self._runner_time_exit_config()
+        override = self._pocket_management_override(base_decision)
+        if not override:
+            return cfg
+        resolved = dict(cfg)
+        if "runner_time_exit_enabled" in override:
+            resolved["enabled"] = bool(override.get("runner_time_exit_enabled"))
+        if "runner_time_exit_minutes" in override:
+            resolved["minutes"] = max(
+                1,
+                int(self._to_float(override.get("runner_time_exit_minutes"), resolved["minutes"])),
+            )
+        if "runner_time_exit_min_completed_levels" in override:
+            resolved["min_completed_levels"] = max(
+                1,
+                int(
+                    self._to_float(
+                        override.get("runner_time_exit_min_completed_levels"),
+                        resolved["min_completed_levels"],
+                    )
+                ),
+            )
+        return resolved
+
+    @staticmethod
+    def _candidate_priority_key_from_decision(decision: Optional[FundFlowDecision]) -> str:
+        if not isinstance(decision, FundFlowDecision):
+            return ""
+        md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+        signal_type = str(md.get("signal_type_1h") or "").strip().lower()
+        vwap_state = str(md.get("vwap_state") or "").strip().lower()
+        if signal_type and vwap_state:
+            return f"{signal_type}|{vwap_state}"
+        return ""
+
+    def _candidate_priority_score(self, item: Dict[str, Any], ai_review_cfg: Optional[Dict[str, Any]] = None) -> float:
+        base_score = self._to_float(item.get("score"), 0.0)
+        cfg = ai_review_cfg if isinstance(ai_review_cfg, dict) else {}
+        overrides = cfg.get("shortlist_priority_overrides", {})
+        decision = item.get("decision")
+        pocket_key = self._candidate_priority_key_from_decision(decision)
+        bonus = self._to_float(overrides.get(pocket_key), 0.0) if isinstance(overrides, dict) and pocket_key else 0.0
+        symbol_overrides = cfg.get("shortlist_symbol_priority_overrides", {})
+        symbol = str(item.get("symbol") or getattr(decision, "symbol", "") or "").strip().upper()
+        symbol_bonus = self._to_float(symbol_overrides.get(symbol), 0.0) if isinstance(symbol_overrides, dict) and symbol else 0.0
+        bonus += symbol_bonus
+        return base_score + bonus
+
+    def _capacity_group_cap(self, item: Dict[str, Any], ai_review_cfg: Optional[Dict[str, Any]] = None) -> Tuple[str, int]:
+        cfg = ai_review_cfg if isinstance(ai_review_cfg, dict) else {}
+        caps = cfg.get("capacity_group_caps", {})
+        if not isinstance(caps, dict) or not caps:
+            return "", 0
+        decision = item.get("decision")
+        pocket_key = self._candidate_priority_key_from_decision(decision)
+        cap = max(0, int(self._to_float(caps.get(pocket_key), 0)))
+        return pocket_key, cap
+
     def _atr_position_scale_config(self) -> Dict[str, Any]:
         ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
         raw_bands = ff_cfg.get("atr_position_scale_bands", [])
@@ -3752,6 +3939,7 @@ class TradingBot:
             return state_raw
         state = {
             "levels_completed": [],
+            "last_tp_trigger_ts": 0.0,
             "trailing_activated": False,
             "trailing_high_water": 0.0,
             "trailing_stop_price": 0.0,
@@ -3869,6 +4057,29 @@ class TradingBot:
                     "breakeven_lock",
                 ):
                     profile[key] = dynamic_profile.get(key, profile.get(key))
+        override = self._pocket_management_override(base_decision)
+        if override:
+            if isinstance(override.get("partial_tp_levels"), list):
+                profile["levels"] = [
+                    dict(item)
+                    for item in override.get("partial_tp_levels", [])
+                    if isinstance(item, dict)
+                ]
+            if "partial_tp_mode" in override:
+                profile["mode"] = str(override.get("partial_tp_mode") or profile.get("mode", "STATIC")).upper()
+            for key, default in (
+                ("trailing_activation_pct", profile.get("trailing_activation_pct")),
+                ("trailing_atr_multiplier", profile.get("trailing_atr_multiplier")),
+                ("trailing_min_distance", profile.get("trailing_min_distance")),
+                ("trailing_max_distance", profile.get("trailing_max_distance")),
+                ("breakeven_trigger", profile.get("breakeven_trigger")),
+                ("breakeven_lock", profile.get("breakeven_lock")),
+            ):
+                if key in override:
+                    if "multiplier" in key:
+                        profile[key] = max(0.1, self._to_float(override.get(key), default))
+                    else:
+                        profile[key] = self._normalize_percent_to_ratio(override.get(key), default)
         return profile
 
     def _calculate_trailing_stop_distance(
@@ -3902,25 +4113,55 @@ class TradingBot:
         flow_context: Dict[str, Any],
         base_decision: FundFlowDecision,
     ) -> Optional[FundFlowDecision]:
-        cfg = self._time_exit_config()
-        if not bool(cfg.get("enabled", False)):
-            return None
+        cfg = self._resolve_time_exit_config(base_decision)
 
         side = str(position.get("side", "")).upper()
         if side not in ("LONG", "SHORT"):
             return None
         pos_key = self._position_track_key(symbol, side)
+        now_ts = self._risk_now_ts()
+        sign = 1.0 if side == "LONG" else -1.0
+        flow_expanding = self._to_float(flow_context.get("cvd_momentum"), 0.0) * sign > 0.0
+
+        runner_cfg = self._resolve_runner_time_exit_config(base_decision)
+        if bool(runner_cfg.get("enabled", False)):
+            state = self._get_or_create_partial_tp_state(symbol, side)
+            completed_levels = state.get("levels_completed", [])
+            completed_count = len(completed_levels) if isinstance(completed_levels, list) else 0
+            min_completed_levels = int(runner_cfg.get("min_completed_levels", 1) or 1)
+            last_tp_trigger_ts = self._to_float(state.get("last_tp_trigger_ts"), 0.0)
+            if completed_count >= min_completed_levels and last_tp_trigger_ts > 0:
+                runner_hold_minutes = max(0.0, (now_ts - last_tp_trigger_ts) / 60.0)
+                if runner_hold_minutes >= float(runner_cfg.get("minutes", 15)) and not flow_expanding:
+                    md = dict(getattr(base_decision, "metadata", None) or {})
+                    md["runner_time_exit_triggered"] = True
+                    md["runner_time_exit_hold_minutes"] = runner_hold_minutes
+                    md["runner_time_exit_completed_levels"] = completed_count
+                    md["runner_time_exit_last_tp_trigger_ts"] = last_tp_trigger_ts
+                    return FundFlowDecision(
+                        operation=FundFlowOperation.CLOSE,
+                        symbol=symbol,
+                        target_portion_of_balance=1.0,
+                        leverage=base_decision.leverage,
+                        reason=(
+                            f"runner_time_exit hold={runner_hold_minutes:.0f}m "
+                            f"completed_levels={completed_count} flow_expanding={int(flow_expanding)}"
+                        ),
+                        metadata=md,
+                    )
+
+        if not bool(cfg.get("enabled", False)):
+            return None
+
         first_seen_ts = self._position_first_seen_ts.get(pos_key)
         if not first_seen_ts:
             return None
 
-        hold_minutes = max(0.0, (self._risk_now_ts() - float(first_seen_ts)) / 60.0)
+        hold_minutes = max(0.0, (now_ts - float(first_seen_ts)) / 60.0)
         if hold_minutes < float(cfg.get("minutes", 30)):
             return None
 
         pnl_ratio = self._position_pnl_ratio(position, current_price)
-        sign = 1.0 if side == "LONG" else -1.0
-        flow_expanding = self._to_float(flow_context.get("cvd_momentum"), 0.0) * sign > 0.0
         min_profit_pct = self._normalize_percent_to_ratio(cfg.get("min_profit_pct", 0.0035), 0.0035)
         if pnl_ratio >= min_profit_pct or flow_expanding:
             return None
@@ -3995,6 +4236,7 @@ class TradingBot:
 
             completed_levels.append(idx)
             state["levels_completed"] = sorted(set(int(x) for x in completed_levels))
+            state["last_tp_trigger_ts"] = self._risk_now_ts()
             self._save_risk_state()
             md = dict(getattr(base_decision, "metadata", None) or {})
             md["partial_tp_triggered"] = True
@@ -4181,6 +4423,23 @@ class TradingBot:
     ) -> FundFlowDecision:
         if not isinstance(position, dict):
             return decision
+
+        if isinstance(getattr(decision, "metadata", None), dict):
+            md = dict(decision.metadata)
+        else:
+            md = {}
+        inherited_keys = ("pocket_management_override", "signal_type_1h", "vwap_state")
+        inherited = False
+        for key in inherited_keys:
+            if key not in md and key in position:
+                value = position.get(key)
+                if isinstance(value, dict):
+                    md[key] = dict(value)
+                else:
+                    md[key] = value
+                inherited = True
+        if inherited:
+            decision.metadata = md
 
         partial_tp_decision = self._evaluate_partial_tp(
             symbol=symbol,
@@ -5173,6 +5432,7 @@ class TradingBot:
                                 levels_completed.append(idx)
                     partial_tp_state[k] = {
                         "levels_completed": sorted(set(levels_completed)),
+                        "last_tp_trigger_ts": self._to_float(v.get("last_tp_trigger_ts"), 0.0),
                         "trailing_activated": bool(v.get("trailing_activated", False)),
                         "trailing_high_water": self._to_float(v.get("trailing_high_water"), 0.0),
                         "trailing_stop_price": self._to_float(v.get("trailing_stop_price"), 0.0),
@@ -7701,6 +7961,7 @@ class TradingBot:
                 f"liq_norm={self._to_float(flow_context.get('liquidity_delta_norm'), 0.0):+.4f}"
             )
         macd_v2_debug = md.get("macd_v2_debug")
+        macd_tf_diag = md.get("macd_tf_diagnostics")
         if isinstance(macd_v2_debug, dict) and str(md.get("strategy_mode")) == "macd_mtf_strategy_v2":
             stage = str(macd_v2_debug.get("stage") or "-")
             macd_dir = str(md.get("signal_direction") or macd_v2_debug.get("direction_1h") or "-")
@@ -7727,6 +7988,7 @@ class TradingBot:
             entry_score_15m = self._to_float(macd_v2_debug.get("entry_score_15m"), 0.0)
             volume_ratio_dbg = self._to_float(macd_v2_debug.get("volume_ratio"), 0.0)
             veto_type_dbg = str(md.get("veto_type") or macd_v2_debug.get("veto_type") or "none")
+            score_1h_source = str(macd_v2_debug.get("score_1h_source") or "-")
             print(
                 "   MACD_V2评分: "
                 f"stage={stage}, dir={macd_dir}, primary={primary_tf}:{score_4h:.4f}({sig4h}), "
@@ -7736,6 +7998,23 @@ class TradingBot:
                 f"VOL={score_vol:.4f}(r={volume_ratio_dbg:.2f}), "
                 f"EMA={ema_mult:.2f}x/{ema_status}, total={score_total:.4f}/{score_threshold:.4f}, veto={veto_type_dbg}"
             )
+            if isinstance(macd_tf_diag, dict) and (
+                score_1h <= 0.0
+                or any(str((macd_tf_diag.get(tf) or {}).get("series_source") or "missing") != "series" for tf in ("15m", "1h", "4h"))
+            ):
+                tf_parts = []
+                for tf in ("15m", "1h", "4h"):
+                    tf_item = macd_tf_diag.get(tf) if isinstance(macd_tf_diag.get(tf), dict) else {}
+                    tf_parts.append(
+                        f"{tf}={str(tf_item.get('series_source') or 'missing')}"
+                        f"/len={int(self._to_float(tf_item.get('series_len'), 0))}"
+                        f"/hist={int(bool(tf_item.get('macd_hist_present')))}"
+                        f"/prev={int(bool(tf_item.get('macd_hist_prev_present')))}"
+                    )
+                print(
+                    "   MACD_V2时框诊断: "
+                    f"score_1h_source={score_1h_source}, " + " | ".join(tf_parts)
+                )
             stop_price_dbg = self._to_float(md.get("suggested_stop_price"), self._to_float(macd_v2_debug.get("stop_price"), 0.0))
             stop_pct_dbg = self._to_float(md.get("stop_loss_pct"), self._to_float(macd_v2_debug.get("stop_loss_pct"), 0.0))
             if stop_price_dbg > 0 or stop_pct_dbg > 0:
@@ -7754,7 +8033,8 @@ class TradingBot:
                 print(
                     "   HOLD归因: "
                     f"direction_lock_blocked={blocked_side}, "
-                    f"lock={direction_lock or '-'}"
+                    f"lock={direction_lock or '-'}, "
+                    f"primary={str(md.get('primary_open_blocker') or '-')}"
                 )
             else:
                 if isinstance(macd_v2_debug, dict) and str(md.get("strategy_mode")) == "macd_mtf_strategy_v2":
@@ -7768,12 +8048,28 @@ class TradingBot:
                         f"signal_1h={str(macd_v2_debug.get('signal_type_1h') or '-')}, "
                         f"entry_15m={str(macd_v2_debug.get('entry_type_15m') or '-')}, "
                         f"veto={str(md.get('veto_type') or macd_v2_debug.get('veto_type') or 'none')}, "
-                        f"lock={direction_lock or '-'}"
+                        f"lock={direction_lock or '-'}, "
+                        f"primary={str(md.get('primary_open_blocker') or '-')}, "
+                        f"symbol_override_block={int(bool(md.get('symbol_override_block', False)))}, "
+                        f"signal_type_disabled={int(bool(md.get('signal_type_disabled', False)))}, "
+                        f"pocket_override_block={int(bool(md.get('pocket_override_block', False)))}, "
+                        f"entry_hard_gate_block={int(bool(md.get('entry_hard_gate_block', False)))}, "
+                        f"direction_lock_block={int(bool(md.get('direction_lock_block', False)))}"
                     )
                 else:
+                    if str(md.get("strategy_mode")) == "macd_mtf_strategy_v2" and isinstance(macd_tf_diag, dict):
+                        tf_parts = []
+                        for tf in ("15m", "1h", "4h"):
+                            tf_item = macd_tf_diag.get(tf) if isinstance(macd_tf_diag.get(tf), dict) else {}
+                            tf_parts.append(
+                                f"{tf}={str(tf_item.get('series_source') or 'missing')}"
+                                f"/len={int(self._to_float(tf_item.get('series_len'), 0))}"
+                            )
+                        print("   MACD_V2时框诊断: " + " | ".join(tf_parts))
                     print(
                         "   HOLD归因: "
-                        f"waiting_rule_confirmation, lock={direction_lock or '-'}"
+                        f"waiting_rule_confirmation, lock={direction_lock or '-'}, "
+                        f"primary={str(md.get('primary_open_blocker') or '-')}"
                     )
         if isinstance(leverage_sync, dict) and leverage_sync.get("status") == "error":
             print(f"   ⚠️ 杠杆同步失败: {leverage_sync.get('message')}")
@@ -8546,7 +8842,19 @@ class TradingBot:
                     f"remaining={int(volatility_guard.get('remaining_seconds', 0) or 0)}s, "
                     f"atr_pct={self._to_float(volatility_guard.get('atr_pct'), 0.0):.4f}, "
                     f"threshold={self._to_float(volatility_guard.get('threshold'), 0.0):.4f}, "
+                    f"quantile_threshold={self._to_float(volatility_guard.get('atr_pct_quantile_threshold'), 0.0):.4f}, "
+                    f"quantile_window={int(volatility_guard.get('quantile_window_size', 0) or 0)}, "
+                    f"trigger_count={int(volatility_guard.get('cooldown_trigger_count', 0) or 0)}, "
+                    f"cooldown={int(volatility_guard.get('cooldown_seconds_applied', 0) or 0)}s, "
                     f"tf={volatility_guard.get('timeframe')}"
+                )
+                print(
+                    "   HOLD归因: "
+                    "code=extreme_volatility_block, "
+                    "stage=extreme_volatility_guard, "
+                    f"atr_pct={self._to_float(volatility_guard.get('atr_pct_current'), 0.0):.4f}, "
+                    f"threshold={self._to_float(volatility_guard.get('atr_pct_quantile_threshold'), 0.0):.4f}, "
+                    f"window={int(volatility_guard.get('quantile_window_size', 0) or 0)}"
                 )
                 continue
             if position is None and bool(conflict_symbol_cooldown.get("blocked")):
@@ -9922,7 +10230,7 @@ class TradingBot:
         if open_candidates:
             open_candidates = sorted(
                 open_candidates,
-                key=lambda x: float(x.get("score", 0.0)),
+                key=lambda x: self._candidate_priority_score(x, ai_review_cfg),
                 reverse=True,
             )
             if ai_gate_enabled and ai_review_flat_enabled:
@@ -9973,6 +10281,7 @@ class TradingBot:
                 except Exception:
                     active_symbols_estimate = set()
             active_symbols_estimate.update(str(s).upper() for s in self._opened_symbols_this_cycle)
+            capacity_group_selected: Dict[str, int] = {}
             for rank, item in enumerate(pending_new_entries, start=1):
                 decision_i = _item_decision(item)
                 if decision_i is None:
@@ -9991,6 +10300,15 @@ class TradingBot:
                         f"候选排名={rank}"
                     )
                     continue
+                if not bypass_capacity_guard:
+                    group_key, group_cap = self._capacity_group_cap(item, ai_review_cfg)
+                    if group_key and group_cap > 0 and capacity_group_selected.get(group_key, 0) >= group_cap:
+                        print(
+                            f"⏭️ {item.get('symbol')} 候选开仓被跳过:"
+                            f"capacity_group_cap {group_key} {capacity_group_selected.get(group_key, 0)}/{group_cap}，"
+                            f"候选排名={rank}"
+                        )
+                        continue
 
                 account_summary_i = item.get("account_summary")
                 if not isinstance(account_summary_i, dict):
@@ -10130,6 +10448,10 @@ class TradingBot:
                     trigger_context=trigger_context_i,
                     portfolio=portfolio_i,
                 )
+                if not is_close_candidate and decision_i.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
+                    group_key, group_cap = self._capacity_group_cap(item, ai_review_cfg)
+                    if group_key and group_cap > 0:
+                        capacity_group_selected[group_key] = capacity_group_selected.get(group_key, 0) + 1
                 item_symbol = str(item.get("symbol") or "").upper()
                 if item_symbol and item_symbol in {str(s).upper() for s in self._opened_symbols_this_cycle}:
                     active_symbols_estimate.add(item_symbol)

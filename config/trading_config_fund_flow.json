@@ -54,32 +54,18 @@
       "FETUSDT"
     ],
     "symbol_blacklist": [
-      "QNTUSDT",
-      "UNIUSDT",
-      "NEARUSDT",
-      "HBARUSDT",
-      "XMRUSDT",
-      "TRXUSDT",
-      "ENAUSDT",
-      "TAOUSDT",
-      "LINKUSDT",
-      "ARBUSDT",
-      "LTCUSDT",
-      "HYPEUSDT",
       "KASUSDT",
-      "DOTUSDT",
-      "FILUSDT",
-      "XRPUSDT",
-      "APTUSDT"
+      "JSTUSDT",
+      "WLDUSDT"
     ],
-    "default_leverage": 3,
-    "min_leverage": 2,
+    "default_leverage": 4,
+    "min_leverage": 3,
     "max_leverage": 5,
     "reserve_pct": 20.0,
-    "max_active_symbols": 4,
-    "target_portion": 30.0,
+    "max_active_symbols": 5,
+    "target_portion": 22.0,
     "max_symbol_position_portion": 30.0,
-    "min_open_portion": 6.0
+    "min_open_portion": 3.0
   },
   "risk": {
     "account_circuit_enabled": true,
@@ -225,16 +211,16 @@
     }
   },
   "fund_flow": {
-    "default_target_portion": 0.3,
-    "add_position_portion": 0.18,
+    "default_target_portion": 0.22,
+    "add_position_portion": 0.2,
     "max_symbol_position_portion": 0.3,
-    "max_active_symbols": 4,
-    "min_open_portion": 0.06,
-    "min_leverage": 2,
-    "default_leverage": 3,
+    "max_active_symbols": 5,
+    "min_open_portion": 0.03,
+    "min_leverage": 3,
+    "default_leverage": 4,
     "max_leverage": 5,
     "long_open_threshold": 0.1,
-    "short_open_threshold": 0.08,
+    "short_open_threshold": 0.1,
     "close_threshold": 0.3,
     "entry_slippage": 0.0015,
     "stop_loss_pct": 0.02,
@@ -246,8 +232,8 @@
     ],
     "take_profit_reduce_pct_levels": [
       0.25,
-      0.30,
-      0.20
+      0.3,
+      0.2
     ],
     "reverse_close_confirm_bars": 2,
     "breakeven_enabled": true,
@@ -256,6 +242,16 @@
     "fast_exit_enabled": true,
     "fast_exit_direction_lock_bars": 2,
     "fast_exit_trap_high_confidence": 0.85,
+    "extreme_volatility_cooldown_enabled": true,
+    "extreme_volatility_cooldown_timeframe": "15m",
+    "extreme_volatility_cooldown_atr_pct": 0.02,
+    "extreme_volatility_cooldown_consecutive_bars": 2,
+    "extreme_volatility_cooldown_seconds": 1800,
+    "extreme_volatility_cooldown_first_trigger_seconds": 900,
+    "extreme_volatility_cooldown_quantile_enabled": true,
+    "extreme_volatility_cooldown_quantile_value": 0.95,
+    "extreme_volatility_cooldown_quantile_window": 96,
+    "extreme_volatility_cooldown_quantile_min_samples": 24,
     "time_exit_enabled": true,
     "time_exit_minutes": 30,
     "time_exit_min_profit_pct": 0.0035,
@@ -333,12 +329,46 @@
       }
     ],
     "entry_hard_gates_enabled": true,
-    "entry_hard_gate_adx_min": 18,
+    "entry_hard_gate_adx_min": 15,
     "entry_hard_gate_atr_min": 0.003,
     "entry_hard_gate_atr_max": 0.025,
     "entry_hard_gate_spread_bps_max": 0.001,
     "entry_hard_gate_flow_min_pass": 1,
     "entry_hard_gate_micro_min_pass": 1,
+    "entry_hard_gate_bypass_rules": [
+      {
+        "direction": "long",
+        "symbols": [
+          "TRUMPUSDT",
+          "FILUSDT",
+          "ENAUSDT",
+          "TONUSDT",
+          "ALGOUSDT",
+          "ARBUSDT",
+          "POLUSDT"
+        ],
+        "signal_type_1h": "flip_bullish",
+        "vwap_state": "long_reclaim_confirmed",
+        "min_signal_score": 0.93,
+        "min_vwap_score": 0.14,
+        "allow_microstructure_fail": true
+      }
+    ],
+    "direction_lock_bypass_rules": [
+      {
+        "direction_lock": "SHORT_ONLY",
+        "decision_side": "long",
+        "symbols": [
+          "SOLUSDT",
+          "LINKUSDT",
+          "ONDOUSDT"
+        ],
+        "signal_type_1h": "flip_bullish",
+        "vwap_state": "long_reclaim_confirmed",
+        "min_signal_score": 0.95,
+        "min_vwap_score": 0.14
+      }
+    ],
     "max_single_trade_nominal_ratio": 0.6,
     "daily_loss_limit_pct": 0.03,
     "consecutive_loss_halt_count": 3,
@@ -395,11 +425,57 @@
       ],
       "exit_close_ratio": 1.0
     },
+    "ai_review": {
+      "enabled": true,
+      "enforced": true,
+      "flat_top_n": 6,
+      "final_min_score": 0.06,
+      "final_same_side_add_min_score": 0.1,
+      "final_trend_weak_score": 0.15,
+      "final_trend_min_structure_votes": 1,
+      "final_max_trap_score": 0.5,
+      "shortlist_priority_overrides": {
+        "green_bar_growing|short_retest_reject": 0.08
+      },
+      "capacity_group_caps": {
+        "green_bar_growing|short_retest_reject": 2
+      },
+      "shortlist_symbol_priority_overrides": {
+        "TRUMPUSDT": 0.08,
+        "SOLUSDT": 0.06,
+        "JUPUSDT": 0.1,
+        "ATOMUSDT": 0.08,
+        "MORPHOUSDT": 0.05,
+        "VETUSDT": 0.08,
+        "POLUSDT": 0.08,
+        "RENDERUSDT": -0.15,
+        "TAOUSDT": 0.08,
+        "AAVEUSDT": 0.07,
+        "DOTUSDT": 0.07,
+        "ZECUSDT": -0.12,
+        "TONUSDT": -0.1,
+        "FETUSDT": -0.09,
+        "DOGEUSDT": -0.08,
+        "ONDOUSDT": -0.08,
+        "XLMUSDT": -0.06,
+        "LINKUSDT": -0.08,
+        "ETCUSDT": -0.05,
+        "APTUSDT": -0.08,
+        "AVAXUSDT": -0.08,
+        "ADAUSDT": -0.08,
+        "HYPEUSDT": -0.12
+      }
+    },
     "alpha_dilution_monitor": {
       "enabled": true,
       "alert_if_layer_dilution_exceeds": 0.3,
       "report_interval_hours": 6
     },
+    "symbol_blacklist": [
+      "KASUSDT",
+      "JSTUSDT",
+      "WLDUSDT"
+    ],
     "trend_gate_adx_min": 30,
     "trend_gate_atr_pct_min": 0.0012,
     "trend_gate_atr_pct_max": 0.02,
@@ -416,7 +492,7 @@
         "macd_15m_fast": 12,
         "macd_15m_slow": 26,
         "macd_15m_signal": 9,
-        "macd_threshold": 5e-05
+        "macd_threshold": 5E-05
       },
       "boll_config": {
         "period": 20,
@@ -429,12 +505,12 @@
       },
       "vwap_config": {
         "vwap_anchor": "daily_utc0",
-        "structural_vwap_mode": "anchored_daily",
+        "structural_vwap_mode": "anchored_weekly",
         "structural_vwap_rolling_window": 20,
-        "vwap_retest_tolerance": 0.005,
+        "vwap_retest_tolerance": 0.003,
         "vwap_deviation_optimal": 0.008,
         "vwap_deviation_warning": 0.02,
-        "vwap_deviation_hard_block": 0.035
+        "vwap_deviation_hard_block": 0.03
       },
       "scoring_weights": {
         "weight_1h_direction": 0.4,
@@ -444,49 +520,50 @@
         "weight_volume": 0.15
       },
       "entry_thresholds": {
-        "default": 0.80,
-        "min_entry_score": 0.20,
-        "min_signal_score": 0.80,
+        "default": 0.85,
+        "min_entry_score": 0.25,
+        "min_signal_score": 0.86,
         "stable_bear_continuation_min_signal_score": 0.72,
         "stable_bull_continuation_min_signal_score": 0.72,
-        "red_bar_growing": 0.80,
-        "red_bar_shrinking": 0.80,
-        "flip_bearish": 0.88,
-        "flip_bullish": 0.76
+        "red_bar_growing": 0.94,
+        "red_bar_shrinking": 0.8,
+        "flip_bearish": 1.2,
+        "flip_bullish": 0.8,
+        "green_bar_growing": 0.86
       },
       "entry_filters": {
         "primary_direction_timeframe": "4h",
         "require_1h_confirmation_when_4h_primary": true,
         "allow_neutral_1h_confirmation": true,
         "light_1h_confirmation_when_4h_primary": true,
-        "enable_green_bar_growing_short_adx_1h_range_filter": true,
+        "enable_green_bar_growing_short_adx_1h_range_filter": false,
         "require_15m_confirmation_gate": false,
-        "green_bar_growing_short_min_adx_1h": 40.0,
-        "green_bar_growing_short_max_adx_1h": 50.0,
+        "green_bar_growing_short_min_adx_1h": 35.0,
+        "green_bar_growing_short_max_adx_1h": 60.0,
         "enable_4h_preflip_trial_entries": true,
         "preflip_trial_min_shrink_pct_long": 0.45,
         "preflip_trial_min_shrink_pct_short": 0.22,
-        "preflip_trial_min_signal_score": 0.60,
-        "preflip_trial_min_vwap_score": 0.03,
-        "preflip_trial_entry_scale": 0.35,
-        "preflip_trial_max_leverage": 2,
+        "preflip_trial_min_signal_score": 0.8,
+        "preflip_trial_min_vwap_score": 0.08,
+        "preflip_trial_entry_scale": 0.2,
+        "preflip_trial_max_leverage": 3,
         "enable_trial_short_below_structure_continuation_promotion": true,
-        "trial_short_below_structure_promotion_min_signal_score": 0.68,
-        "trial_short_below_structure_promotion_min_vwap_score": 0.04,
-        "trial_short_below_structure_promotion_min_adx_1h": 25.0,
+        "trial_short_below_structure_promotion_min_signal_score": 0.8,
+        "trial_short_below_structure_promotion_min_vwap_score": 0.08,
+        "trial_short_below_structure_promotion_min_adx_1h": 30.0,
         "trial_short_below_structure_promotion_min_4h_shrink_pct": 0.8,
         "trial_short_below_structure_promotion_min_4h_shrink_bars": 6,
         "enable_stable_bear_continuation": true,
-        "stable_bear_continuation_min_vwap_score": 0.04,
+        "stable_bear_continuation_min_vwap_score": 0.05,
         "stable_bear_continuation_min_adx_1h": 25.0,
-        "stable_bear_continuation_min_4h_bars": 2,
+        "stable_bear_continuation_min_4h_bars": 1,
         "enable_stable_bull_continuation": true,
-        "stable_bull_continuation_min_vwap_score": 0.1,
-        "stable_bull_continuation_min_adx_1h": 30.0,
-        "stable_bull_continuation_min_4h_bars": 2,
-        "enable_flip_bullish_strict_filter": true,
+        "stable_bull_continuation_min_vwap_score": 0.08,
+        "stable_bull_continuation_min_adx_1h": 25.0,
+        "stable_bull_continuation_min_4h_bars": 1,
+        "enable_flip_bullish_strict_filter": false,
         "disable_flip_bullish_entries": false,
-        "flip_bullish_min_vwap_score": 0.12,
+        "flip_bullish_min_vwap_score": 0.08,
         "flip_bullish_require_pullback_bounce": true,
         "flip_bullish_require_15m_growing": true,
         "enable_flip_bullish_cvd_context_filter": false,
@@ -494,62 +571,197 @@
         "flip_bullish_min_cvd_1h_delta_ratio": 0.03,
         "flip_bearish_min_boll_multiplier": 0.0,
         "flip_bearish_normal_boll_min_signal_score": 0.0,
-        "flip_bearish_normal_boll_max_leverage": 2,
-        "flip_bearish_min_adx_1h": 30.0,
-        "flip_bearish_retest_reject_min_vwap_score": 0.16,
+        "flip_bearish_normal_boll_max_leverage": 3,
+        "flip_bearish_min_adx_1h": 25.0,
+        "flip_bearish_retest_reject_min_vwap_score": 0.18,
         "flip_bearish_max_bb_middle_slope_1h": 0.0,
         "flip_bearish_max_bb_middle_slope_4h": 0.0005,
         "bb_slope_lookback_1h": 3,
         "bb_slope_lookback_4h": 2,
-        "disable_red_bar_growing_long_entries": false,
+        "disable_red_bar_growing_long_entries": true,
         "disable_green_bar_growing_entries": false,
-        "disable_green_bar_shrinking_short_dual_pressure_entries": true,
+        "disable_green_bar_shrinking_short_dual_pressure_entries": false,
         "disable_red_bar_shrinking_long_dual_support_entries": true,
-        "min_signal_score": 0.70,
-        "min_vwap_score_for_entry": 0.04,
+        "min_signal_score": 0.86,
+        "min_vwap_score_for_entry": 0.12,
         "symbol_signal_overrides": [
           {
-            "symbol": "DOTUSDT",
-            "disable_green_bar_growing": true
+            "symbol": "ZECUSDT",
+            "min_signal_score_override": 0.95,
+            "min_vwap_score_override": 0.16,
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
           },
           {
-            "symbol": "ONDOUSDT",
-            "disable_green_bar_growing": true
+            "symbol": "TONUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
           },
           {
-            "symbol": "HYPEUSDT",
-            "disable_green_bar_growing": true
-          },
-          {
-            "symbol": "WLDUSDT",
-            "disable_green_bar_growing": true
+            "symbol": "FETUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
           },
           {
             "symbol": "DOGEUSDT",
-            "disable_green_bar_growing": true
+            "min_signal_score_override": 0.94,
+            "min_vwap_score_override": 0.13,
+            "flip_bullish_mode": "trial_only",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "ONDOUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "APTUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "AVAXUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "LINKUSDT",
+            "min_signal_score_override": 0.95,
+            "min_vwap_score_override": 0.15,
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "ADAUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "BCHUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "JUPUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "PUMPUSDT",
+            "flip_bullish_mode": "trial_only",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "RENDERUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "ZROUSDT",
+            "min_signal_score_override": 0.97,
+            "min_vwap_score_override": 0.17,
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
           },
           {
             "symbol": "LTCUSDT",
-            "disable_green_bar_growing": true
+            "min_signal_score_override": 0.95,
+            "min_vwap_score_override": 0.15,
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "XRPUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "SOLUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "HYPEUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "XLMUSDT"
+          },
+          {
+            "symbol": "DOTUSDT"
+          },
+          {
+            "symbol": "SUIUSDT"
+          },
+          {
+            "symbol": "TAOUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "AAVEUSDT"
+          },
+          {
+            "symbol": "ATOMUSDT"
+          },
+          {
+            "symbol": "ICPUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "ETCUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "KASUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "POLUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "WLDUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "MORPHOUSDT",
+            "flip_bullish_mode": "trial_only"
+          },
+          {
+            "symbol": "ENAUSDT"
+          },
+          {
+            "symbol": "TRUMPUSDT"
+          },
+          {
+            "symbol": "ALGOUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "FILUSDT"
+          },
+          {
+            "symbol": "VETUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold"
+          },
+          {
+            "symbol": "ARBUSDT"
+          },
+          {
+            "symbol": "JSTUSDT",
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "flip_bullish_mode": "trial_only"
           }
         ],
-        "soft_15m_entry_score": 0.3,
+        "soft_15m_entry_score": 0.14,
         "pocket_entry_overrides": {
           "red_bar_growing|long_dual_support": {
             "label": "ld_support_e2_cvd_vwap_score",
             "allow_neutral_1h_confirmation": false,
             "require_strict_1h_confirmation": true,
             "disallow_trial_entry": true,
-            "min_signal_score": 0.88,
-            "min_vwap_score": 0.16,
-            "min_entry_score": 0.5,
+            "min_signal_score": 0.84,
+            "min_vwap_score": 0.12,
+            "min_entry_score": 0.35,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true
           },
           "green_bar_growing|short_dual_pressure": {
             "label": "sdp_a_strict_gate",
-            "min_signal_score": 0.88,
-            "min_vwap_score": 0.18,
+            "min_signal_score": 0.84,
+            "min_vwap_score": 0.14,
             "require_cvd_ok": true,
             "require_strict_1h_confirmation": true
           },
@@ -558,12 +770,31 @@
             "allow_neutral_1h_confirmation": false,
             "require_strict_1h_confirmation": true,
             "strict_1h_direction": "bearish",
-            "min_signal_score": 0.88,
-            "min_vwap_score": 0.155,
+            "min_signal_score": 0.84,
+            "min_vwap_score": 0.12,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true
+          },
+          "green_bar_growing|short_under_structure_wait_reject": {
+            "label": "lowfreq_disable_suwr",
+            "min_signal_score": 0.9,
+            "min_vwap_score": 0.14,
+            "require_strict_1h_confirmation": true
+          },
+          "green_bar_growing|short_below_session_above_structure": {
+            "label": "lowfreq_disable_sbas",
+            "min_signal_score": 0.9,
+            "min_vwap_score": 0.14,
+            "require_strict_1h_confirmation": true
           }
-        }
+        },
+        "disable_flip_bullish_trial_entries": false,
+        "long_entry_mode": "all",
+        "long_whitelist_signal_types": [],
+        "long_whitelist_vwap_states": [],
+        "long_whitelist_pockets": [
+          "flip_bullish|long_reclaim_confirmed"
+        ]
       },
       "symbol_timed_campaigns": [
         {
@@ -599,7 +830,7 @@
         "overheat_growing_penalty": 0.12,
         "overheat_boll_multiplier_threshold": 1.2,
         "overheat_vwap_score_threshold": 0.1,
-        "min_vwap_score_for_entry": 0.1
+        "min_vwap_score_for_entry": 0.12
       },
       "stop_loss_config": {
         "use_dynamic_stop": true,
@@ -607,16 +838,16 @@
         "max_stop_loss_pct": 0.025,
         "vwap_alert_deviation": 0.005,
         "enable_4h_shrink_exit": true,
-        "exit_4h_shrink_bars": 2,
+        "exit_4h_shrink_bars": 3,
         "exit_4h_min_shrink_pct": 0.15,
         "exit_4h_require_profit": false,
         "enable_stable_continuation_slow_4h_shrink_exit": true,
-        "stable_continuation_exit_4h_shrink_bars": 3,
+        "stable_continuation_exit_4h_shrink_bars": 4,
         "stable_continuation_exit_4h_min_shrink_pct": 0.35,
         "shrink_exit_loss_mitigation_enabled": true,
         "shrink_exit_loss_mitigation_pnl_threshold": -0.005,
-        "shrink_exit_loss_mitigation_exit_ratio": 0.6,
-        "shrink_exit_loss_mitigation_ignore_if_pnl_gt": 0.01
+        "shrink_exit_loss_mitigation_exit_ratio": 0.35,
+        "shrink_exit_loss_mitigation_ignore_if_pnl_gt": 0.005
       },
       "short_quality_filter": {
         "enabled": false,
@@ -639,7 +870,24 @@
         "cvd_negative_delta_ratio_threshold": -0.05,
         "cvd_bullish_bonus_multiplier": 0.0,
         "cvd_neutral_bonus_multiplier": 0.7,
-        "cvd_bearish_bonus_multiplier": 1.0
+        "cvd_bearish_bonus_multiplier": 1.0,
+        "score_tiers": [
+          {
+            "score_min": 1.0,
+            "score_max": 1.0,
+            "leverage": 5
+          },
+          {
+            "score_min": 0.84,
+            "score_max": 1.0,
+            "leverage": 4
+          },
+          {
+            "score_min": 0.78,
+            "score_max": 0.84,
+            "leverage": 3
+          }
+        ]
       },
       "cvd_filter_config": {
         "enabled": false,
@@ -702,6 +950,136 @@
             "position_mult": 1.05
           }
         ]
+      },
+      "symbol_risk_tiers": {
+        "watchlist_symbols": [
+          "XRPUSDT",
+          "LINKUSDT",
+          "LTCUSDT",
+          "HYPEUSDT",
+          "ENAUSDT",
+          "FILUSDT",
+          "ARBUSDT",
+          "APTUSDT",
+          "ICPUSDT",
+          "ZROUSDT",
+          "XLMUSDT",
+          "ETCUSDT",
+          "TONUSDT",
+          "FETUSDT",
+          "DOGEUSDT",
+          "ONDOUSDT",
+          "ZECUSDT",
+          "RENDERUSDT"
+        ],
+        "watchlist_max_position_portion": 0.15,
+        "watchlist_max_leverage": 3,
+        "watchlist_apply_session_scale_double": true,
+        "watchlist_session_scale_multiplier": 0.6
+      },
+      "position_size_config": {
+        "score_tiers": [
+          {
+            "score_min": 0.85,
+            "target_portion": 0.3
+          },
+          {
+            "score_min": 0.75,
+            "target_portion": 0.28
+          },
+          {
+            "score_min": 0.68,
+            "target_portion": 0.24
+          }
+        ]
+      },
+      "pocket_management_overrides": {
+        "flip_bullish|long_reclaim_confirmed": {
+          "leverage_floor": 5,
+          "position_scale": 0.9,
+          "max_target_portion": 0.24,
+          "time_exit_enabled": false
+        },
+        "green_bar_growing|long_reclaim_confirmed": {
+          "time_exit_enabled": false
+        },
+        "green_bar_growing|short_retest_reject": {
+          "leverage_floor": 5,
+          "position_scale": 0.9,
+          "max_target_portion": 0.24,
+          "disable_shrink_loss_mitigation": true,
+          "enable_4h_shrink_exit": false,
+          "promote_to_min_open": true,
+          "promote_to_min_open_min_signal_score": 0.86,
+          "tp_pct": 0.05,
+          "take_profit_pct_levels": [
+            0.01,
+            0.018,
+            0.032
+          ],
+          "take_profit_reduce_pct_levels": [
+            0.2,
+            0.2,
+            0.15
+          ],
+          "time_exit_minutes": 25,
+          "time_exit_min_profit_pct": 0.0008,
+          "trailing_activation_pct": 0.01,
+          "trailing_atr_multiplier": 1.2,
+          "trailing_min_distance": 0.008,
+          "trailing_max_distance": 0.018,
+          "breakeven_trigger": 0.008,
+          "breakeven_lock": 0.0025
+        },
+        "flip_bearish|short_retest_reject": {
+          "leverage_cap": 2,
+          "position_scale": 0.75,
+          "max_target_portion": 0.18,
+          "tp_pct": 0.05,
+          "take_profit_pct_levels": [
+            0.01,
+            0.018,
+            0.03
+          ],
+          "take_profit_reduce_pct_levels": [
+            0.2,
+            0.2,
+            0.15
+          ],
+          "time_exit_minutes": 20,
+          "time_exit_min_profit_pct": 0.0008,
+          "trailing_activation_pct": 0.01,
+          "trailing_atr_multiplier": 1.15,
+          "trailing_min_distance": 0.008,
+          "trailing_max_distance": 0.017,
+          "breakeven_trigger": 0.008,
+          "breakeven_lock": 0.0025
+        },
+        "green_bar_growing|short_below_session_above_structure": {
+          "leverage_cap": 2,
+          "position_scale": 0.75,
+          "max_target_portion": 0.15,
+          "tp_pct": 0.028,
+          "sl_pct": 0.012,
+          "take_profit_pct_levels": [
+            0.006,
+            0.0095,
+            0.014
+          ],
+          "take_profit_reduce_pct_levels": [
+            0.4,
+            0.3,
+            0.15
+          ],
+          "time_exit_minutes": 8,
+          "time_exit_min_profit_pct": 0.0002,
+          "trailing_activation_pct": 0.003,
+          "trailing_atr_multiplier": 0.35,
+          "trailing_min_distance": 0.003,
+          "trailing_max_distance": 0.006,
+          "breakeven_trigger": 0.002,
+          "breakeven_lock": 0.001
+        }
       }
     },
     "vwap_structure_overrides": {
@@ -709,47 +1087,79 @@
         "position_scale_override": 0.8
       },
       "long_below_both": {
-        "position_scale_override": 0.60,
-        "max_leverage_override": 5
+        "position_scale_override": 0.6,
+        "max_leverage_override": 4
       },
       "short_above_both": {
-        "position_scale_override": 0.60,
-        "max_leverage_override": 5
+        "position_scale_override": 0.6,
+        "max_leverage_override": 4
       }
     },
     "passive_pricing": {
       "signal_type_multipliers": {
-        "flip_bullish": 1.40,
-        "flip_bearish": 1.40
+        "flip_bullish": 1.4,
+        "flip_bearish": 1.4
       },
       "vwap_state_multipliers": {}
     },
     "signal_type_tp_config": {
       "enabled": true,
       "flip_bullish": {
-        "take_profit_pct_levels": [0.012, 0.020, 0.035],
-        "take_profit_reduce_pct_levels": [0.20, 0.30, 0.20],
+        "take_profit_pct_levels": [
+          0.012,
+          0.02,
+          0.035
+        ],
+        "take_profit_reduce_pct_levels": [
+          0.2,
+          0.3,
+          0.2
+        ],
         "trailing_stop_enabled": true,
         "trailing_stop_activation_pct": 0.025,
         "trailing_stop_min_distance_pct": 0.008,
-        "trailing_stop_max_distance_pct": 0.020
+        "trailing_stop_max_distance_pct": 0.02
       },
       "flip_bearish": {
-        "take_profit_pct_levels": [0.008, 0.014, 0.022],
-        "take_profit_reduce_pct_levels": [0.30, 0.35, 0.25],
+        "take_profit_pct_levels": [
+          0.008,
+          0.014,
+          0.022
+        ],
+        "take_profit_reduce_pct_levels": [
+          0.3,
+          0.35,
+          0.25
+        ],
         "trailing_stop_enabled": false
       },
       "red_bar_growing": {
-        "take_profit_pct_levels": [0.008, 0.012, 0.020],
-        "take_profit_reduce_pct_levels": [0.25, 0.30, 0.20],
+        "take_profit_pct_levels": [
+          0.008,
+          0.012,
+          0.02
+        ],
+        "take_profit_reduce_pct_levels": [
+          0.25,
+          0.3,
+          0.2
+        ],
         "trailing_stop_enabled": true,
         "trailing_stop_activation_pct": 0.018,
         "trailing_stop_min_distance_pct": 0.006,
         "trailing_stop_max_distance_pct": 0.015
       },
       "green_bar_growing": {
-        "take_profit_pct_levels": [0.008, 0.012, 0.020],
-        "take_profit_reduce_pct_levels": [0.25, 0.30, 0.20],
+        "take_profit_pct_levels": [
+          0.008,
+          0.012,
+          0.02
+        ],
+        "take_profit_reduce_pct_levels": [
+          0.25,
+          0.3,
+          0.2
+        ],
         "trailing_stop_enabled": true,
         "trailing_stop_activation_pct": 0.018,
         "trailing_stop_min_distance_pct": 0.006,
@@ -761,14 +1171,14 @@
       "lookback_trades": 5,
       "win_4_of_5_multiplier": 1.15,
       "win_3_of_5_multiplier": 1.05,
-      "loss_3_of_5_multiplier": 0.80,
+      "loss_3_of_5_multiplier": 0.8,
       "loss_4_of_5_multiplier": 0.65,
-      "max_multiplier": 1.20,
-      "min_multiplier": 0.60
+      "max_multiplier": 1.2,
+      "min_multiplier": 0.6
     },
     "backtest": {
       "warmup_hours": 24,
-      "same_bar_tp_priority_mode": "tp1_before_stop",
+      "same_bar_tp_priority_mode": "stop_first",
       "runner_only_trailing_enabled": true,
       "runner_only_trailing_min_completed_levels": 1,
       "profiles": {
@@ -778,6 +1188,33 @@
           ],
           "max_active_symbols": 1
         }
+      }
+    },
+    "candidate_pre_filter": {
+      "enabled": true,
+      "candidate_filter_reject_combos": [
+        {
+          "symbol": "HYPEUSDT",
+          "signal_type": "green_bar_growing",
+          "vwap_state": "short_retest_reject",
+          "min_signal_score": 0.0,
+          "min_vwap_score": 0.0,
+          "reason_label": "HYPE_SRR_HARD_BLOCK"
+        },
+        {
+          "symbol": "RENDERUSDT",
+          "signal_type": "green_bar_growing",
+          "vwap_state": "short_retest_reject",
+          "min_signal_score": 0.0,
+          "min_vwap_score": 0.0,
+          "reason_label": "RENDER_SRR_HARD_BLOCK"
+        }
+      ],
+      "candidate_filter_min_signal_scores": {
+        "_default": 0.0
+      },
+      "candidate_filter_min_vwap_scores": {
+        "_default": 0.0
       }
     }
   },

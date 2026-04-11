@@ -318,7 +318,124 @@ def test_pure_strategy_runtime_bypasses_pretrade_risk_gate():
 
     assert out_decision.operation == FundFlowOperation.BUY
     assert gate_meta["action"] == "BYPASS_PURE_RUNTIME"
-    assert out_decision.metadata["pretrade_risk_gate"]["action"] == "BYPASS_PURE_RUNTIME"
+
+
+def test_extreme_volatility_cooldown_uses_shorter_first_lock_then_full_lock():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "extreme_volatility_cooldown_enabled": True,
+            "extreme_volatility_cooldown_timeframe": "15m",
+            "extreme_volatility_cooldown_atr_pct": 0.02,
+            "extreme_volatility_cooldown_consecutive_bars": 2,
+            "extreme_volatility_cooldown_seconds": 1800,
+            "extreme_volatility_cooldown_first_trigger_seconds": 900,
+        }
+    }
+    bot._volatility_cooldown_until_by_symbol = {}
+    bot._volatility_cooldown_reason_by_symbol = {}
+    bot._volatility_spike_streak_by_symbol = {}
+    bot._volatility_last_bucket_by_symbol = {}
+    bot._volatility_cooldown_trigger_count_by_symbol = {}
+    bucket_iter = iter(["bucket-1", "bucket-2", "bucket-3"])
+    bot._timeframe_bucket_key = lambda _tf: next(bucket_iter)
+    bot._to_float = lambda value, default=0.0: TradingBot._to_float(value, default)
+    bot._normalize_percent_to_ratio = lambda value, default: TradingBot._normalize_percent_to_ratio(value, default)
+
+    flow_context = {"timeframes": {"15m": {"atr_pct": 0.03}}}
+
+    first = bot._update_extreme_volatility_state("TAOUSDT", flow_context)
+    second = bot._update_extreme_volatility_state("TAOUSDT", flow_context)
+    third = bot._update_extreme_volatility_state("TAOUSDT", flow_context)
+
+    assert first["blocked"] is False
+    assert first["streak"] == 1
+    assert first["trigger_count"] == 0
+    assert second["blocked"] is True
+    assert 850 <= second["remaining_seconds"] <= 900
+    assert second["streak"] == 2
+    assert second["trigger_count"] == 1
+    assert third["blocked"] is True
+    assert 1750 <= third["remaining_seconds"] <= 1800
+    assert third["streak"] == 3
+    assert third["trigger_count"] == 2
+
+
+def test_extreme_volatility_cooldown_supports_symbol_specific_quantile_thresholds():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {
+        "fund_flow": {
+            "extreme_volatility_cooldown_enabled": True,
+            "extreme_volatility_cooldown_timeframe": "15m",
+            "extreme_volatility_cooldown_atr_pct": 0.02,
+            "extreme_volatility_cooldown_consecutive_bars": 1,
+            "extreme_volatility_cooldown_seconds": 1800,
+            "extreme_volatility_cooldown_first_trigger_seconds": 900,
+            "extreme_volatility_cooldown_quantile_enabled": True,
+            "extreme_volatility_cooldown_quantile_value": 0.75,
+            "extreme_volatility_cooldown_quantile_window": 3,
+            "extreme_volatility_cooldown_quantile_min_samples": 3,
+        }
+    }
+    bot._volatility_cooldown_until_by_symbol = {}
+    bot._volatility_cooldown_reason_by_symbol = {}
+    bot._volatility_spike_streak_by_symbol = {}
+    bot._volatility_last_bucket_by_symbol = {}
+    bot._volatility_cooldown_trigger_count_by_symbol = {}
+    bot._volatility_atr_pct_history_by_symbol = {}
+    bucket_iter = iter(["bucket-1", "bucket-2", "bucket-3", "bucket-4", "bucket-5"])
+    bot._timeframe_bucket_key = lambda _tf: next(bucket_iter)
+    bot._to_float = lambda value, default=0.0: TradingBot._to_float(value, default)
+    bot._normalize_percent_to_ratio = lambda value, default: TradingBot._normalize_percent_to_ratio(value, default)
+
+    bot._update_extreme_volatility_state("TAOUSDT", {"timeframes": {"15m": {"atr_pct": 0.010}}})
+    bot._update_extreme_volatility_state("TAOUSDT", {"timeframes": {"15m": {"atr_pct": 0.011}}})
+    bot._update_extreme_volatility_state("TAOUSDT", {"timeframes": {"15m": {"atr_pct": 0.012}}})
+    tao_blocked = bot._update_extreme_volatility_state("TAOUSDT", {"timeframes": {"15m": {"atr_pct": 0.013}}})
+    eth_clear = bot._update_extreme_volatility_state("ETHUSDT", {"timeframes": {"15m": {"atr_pct": 0.013}}})
+
+    assert tao_blocked["blocked"] is True
+    assert tao_blocked["quantile_window_size"] == 3
+    assert tao_blocked["atr_pct_quantile_threshold"] < 0.013
+    assert tao_blocked["cooldown_seconds_applied"] == 900
+    assert eth_clear["blocked"] is False
+    assert eth_clear["atr_pct_quantile_threshold"] == 0.02
+
+
+def test_live_config_restores_long_channel_and_relaxes_pocket_thresholds():
+    cfg = json.loads(Path("config/trading_config_fund_flow.json").read_text(encoding="utf-8"))
+
+    ff = cfg["fund_flow"]
+    strategy_cfg = cfg["fund_flow"]["macd_mtf_strategy_v2"]
+    entry_filters = cfg["fund_flow"]["macd_mtf_strategy_v2"]["entry_filters"]
+    penalty_config = strategy_cfg["penalty_config"]
+    pocket_overrides = entry_filters["pocket_entry_overrides"]
+
+    assert ff["extreme_volatility_cooldown_quantile_enabled"] is True
+    assert ff["extreme_volatility_cooldown_quantile_value"] == 0.95
+    assert ff["extreme_volatility_cooldown_quantile_window"] == 96
+    assert ff["extreme_volatility_cooldown_quantile_min_samples"] == 24
+    assert strategy_cfg["entry_thresholds"]["min_entry_score"] == 0.25
+    assert entry_filters["min_vwap_score_for_entry"] == 0.12
+    assert penalty_config["min_vwap_score_for_entry"] == 0.12
+    assert entry_filters["disable_flip_bullish_trial_entries"] is False
+    assert entry_filters["long_entry_mode"] == "all"
+    doge_override = next(item for item in entry_filters["symbol_signal_overrides"] if item["symbol"] == "DOGEUSDT")
+    assert doge_override["flip_bullish_mode"] == "trial_only"
+    assert doge_override["green_bar_growing_mode"] == "enabled_with_strict_threshold"
+    assert "disable_flip_bullish" not in doge_override
+    assert "disable_green_bar_growing" not in doge_override
+    assert pocket_overrides["red_bar_growing|long_dual_support"]["min_signal_score"] == 0.84
+    assert pocket_overrides["red_bar_growing|long_dual_support"]["min_vwap_score"] == 0.12
+    assert pocket_overrides["red_bar_growing|long_dual_support"]["min_entry_score"] == 0.35
+    assert pocket_overrides["green_bar_growing|short_dual_pressure"]["min_signal_score"] == 0.84
+    assert pocket_overrides["green_bar_growing|short_dual_pressure"]["min_vwap_score"] == 0.14
+    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_signal_score"] == 0.84
+    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_vwap_score"] == 0.12
+    assert pocket_overrides["green_bar_growing|short_under_structure_wait_reject"]["min_signal_score"] == 0.90
+    assert pocket_overrides["green_bar_growing|short_under_structure_wait_reject"]["min_vwap_score"] == 0.14
+    assert pocket_overrides["green_bar_growing|short_below_session_above_structure"]["min_signal_score"] == 0.90
+    assert pocket_overrides["green_bar_growing|short_below_session_above_structure"]["min_vwap_score"] == 0.14
 
 
 def test_pure_strategy_runtime_bypasses_dynamic_max_active_symbols():

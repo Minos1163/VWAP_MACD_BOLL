@@ -101,6 +101,85 @@ def test_macd_v2_engine_for_symbol_applies_trial_specific_overrides() -> None:
     assert local_engine.config.preflip_trial_min_signal_score == 0.90
 
 
+def test_macd_v2_engine_for_symbol_marks_explicit_flip_bullish_disable_as_force_override() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "disable_flip_bullish_entries": False,
+        }
+    }
+    cfg["fund_flow"]["symbol_overrides"] = {
+        "BCHUSDT": {
+            "disable_flip_bullish": True,
+        }
+    }
+
+    engine = FundFlowDecisionEngine(cfg)
+    local_engine, override = engine._macd_v2_engine_for_symbol("BCHUSDT")
+
+    assert override["disable_flip_bullish"] is True
+    assert local_engine.config.disable_flip_bullish_entries is True
+    assert local_engine.config.force_disable_flip_bullish_entries is True
+
+
+def test_macd_v2_engine_for_symbol_supports_signal_mode_overrides() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "disable_flip_bullish_entries": False,
+            "disable_flip_bullish_trial_entries": False,
+            "disable_green_bar_growing_entries": True,
+            "min_signal_score": 0.85,
+            "flip_bullish_min_vwap_score": 0.12,
+        }
+    }
+    cfg["fund_flow"]["symbol_overrides"] = {
+        "DOGEUSDT": {
+            "flip_bullish_mode": "trial_only",
+            "green_bar_growing_mode": "enabled_with_strict_threshold",
+            "min_signal_score_override": 0.91,
+            "min_vwap_score_override": 0.15,
+        }
+    }
+
+    engine = FundFlowDecisionEngine(cfg)
+    local_engine, override = engine._macd_v2_engine_for_symbol("DOGEUSDT")
+
+    assert override["flip_bullish_mode"] == "trial_only"
+    assert override["green_bar_growing_mode"] == "enabled_with_strict_threshold"
+    assert local_engine.config.disable_flip_bullish_entries is True
+    assert local_engine.config.force_disable_flip_bullish_entries is False
+    assert local_engine.config.disable_flip_bullish_trial_entries is False
+    assert local_engine.config.disable_green_bar_growing_entries is False
+    assert local_engine.config.min_signal_score == 0.91
+    assert local_engine.config.flip_bullish_min_vwap_score == 0.15
+
+
+def test_enforce_direction_lock_on_decision_marks_structured_primary_blocker() -> None:
+    engine = FundFlowDecisionEngine(_cfg())
+    decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=2,
+        reason="macd_v2_long_signal",
+        metadata={"strategy_mode": "macd_mtf_strategy_v2"},
+    )
+
+    blocked = engine._enforce_direction_lock_on_decision(
+        decision,
+        {"direction": "SHORT_ONLY"},
+        source="macd_v2",
+    )
+
+    assert blocked.operation == Operation.HOLD
+    assert blocked.metadata["direction_lock_block"] is True
+    assert blocked.metadata["primary_open_blocker"] == "direction_lock_block"
+    assert blocked.metadata["blocked_reason"] == "direction_lock_hard_block:SHORT_ONLY"
+
+
 def test_macd_v2_config_keeps_long_whitelist_controls_in_decision_engine() -> None:
     cfg = _cfg()
     cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
@@ -124,6 +203,25 @@ def test_macd_v2_config_keeps_long_whitelist_controls_in_decision_engine() -> No
     assert engine.macd_v2_config.long_whitelist_signal_types == strategy_config.long_whitelist_signal_types
     assert engine.macd_v2_config.long_whitelist_vwap_states == strategy_config.long_whitelist_vwap_states
     assert engine.macd_v2_config.long_whitelist_pockets == strategy_config.long_whitelist_pockets
+
+
+def test_pocket_leverage_floor_cannot_override_watchlist_max_leverage() -> None:
+    engine = FundFlowDecisionEngine(_cfg())
+    engine.min_leverage = 3
+    engine.max_leverage = 5
+    macd_v2_engine = SimpleNamespace(
+        config=SimpleNamespace(symbol_risk_watchlist_max_leverage=3),
+        is_watchlist_symbol=lambda symbol: str(symbol).upper() == "TONUSDT",
+    )
+
+    leverage = engine._apply_pocket_leverage_constraints(
+        leverage=3,
+        pocket_management_override={"leverage_floor": 5},
+        macd_v2_engine=macd_v2_engine,
+        symbol="TONUSDT",
+    )
+
+    assert leverage == 3
 
 
 def test_decide_hold_when_long_score_lacks_breakout_or_pullback():
@@ -169,6 +267,27 @@ def test_decide_close_long_when_short_reversal():
     assert decision.reason == "macd_mtf_missing_tf_data"
 
 
+def test_macd_v2_missing_tf_data_includes_timeframe_diagnostics() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    engine = FundFlowDecisionEngine(cfg)
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=100.0,
+        market_flow_context={"timeframes": {"15m": {"macd_hist": 0.1}, "1h": {}, "4h": {}}},
+        regime_info={"regime": "TREND", "direction": "BOTH", "guide_direction": "BOTH"},
+    )
+
+    assert decision.operation == Operation.HOLD
+    assert decision.reason == "macd_v2_missing_tf_data"
+    diag = decision.metadata["macd_tf_diagnostics"]
+    assert diag["15m"]["timeframe_present"] is True
+    assert diag["1h"]["timeframe_present"] is False
+    assert diag["4h"]["timeframe_present"] is False
+
+
 def test_decide_macd_v2_hard_blocks_long_when_direction_lock_is_short_only():
     cfg = _cfg()
     cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
@@ -210,6 +329,83 @@ def test_decide_macd_v2_hard_blocks_long_when_direction_lock_is_short_only():
     assert decision.metadata["blocked_operation"] == Operation.BUY.value
 
 
+def test_macd_v2_decision_metadata_includes_timeframe_diagnostics_when_series_exist() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_thresholds": {
+            "default": 0.1,
+            "min_entry_score": 0.1,
+            "min_signal_score": 0.1,
+            "red_bar_growing": 0.1,
+            "red_bar_shrinking": 0.1,
+            "flip_bearish": 0.1,
+            "flip_bullish": 0.1,
+            "green_bar_growing": 0.1,
+        },
+        "entry_filters": {
+            "primary_direction_timeframe": "4h",
+            "require_1h_confirmation_when_4h_primary": True,
+            "allow_neutral_1h_confirmation": True,
+            "light_1h_confirmation_when_4h_primary": True,
+            "require_15m_confirmation_gate": False,
+            "disable_flip_bullish_entries": False,
+            "disable_flip_bullish_trial_entries": False,
+            "disable_green_bar_growing_entries": False,
+            "min_signal_score": 0.1,
+            "min_vwap_score_for_entry": 0.0,
+        },
+    }
+    engine = FundFlowDecisionEngine(cfg)
+
+    timeframes = {
+        "15m": {
+            "timestamp": "2026-04-01T00:00:00+00:00",
+            "macd_hist_series": [-0.00040, -0.00025, -0.00018, -0.00010],
+            "volume": 200.0,
+            "avg_volume": 100.0,
+            "bb_middle": 100.0,
+            "bb_upper": 103.0,
+            "bb_lower": 97.0,
+            "close": 100.8,
+        },
+        "1h": {
+            "timestamp": "2026-04-01T00:00:00+00:00",
+            "macd_hist_series": [0.0, 0.0, 0.0, 0.0],
+            "close": 101.0,
+            "vwap": 100.0,
+            "structural_vwap": 99.6,
+            "bb_middle": 100.0,
+            "bb_upper": 110.0,
+            "bb_lower": 90.0,
+            "atr": 1.0,
+            "adx": 20.0,
+        },
+        "4h": {
+            "timestamp": "2026-04-01T00:00:00+00:00",
+            "macd_hist_series": [-0.30, -0.15, -0.05, 0.20],
+            "bb_middle": 99.0,
+            "bb_upper": 109.0,
+            "bb_lower": 89.0,
+            "adx": 22.0,
+        },
+    }
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=101.0,
+        market_flow_context={"timeframes": timeframes},
+        regime_info={"regime": "TREND", "direction": "BOTH", "guide_direction": "BOTH", "adx": 22.0, "atr_pct": 0.01},
+    )
+
+    assert decision.metadata["strategy_mode"] == "macd_mtf_strategy_v2"
+    diag = decision.metadata["macd_tf_diagnostics"]
+    assert diag["15m"]["series_source"] == "series"
+    assert diag["1h"]["series_source"] == "series"
+    assert diag["4h"]["series_source"] == "series"
+
+
 def test_decide_hold_when_signal_not_enough():
     engine = FundFlowDecisionEngine(_cfg())
     decision = engine.decide(
@@ -246,6 +442,7 @@ def test_entry_hard_gate_allows_missing_spread_for_configured_pocket_match() -> 
     engine = FundFlowDecisionEngine(cfg)
 
     passed, reason, _ = engine._validate_macd_v2_entry_hard_gates(
+        symbol="BTCUSDT",
         direction="long",
         price=101.0,
         structural_vwap=100.0,
@@ -293,6 +490,7 @@ def test_entry_hard_gate_keeps_missing_spread_block_when_vwap_below_rule_floor()
     engine = FundFlowDecisionEngine(cfg)
 
     passed, reason, _ = engine._validate_macd_v2_entry_hard_gates(
+        symbol="BTCUSDT",
         direction="long",
         price=101.0,
         structural_vwap=100.0,
@@ -315,6 +513,239 @@ def test_entry_hard_gate_keeps_missing_spread_block_when_vwap_below_rule_floor()
     assert reason == "L1_structure_failed:spread_ok"
 
 
+def test_entry_hard_gate_can_skip_regime_trend_requirement_but_keep_other_l1_checks() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"].update(
+        {
+            "entry_hard_gates_enabled": True,
+            "entry_hard_gate_require_regime_trend": False,
+            "entry_hard_gate_adx_min": 22,
+            "entry_hard_gate_atr_min": 0.006,
+            "entry_hard_gate_atr_max": 0.02,
+            "entry_hard_gate_spread_bps_max": 0.0008,
+            "entry_hard_gate_flow_min_pass": 2,
+            "entry_hard_gate_micro_min_pass": 1,
+        }
+    )
+    engine = FundFlowDecisionEngine(cfg)
+
+    passed, reason, _ = engine._validate_macd_v2_entry_hard_gates(
+        symbol="BTCUSDT",
+        direction="long",
+        price=101.0,
+        structural_vwap=100.0,
+        market_flow_context={"cvd_ratio": 0.1},
+        regime_info={"regime": "RANGE", "atr_pct": 0.01},
+        tf_15m={
+            "spread_bps": 0.0005,
+            "cvd_ratio": 0.1,
+            "depth_ratio": 1.03,
+            "imbalance": 0.04,
+            "cvd_momentum": 0.1,
+        },
+        tf_1h={"adx": 30.0, "oi_delta_ratio": 0.1},
+        signal_type_1h="green_bar_growing",
+        vwap_state="long_reclaim_confirmed",
+        vwap_score=0.1535,
+    )
+
+    assert passed is True
+    assert reason == ""
+
+
+def test_entry_hard_gate_can_bypass_selected_l1_failures_for_target_long_symbols() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"].update(
+        {
+            "entry_hard_gates_enabled": True,
+            "entry_hard_gate_adx_min": 18,
+            "entry_hard_gate_atr_min": 0.003,
+            "entry_hard_gate_atr_max": 0.02,
+            "entry_hard_gate_spread_bps_max": 0.0008,
+            "entry_hard_gate_flow_min_pass": 1,
+            "entry_hard_gate_micro_min_pass": 1,
+            "entry_hard_gate_bypass_rules": [
+                {
+                    "direction": "long",
+                    "symbols": ["TRUMPUSDT", "SUIUSDT"],
+                    "signal_type_1h": "flip_bullish",
+                    "vwap_state": "long_reclaim_confirmed",
+                    "min_signal_score": 0.90,
+                    "min_vwap_score": 0.12,
+                    "allow_l1_failures": ["regime_trend", "adx_sufficient", "spread_ok"],
+                }
+            ],
+        }
+    )
+    engine = FundFlowDecisionEngine(cfg)
+
+    passed, reason, meta = engine._validate_macd_v2_entry_hard_gates(
+        symbol="TRUMPUSDT",
+        direction="long",
+        price=101.0,
+        structural_vwap=100.0,
+        market_flow_context={"cvd_ratio": 0.1},
+        regime_info={"regime": "RANGE", "atr_pct": 0.01},
+        tf_15m={
+            "spread_bps": 0.0012,
+            "cvd_ratio": 0.1,
+            "depth_ratio": 1.03,
+            "imbalance": 0.04,
+            "cvd_momentum": 0.1,
+        },
+        tf_1h={"adx": 15.0, "oi_delta_ratio": 0.01},
+        signal_type_1h="flip_bullish",
+        vwap_state="long_reclaim_confirmed",
+        vwap_score=0.16,
+        signal_score=0.95,
+    )
+
+    assert passed is True
+    assert reason == ""
+    assert meta["entry_hard_gate_bypass_rule"]["signal_type_1h"] == "flip_bullish"
+    assert set(meta["entry_hard_gate_bypassed_l1_failures"]) == {"regime_trend", "adx_sufficient", "spread_ok"}
+
+
+def test_entry_hard_gate_can_bypass_microstructure_failure_for_target_long_symbols() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"].update(
+        {
+            "entry_hard_gates_enabled": True,
+            "entry_hard_gate_adx_min": 15,
+            "entry_hard_gate_atr_min": 0.003,
+            "entry_hard_gate_atr_max": 0.02,
+            "entry_hard_gate_spread_bps_max": 0.0008,
+            "entry_hard_gate_flow_min_pass": 1,
+            "entry_hard_gate_micro_min_pass": 1,
+            "entry_hard_gate_bypass_rules": [
+                {
+                    "direction": "long",
+                    "symbol": "TRUMPUSDT",
+                    "signal_type_1h": "flip_bullish",
+                    "vwap_state": "long_reclaim_confirmed",
+                    "min_signal_score": 0.90,
+                    "min_vwap_score": 0.12,
+                    "allow_microstructure_fail": True,
+                }
+            ],
+        }
+    )
+    engine = FundFlowDecisionEngine(cfg)
+
+    passed, reason, meta = engine._validate_macd_v2_entry_hard_gates(
+        symbol="TRUMPUSDT",
+        direction="long",
+        price=101.0,
+        structural_vwap=100.0,
+        market_flow_context={"cvd_ratio": 0.1},
+        regime_info={"regime": "TREND", "atr_pct": 0.01},
+        tf_15m={
+            "spread_bps": 0.0004,
+            "cvd_ratio": 0.1,
+            "depth_ratio": 0.95,
+            "imbalance": 0.00,
+            "cvd_momentum": -0.1,
+        },
+        tf_1h={"adx": 20.0, "oi_delta_ratio": 0.01},
+        signal_type_1h="flip_bullish",
+        vwap_state="long_reclaim_confirmed",
+        vwap_score=0.16,
+        signal_score=0.95,
+    )
+
+    assert passed is True
+    assert reason == ""
+    assert meta["entry_hard_gate_bypass_rule"]["symbol"] == "TRUMPUSDT"
+    assert meta["entry_hard_gate_bypassed_microstructure"] is True
+
+
+def test_entry_hard_gate_bypass_rule_can_require_stable_continuation_active() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"].update(
+        {
+            "entry_hard_gates_enabled": True,
+            "entry_hard_gate_adx_min": 15,
+            "entry_hard_gate_atr_min": 0.003,
+            "entry_hard_gate_atr_max": 0.02,
+            "entry_hard_gate_spread_bps_max": 0.0008,
+            "entry_hard_gate_flow_min_pass": 1,
+            "entry_hard_gate_micro_min_pass": 1,
+            "entry_hard_gate_bypass_rules": [
+                {
+                    "direction": "long",
+                    "symbol": "SOLUSDT",
+                    "signal_type_1h": "flip_bullish",
+                    "vwap_state": "long_reclaim_confirmed",
+                    "min_signal_score": 0.95,
+                    "min_vwap_score": 0.13,
+                    "require_stable_continuation_active": True,
+                    "allow_l1_failures": ["regime_trend"],
+                }
+            ],
+        }
+    )
+    engine = FundFlowDecisionEngine(cfg)
+
+    passed, reason, _ = engine._validate_macd_v2_entry_hard_gates(
+        symbol="SOLUSDT",
+        direction="long",
+        price=101.0,
+        structural_vwap=100.0,
+        market_flow_context={"cvd_ratio": 0.1},
+        regime_info={"regime": "RANGE", "atr_pct": 0.01},
+        tf_15m={"spread_bps": 0.0004, "cvd_ratio": 0.1, "depth_ratio": 1.03, "imbalance": 0.04, "cvd_momentum": 0.1},
+        tf_1h={"adx": 20.0, "oi_delta_ratio": 0.01},
+        signal_type_1h="flip_bullish",
+        vwap_state="long_reclaim_confirmed",
+        vwap_score=0.16,
+        signal_score=1.0,
+        stable_continuation_active=False,
+    )
+
+    assert passed is False
+    assert reason == "L1_structure_failed:regime_trend"
+
+
+def test_direction_lock_bypass_rule_can_release_target_long_signal() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["direction_lock_bypass_rules"] = [
+        {
+            "direction_lock": "SHORT_ONLY",
+            "decision_side": "long",
+            "symbol": "SOLUSDT",
+            "signal_type_1h": "flip_bullish",
+            "vwap_state": "long_reclaim_confirmed",
+            "min_signal_score": 0.95,
+            "min_vwap_score": 0.13,
+            "require_stable_continuation_active": True,
+        }
+    ]
+    engine = FundFlowDecisionEngine(cfg)
+    decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="SOLUSDT",
+        target_portion_of_balance=0.2,
+        leverage=3,
+        reason="macd_v2_long_signal",
+        metadata={
+            "signal_type_1h": "flip_bullish",
+            "vwap_state": "long_reclaim_confirmed",
+            "signal_score": 1.0,
+            "vwap_score": 0.16,
+            "stable_continuation_active": True,
+        },
+    )
+
+    out = engine._enforce_direction_lock_on_decision(
+        decision,
+        {"direction": "SHORT_ONLY"},
+        source="macd_v2",
+    )
+
+    assert out.operation == Operation.BUY
+    assert out.metadata["direction_lock_bypass_rule"]["symbol"] == "SOLUSDT"
+
+
 def test_pure_strategy_runtime_bypasses_entry_hard_gate() -> None:
     cfg = _cfg()
     cfg["fund_flow"].update(
@@ -329,6 +760,7 @@ def test_pure_strategy_runtime_bypasses_entry_hard_gate() -> None:
     engine = FundFlowDecisionEngine(cfg)
 
     passed, reason, metadata = engine._validate_macd_v2_entry_hard_gates(
+        symbol="BTCUSDT",
         direction="long",
         price=100.0,
         structural_vwap=200.0,
@@ -501,6 +933,155 @@ def test_macd_v2_shrink_exit_loss_mitigation_returns_partial_close() -> None:
     assert decision.operation == Operation.CLOSE
     assert decision.target_portion_of_balance == 0.6
     assert decision.reason == "macd_v2_4h_shrink_reduce_long"
+
+
+def test_macd_v2_shrink_exit_loss_mitigation_can_be_disabled_for_main_short_pocket() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "stop_loss_config": {
+            "enable_4h_shrink_exit": True,
+            "exit_4h_require_profit": False,
+            "exit_4h_weak_loss_threshold": -1.0,
+            "shrink_exit_loss_mitigation_enabled": True,
+            "shrink_exit_loss_mitigation_pnl_threshold": -0.005,
+            "shrink_exit_loss_mitigation_exit_ratio": 0.6,
+            "shrink_exit_loss_mitigation_ignore_if_pnl_gt": 0.01,
+        },
+        "pocket_management_overrides": {
+            "green_bar_growing|short_retest_reject": {
+                "disable_shrink_loss_mitigation": True
+            }
+        },
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    signal = MACDSignalV2(
+        direction="neutral",
+        signal_score=0.0,
+        signal_type_1h="green_bar_growing",
+        entry_type_15m="green_bar_growing",
+        entry_score_15m=0.4,
+        vwap_score=0.2,
+        vwap_deviation=0.0,
+        vwap_state="short_retest_reject",
+        vwap_location_score=0.6,
+        ema_multiplier=1.0,
+        ema_structure_status="normal",
+        details={
+            "shrink_exit_direction": "SHORT",
+            "shrink_exit_ready": True,
+            "macd_4h_shrink_pct": 0.2,
+            "macd_4h_shrink_bars": 2,
+        },
+    )
+    engine._macd_v2_engine_for_symbol = lambda _symbol: (
+        SimpleNamespace(
+            analyze=lambda **_kwargs: signal,
+            resolve_4h_shrink_exit_policy=lambda **_kwargs: {
+                "active": True,
+                "mode": "default",
+                "shrink_exit_direction": "SHORT",
+                "required_bars": 2,
+                "required_pct": 0.15,
+                "shrink_bars": 2,
+                "shrink_pct": 0.2,
+                "stable_continuation_active": False,
+            },
+        ),
+        {},
+    )
+    engine._rule_position_pnl_ratio = lambda *_args, **_kwargs: -0.006
+    engine._detect_regime = lambda *_args, **_kwargs: {"regime": "TREND"}
+    engine._build_macd_v2_regime_entry_decision = lambda **_kwargs: None
+
+    decision = engine._decide_macd_v2_strategy(
+        "BTCUSDT",
+        {"positions": {"BTCUSDT": {"side": "SHORT"}}},
+        100.0,
+        {
+            "timeframes": {
+                "15m": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+                "1h": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+                "4h": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+            }
+        },
+        {"regime": "TREND"},
+    )
+
+    assert decision.reason == "macd_v2_4h_shrink_exit_short"
+
+
+def test_macd_v2_normal_shrink_exit_can_be_disabled_for_main_short_pocket() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "stop_loss_config": {
+            "enable_4h_shrink_exit": True,
+            "exit_4h_require_profit": False,
+            "exit_4h_weak_loss_threshold": -1.0,
+            "shrink_exit_loss_mitigation_enabled": False,
+        },
+        "pocket_management_overrides": {
+            "green_bar_growing|short_retest_reject": {
+                "enable_4h_shrink_exit": False
+            }
+        },
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    signal = MACDSignalV2(
+        direction="neutral",
+        signal_score=0.0,
+        signal_type_1h="green_bar_growing",
+        entry_type_15m="green_bar_growing",
+        entry_score_15m=0.4,
+        vwap_score=0.2,
+        vwap_deviation=0.0,
+        vwap_state="short_retest_reject",
+        vwap_location_score=0.6,
+        ema_multiplier=1.0,
+        ema_structure_status="normal",
+        details={
+            "shrink_exit_direction": "SHORT",
+            "shrink_exit_ready": True,
+            "macd_4h_shrink_pct": 0.2,
+            "macd_4h_shrink_bars": 2,
+        },
+    )
+    engine._macd_v2_engine_for_symbol = lambda _symbol: (
+        SimpleNamespace(
+            analyze=lambda **_kwargs: signal,
+            resolve_4h_shrink_exit_policy=lambda **_kwargs: {
+                "active": True,
+                "mode": "default",
+                "shrink_exit_direction": "SHORT",
+                "required_bars": 2,
+                "required_pct": 0.15,
+                "shrink_bars": 2,
+                "shrink_pct": 0.2,
+                "stable_continuation_active": False,
+            },
+        ),
+        {},
+    )
+    engine._rule_position_pnl_ratio = lambda *_args, **_kwargs: -0.006
+    engine._detect_regime = lambda *_args, **_kwargs: {"regime": "TREND"}
+    engine._build_macd_v2_regime_entry_decision = lambda **_kwargs: None
+
+    decision = engine._decide_macd_v2_strategy(
+        "BTCUSDT",
+        {"positions": {"BTCUSDT": {"side": "SHORT", "signal_type_1h": "green_bar_growing", "vwap_state": "short_retest_reject"}}},
+        100.0,
+        {
+            "timeframes": {
+                "15m": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+                "1h": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+                "4h": {"timestamp": "2026-04-01 00:00:00", "macd_hist": 0.0, "macd_hist_prev": 0.0},
+            }
+        },
+        {"regime": "TREND"},
+    )
+
+    assert decision.operation == Operation.HOLD
 
 
 def test_pick_leverage_uses_discrete_config_levels():
@@ -889,7 +1470,7 @@ def test_resolve_entry_mode_does_not_inject_fallback_when_entry_window_closed():
     assert resolved.metadata["trend_capture_injection_gate_pass"] is False
 
 
-def test_detect_regime_primary_flat_prefers_5m_confluence_fallback_over_cvd():
+def test_detect_regime_primary_flat_ignores_ma10_kdj_fallback_and_uses_cvd():
     engine = FundFlowDecisionEngine(_cfg())
     regime_info = engine._detect_regime(
         {
@@ -936,9 +1517,9 @@ def test_detect_regime_primary_flat_prefers_5m_confluence_fallback_over_cvd():
             },
         }
     )
-    assert regime_info["guide_direction"] == "LONG_ONLY"
-    assert regime_info["lw"]["components"]["backup_source"] == "ma10_macd_confluence_5m"
-    assert regime_info["ev"]["components"]["backup_source"] == "ma10_macd_confluence_5m"
+    assert regime_info["guide_direction"] == "SHORT_ONLY"
+    assert regime_info["lw"]["components"]["backup_source"] == "cvd_imbalance"
+    assert regime_info["ev"]["components"]["backup_source"] == "cvd_imbalance"
 
 
 def test_detect_regime_primary_flat_still_uses_cvd_fallback_when_no_confluence():
@@ -973,6 +1554,70 @@ def test_detect_regime_primary_flat_still_uses_cvd_fallback_when_no_confluence()
     )
     assert regime_info["guide_direction"] == "SHORT_ONLY"
     assert regime_info["lw"]["components"]["backup_source"] == "cvd_imbalance"
+
+
+def test_detect_regime_conflicting_near_zero_guide_is_neutralized_to_both(monkeypatch):
+    engine = FundFlowDecisionEngine(_cfg())
+    monkeypatch.setattr(
+        engine,
+        "_score_lw",
+        lambda *_args, **_kwargs: {
+            "dir": "SHORT_ONLY",
+            "score": -0.024,
+            "components": {},
+            "combo_compare": {"score_macd_bb": -0.024},
+            "active_model": "MACD+BB",
+        },
+    )
+    monkeypatch.setattr(
+        engine,
+        "_score_ev",
+        lambda *_args, **_kwargs: {
+            "dir": "LONG_ONLY",
+            "score": 0.31,
+            "components": {},
+            "combo_compare": {"score_macd_bb": -0.024},
+            "active_model": "MACD+BB",
+        },
+    )
+
+    regime_info = engine._detect_regime(
+        {
+            "cvd_momentum": 0.1,
+            "imbalance": 0.1,
+            "timeframes": {
+                "15m": {
+                    "adx": 26.0,
+                    "atr_pct": 0.006,
+                    "ema_fast": 101.0,
+                    "ema_slow": 100.0,
+                    "last_open": 100.0,
+                    "last_close": 100.2,
+                    "macd_hist_norm": -0.024,
+                    "macd_cross": "NONE",
+                    "macd_hist_delta": 0.0,
+                    "bb_pos_norm": -0.02,
+                    "bb_width_norm": 0.01,
+                    "bb_break": "NONE",
+                    "bb_trend": "MID",
+                    "bb_squeeze": False,
+                },
+            },
+        }
+    )
+
+    assert regime_info["ev_direction"] == "LONG_ONLY"
+    assert regime_info["guide_direction"] == "BOTH"
+    assert regime_info["direction"] == "BOTH"
+    assert regime_info["guide_score_source"] == "macd_bb_only"
+
+
+def test_direction_guide_snapshot_defaults_to_macd_bb():
+    engine = FundFlowDecisionEngine(_cfg())
+    snapshot = engine.get_direction_guide_snapshot()
+
+    assert snapshot["model"] == "MACD_BB"
+    assert snapshot["enhanced_fallback_enabled"] is False
 
 
 def test_detect_regime_does_not_keep_long_only_on_monotonic_15m_selloff():
@@ -1272,6 +1917,103 @@ def test_resolve_entry_mode_allows_primary_flat_ma10_fallback_when_feature_snaps
     assert resolved.metadata["entry_feature_snapshot_all_zero"] is True
     assert resolved.metadata["entry_feature_snapshot_zero_soft_bypass"] is True
     assert "feature_snapshot_all_zero" not in resolved.metadata["entry_hard_filters"]
+
+
+def test_macd_v2_hold_metadata_surfaces_structured_reject_and_regime_fallback_fields():
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "min_signal_score": 0.85,
+        }
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    engine._detect_regime = lambda *_args, **_kwargs: {
+        "regime": "TREND",
+        "direction": "LONG_ONLY",
+        "guide_direction": "LONG_ONLY",
+        "adx": 25.0,
+        "atr_pct": 0.01,
+        "last_open": 100.0,
+        "last_close": 101.0,
+    }
+
+    fake_signal = MACDSignalV2(
+        direction="neutral",
+        signal_score=0.83,
+        signal_type_1h="red_bar_growing",
+        is_4h_enhanced=False,
+        enhancement_score=0.0,
+        entry_type_15m="pullback",
+        entry_score_15m=0.22,
+        vwap_score=0.11,
+        vwap_deviation=0.005,
+        vwap_state="long_dual_support",
+        vwap_location_score=0.0,
+        ema_multiplier=1.0,
+        ema_structure_status="normal",
+        details={
+            "reason": "pocket_min_entry_score_block",
+            "reject_reason_code": "pocket_min_entry_score_block",
+            "reject_stage": "pocket_entry_requirements",
+            "pocket_entry_override_label": "ld_support_e2_cvd_vwap_score",
+            "signal_score_threshold_used": 0.84,
+            "min_vwap_score_used": 0.12,
+            "min_entry_score_used": 0.35,
+            "direction_lock_applied": True,
+            "entry_hard_filter_blocked": True,
+            "entry_hard_filters": ["pending_side_short_blocks_long"],
+            "regime_fallback_allowed": False,
+            "regime_fallback_score": 0.61,
+            "stable_continuation_active": False,
+        },
+    )
+
+    class _FakeMacdEngine:
+        def analyze(self, **_kwargs):
+            return fake_signal
+
+        def resolve_4h_shrink_exit_policy(self, **_kwargs):
+            return {"active": False}
+
+    engine._macd_v2_engine_for_symbol = lambda _symbol: (_FakeMacdEngine(), None)
+    engine._build_macd_v2_4h_regime_state = lambda **_kwargs: {
+        "state": "neutral",
+        "phase": "neutral",
+        "side": "neutral",
+        "score": 0.61,
+        "entry_allowed": False,
+        "entry_scale": 0.35,
+    }
+
+    decision = engine.decide(
+        symbol="TRUMPUSDT",
+        portfolio={"positions": {}},
+        price=100.0,
+        market_flow_context={
+            "timeframes": {
+                "15m": {"timestamp": 1, "close": 100.0, "volume": 10.0, "avg_volume": 10.0},
+                "1h": {"timestamp": 1, "close": 100.0, "vwap": 99.8, "structural_vwap": 99.7, "atr": 1.0},
+                "4h": {"timestamp": 1, "close": 100.0},
+            }
+        },
+        trigger_context={"trigger_type": "signal"},
+        use_weight_router=False,
+        use_ai_weights=False,
+    )
+
+    assert decision.operation == Operation.HOLD
+    assert decision.metadata["reject_reason_code"] == "pocket_min_entry_score_block"
+    assert decision.metadata["reject_stage"] == "pocket_entry_requirements"
+    assert decision.metadata["pocket_entry_override_label"] == "ld_support_e2_cvd_vwap_score"
+    assert decision.metadata["signal_score_threshold_used"] == 0.84
+    assert decision.metadata["min_vwap_score_used"] == 0.12
+    assert decision.metadata["min_entry_score_used"] == 0.35
+    assert decision.metadata["direction_lock_applied"] is True
+    assert decision.metadata["entry_hard_filter_blocked"] is True
+    assert decision.metadata["entry_hard_filters"] == ["pending_side_short_blocks_long"]
+    assert decision.metadata["regime_fallback_allowed"] is False
+    assert decision.metadata["regime_fallback_score"] == 0.61
 
 
 def test_resolve_entry_mode_blocks_long_when_pending_side_is_short():

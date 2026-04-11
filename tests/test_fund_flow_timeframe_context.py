@@ -78,6 +78,10 @@ def test_get_trend_filter_metrics_includes_direction_feature_fields():
     assert -1.0 <= float(metrics["kdj_j_norm"]) <= 1.0
     assert metrics["bb_break"] in {"NONE", "UPPER", "LOWER"}
     assert metrics["bb_trend"] in {"MID", "ALONG_UPPER", "ALONG_LOWER"}
+    assert isinstance(metrics["macd_hist_series"], list)
+    assert isinstance(metrics["macd_hist_array"], list)
+    assert len(metrics["macd_hist_series"]) >= 10
+    assert metrics["macd_hist_prev"] is not None
 
 
 def test_apply_timeframe_context_injects_full_trend_filter_snapshot():

@@ -177,6 +177,7 @@ class MACDStrategyV2Config:
     # 1H flip_bullish 严格过滤
     enable_flip_bullish_strict_filter: bool = True
     disable_flip_bullish_entries: bool = False
+    force_disable_flip_bullish_entries: bool = False
     disable_flip_bullish_trial_entries: bool = False
     flip_bullish_min_vwap_score: float = 0.12
     flip_bullish_require_pullback_bounce: bool = True
@@ -244,6 +245,7 @@ class MACDStrategyV2Config:
     stable_bull_continuation_min_4h_bars: int = 2
     pocket_entry_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     pocket_scoring_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    pocket_management_overrides: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     enable_stable_continuation_slow_4h_shrink_exit: bool = True
     stable_continuation_exit_4h_shrink_bars: int = 3
     stable_continuation_exit_4h_min_shrink_pct: float = 0.35
@@ -421,6 +423,27 @@ class MACDStrategyV2Config:
             override = overrides.get(key)
             if isinstance(override, dict) and override:
                 return dict(override)
+        return {}
+
+    def resolve_pocket_management_override(
+        self,
+        signal_type_1h: Optional[str],
+        vwap_state: Optional[str],
+    ) -> Dict[str, Any]:
+        overrides = self.pocket_management_overrides or {}
+        if not isinstance(overrides, dict) or not overrides:
+            return {}
+
+        candidates = [
+            self.normalize_pocket_key(signal_type_1h, vwap_state),
+            self.normalize_pocket_key("*", vwap_state),
+            self.normalize_pocket_key(signal_type_1h, "*"),
+            self.normalize_pocket_key("*", "*"),
+        ]
+        for key in candidates:
+            value = overrides.get(key)
+            if isinstance(value, dict):
+                return copy.deepcopy(value)
         return {}
 
 
@@ -634,6 +657,8 @@ def build_macd_v2_config_from_runtime(
         if isinstance(filter_cfg.get("pocket_entry_overrides"), dict) else {},
         pocket_scoring_overrides=copy.deepcopy(v2_cfg.get("pocket_scoring_overrides", {}))
         if isinstance(v2_cfg.get("pocket_scoring_overrides"), dict) else {},
+        pocket_management_overrides=copy.deepcopy(v2_cfg.get("pocket_management_overrides", {}))
+        if isinstance(v2_cfg.get("pocket_management_overrides"), dict) else {},
         overheat_growing_penalty=float(penalty_cfg.get("overheat_growing_penalty", 0.12)),
         overheat_ema_multiplier_threshold=float(
             penalty_cfg.get("overheat_boll_multiplier_threshold", penalty_cfg.get("overheat_ema_multiplier_threshold", 1.2))
@@ -875,6 +900,32 @@ class MACDStrategyV2Engine:
         payload["reject_reason_detail"] = reject_detail
         payload["stage_path"] = self._normalize_stage_path(payload.get("stage_path"))
         payload["stage_path_text"] = " > ".join(payload["stage_path"]) if payload["stage_path"] else ""
+        payload["pocket_entry_override_label"] = str(
+            payload.get("pocket_entry_override_label")
+            or payload.get("override_label")
+            or ""
+        )
+        payload["signal_score_threshold_used"] = float(
+            payload.get("signal_score_threshold_used", payload.get("signal_score_threshold", self.config.min_signal_score))
+        )
+        payload["min_vwap_score_used"] = float(
+            payload.get(
+                "min_vwap_score_used",
+                payload.get("min_vwap_score_for_entry", self.config.min_vwap_score_for_entry),
+            )
+        )
+        min_entry_score_used = payload.get("min_entry_score_used")
+        if min_entry_score_used is None:
+            min_entry_score_used = payload.get("pocket_min_entry_score")
+        if min_entry_score_used is None:
+            min_entry_score_used = payload.get("min_entry_score", self.config.min_entry_score)
+        payload["min_entry_score_used"] = float(min_entry_score_used)
+        payload["direction_lock_applied"] = bool(payload.get("direction_lock_applied", False))
+        payload["entry_hard_filter_blocked"] = bool(payload.get("entry_hard_filter_blocked", False))
+        entry_hard_filters = payload.get("entry_hard_filters", [])
+        payload["entry_hard_filters"] = list(entry_hard_filters) if isinstance(entry_hard_filters, list) else []
+        payload["regime_fallback_allowed"] = bool(payload.get("regime_fallback_allowed", False))
+        payload["regime_fallback_score"] = float(payload.get("regime_fallback_score", 0.0) or 0.0)
         if veto_type != VetoType.NONE and "veto_type" not in payload:
             payload["veto_type"] = veto_type.value
         self._last_analysis = payload.copy()
@@ -3185,15 +3236,19 @@ class MACDStrategyV2Engine:
             )
 
         if (
-            strict_1h_filters_enabled
-            and not stable_continuation_active
+            (strict_1h_filters_enabled or self.config.force_disable_flip_bullish_entries)
             and self.config.disable_flip_bullish_entries
             and signal_type_1h == 'flip_bullish'
+            and (
+                self.config.force_disable_flip_bullish_entries
+                or not stable_continuation_active
+            )
         ):
             debug_details = self._set_stage(
                 debug_details,
                 "flip_bullish_disabled",
                 flip_bullish_disabled=True,
+                flip_bullish_force_disabled=bool(self.config.force_disable_flip_bullish_entries),
             )
             return self._neutral_signal(
                 reason='flip_bullish_disabled',
@@ -3606,17 +3661,38 @@ class MACDStrategyV2Engine:
         signal_strength_1h = details_1h.get('signal_strength', 0.5)
         score_1h_base = 0.0
         score_1h = 0.0
+        score_1h_source = "no_direction_credit"
 
-        if signal_type_1h in ['flip_bullish', 'flip_bearish']:
+        neutral_1h_light_credit = (
+            primary_mode == "4h"
+            and direction_1h is None
+            and bool(self.config.require_1h_confirmation_when_4h_primary)
+            and bool(self.config.allow_neutral_1h_confirmation)
+            and self.use_light_1h_confirmation()
+            and debug_details.get("confirmation_status") == "neutral_allowed"
+        )
+
+        if neutral_1h_light_credit:
+            # In 4H-primary mode, a neutral 1H that is explicitly allowed should not
+            # silently zero out the full 1H bucket and freeze live entries.
+            score_1h_base = weight_1h_direction * 0.75
+            score_1h_source = "neutral_allowed_light_credit"
+            debug_details["light_1h_neutral_credit_applied"] = True
+        elif signal_type_1h in ['flip_bullish', 'flip_bearish']:
             score_1h_base = weight_1h_direction
+            score_1h_source = "signal_type_flip"
         elif signal_type_1h in ['red_bar_growing', 'green_bar_growing']:
             score_1h_base = weight_1h_direction * 0.875
+            score_1h_source = "signal_type_growing"
         elif trade_direction == direction_1h:
             score_1h_base = weight_1h_direction * signal_strength_1h
+            score_1h_source = "aligned_direction_strength"
         else:
             score_1h_base = 0.0
+            score_1h_source = "no_direction_credit"
 
         score_1h = min(score_1h_base * ema_score_multiplier, weight_1h_direction)
+        debug_details["score_1h_source"] = score_1h_source
         score += score_1h
 
         if is_trial_entry:
@@ -4152,6 +4228,7 @@ class MACDStrategyV2Engine:
             'volume_ratio': volume_ratio,
             'score_1h_base': score_1h_base,
             'score_1h': score_1h,
+            'score_1h_source': score_1h_source,
             'score_4h_base': score_4h_base,
             'score_4h': score_4h,
             'score_4h_enhancement_base': score_4h_enhancement_base,

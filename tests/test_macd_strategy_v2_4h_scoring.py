@@ -629,6 +629,71 @@ def test_light_1h_confirmation_skips_flip_bullish_disable_filter() -> None:
     assert light_signal.direction == "long"
 
 
+def test_force_disable_flip_bullish_blocks_stable_continuation_long() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            weight_1h_direction=0.0,
+            weight_4h_direction=0.5,
+            weight_4h_enhancement=0.0,
+            weight_vwap=0.2,
+            weight_15m_entry=0.15,
+            weight_volume=0.15,
+            min_signal_score=0.1,
+            min_entry_score=0.1,
+            red_bar_growing_min_signal_score=0.1,
+            flip_bullish_min_signal_score=0.1,
+            flip_bullish_min_vwap_score=0.0,
+            min_vwap_score_for_entry=0.0,
+            overheat_growing_penalty=0.0,
+            enable_flip_bullish_strict_filter=False,
+            disable_flip_bullish_entries=True,
+            force_disable_flip_bullish_entries=True,
+            disable_green_bar_growing_entries=False,
+            primary_direction_timeframe="4h",
+            require_1h_confirmation_when_4h_primary=True,
+            light_1h_confirmation_when_4h_primary=True,
+            enable_stable_bull_continuation=True,
+            stable_bull_continuation_min_signal_score=0.1,
+            stable_bull_continuation_min_vwap_score=0.0,
+            stable_bull_continuation_min_adx_1h=10.0,
+            stable_bull_continuation_min_4h_bars=2,
+        )
+    )
+
+    signal = engine.analyze(
+        macd_hist_15m=np.array([-0.10, -0.05, 0.02, 0.05]),
+        macd_hist_1h=np.array([-0.20, -0.10, -0.05, 0.10]),
+        macd_hist_4h=np.array([-0.30, -0.15, -0.05, 0.20, 0.25, 0.30]),
+        idx_15m=3,
+        idx_1h=3,
+        idx_4h=5,
+        volume_ratio=2.0,
+        vwap=100.5,
+        structural_vwap=100.0,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        bb_upper_1h=110.0,
+        bb_lower_1h=90.0,
+        bb_middle_4h=99.0,
+        bb_upper_4h=109.0,
+        bb_lower_4h=89.0,
+        bb_middle_15m=100.0,
+        bb_upper_15m=103.0,
+        bb_lower_15m=97.0,
+        close_15m=100.8,
+        close_1h_series=np.array([100.4, 100.3, 100.5, 101.0]),
+        vwap_1h_series=np.array([100.5, 100.5, 100.5, 100.5]),
+        structural_vwap_1h_series=np.array([100.0, 100.0, 100.0, 100.0]),
+        adx_1h=20.0,
+        adx_4h=22.0,
+        atr_1h=1.0,
+    )
+
+    assert signal.details["stable_continuation_active"] is True
+    assert signal.direction == "neutral"
+    assert "flip_bullish_disabled" in str(signal.details.get("reason"))
+
+
 def test_preflip_trial_entry_allows_4h_green_shrinking_long() -> None:
     engine = MACDStrategyV2Engine(
         MACDStrategyV2Config(
@@ -869,6 +934,41 @@ def test_neutral_signal_carries_4h_shrink_exit_metadata() -> None:
     assert signal.details["shrink_exit_ready"] is True
 
 
+def test_neutral_signal_populates_structured_reject_metadata_defaults() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config())
+
+    signal = engine._neutral_signal(
+        reason="pocket_min_entry_score_block",
+        score=0.83,
+        signal_type_1h="red_bar_growing",
+        entry_type_15m="pullback",
+        entry_score_15m=0.22,
+        vwap_score=0.11,
+        vwap_state="long_dual_support",
+        details={
+            "stage": "pocket_entry_requirements",
+            "stage_path": ["score_calc", "pocket_entry_requirements"],
+            "signal_score_threshold": 0.84,
+            "min_vwap_score_for_entry": 0.12,
+            "pocket_min_entry_score": 0.35,
+            "pocket_entry_override_label": "ld_support_e2_cvd_vwap_score",
+        },
+    )
+
+    assert signal.direction == "neutral"
+    assert signal.details["reject_reason_code"] == "pocket_min_entry_score_block"
+    assert signal.details["reject_stage"] == "pocket_entry_requirements"
+    assert signal.details["pocket_entry_override_label"] == "ld_support_e2_cvd_vwap_score"
+    assert signal.details["signal_score_threshold_used"] == pytest.approx(0.84, rel=1e-6)
+    assert signal.details["min_vwap_score_used"] == pytest.approx(0.12, rel=1e-6)
+    assert signal.details["min_entry_score_used"] == pytest.approx(0.35, rel=1e-6)
+    assert signal.details["direction_lock_applied"] is False
+    assert signal.details["entry_hard_filter_blocked"] is False
+    assert signal.details["entry_hard_filters"] == []
+    assert signal.details["regime_fallback_allowed"] is False
+    assert signal.details["regime_fallback_score"] == pytest.approx(0.0, rel=1e-6)
+
+
 def test_soft_15m_confirmation_allows_4h_primary_entry() -> None:
     engine = MACDStrategyV2Engine(
         MACDStrategyV2Config(
@@ -982,6 +1082,63 @@ def test_15m_confirmation_no_longer_blocks_entry_when_gate_disabled() -> None:
     assert signal.direction == "long"
     assert signal.details["entry_type_15m"] == ""
     assert signal.details["entry_score_15m"] == pytest.approx(0.0, rel=1e-6)
+
+
+def test_neutral_1h_confirmation_receives_light_score_credit_when_allowed() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            weight_1h_direction=0.4,
+            weight_4h_direction=0.2,
+            weight_4h_enhancement=0.0,
+            weight_vwap=0.2,
+            weight_15m_entry=0.05,
+            weight_volume=0.15,
+            min_signal_score=0.75,
+            min_entry_score=0.1,
+            min_vwap_score_for_entry=0.12,
+            overheat_growing_penalty=0.0,
+            enable_flip_bullish_strict_filter=False,
+            disable_flip_bullish_entries=False,
+            disable_green_bar_growing_entries=False,
+            primary_direction_timeframe="4h",
+            require_1h_confirmation_when_4h_primary=True,
+            allow_neutral_1h_confirmation=True,
+            light_1h_confirmation_when_4h_primary=True,
+            enable_soft_15m_confirmation_when_4h_primary=True,
+            soft_15m_entry_score=0.28,
+        )
+    )
+
+    signal = engine.analyze(
+        macd_hist_15m=np.array([-0.00040, -0.00025, -0.00018, -0.00010]),
+        macd_hist_1h=np.array([0.0, 0.0, 0.0, 0.0]),
+        macd_hist_4h=np.array([-0.30, -0.15, -0.05, 0.20]),
+        idx_15m=3,
+        idx_1h=3,
+        idx_4h=3,
+        volume_ratio=2.0,
+        vwap=100.0,
+        structural_vwap=99.6,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        bb_upper_1h=110.0,
+        bb_lower_1h=90.0,
+        bb_middle_4h=99.0,
+        bb_upper_4h=109.0,
+        bb_lower_4h=89.0,
+        bb_middle_15m=100.0,
+        bb_upper_15m=103.0,
+        bb_lower_15m=97.0,
+        close_15m=100.8,
+        adx_1h=20.0,
+        adx_4h=22.0,
+        atr_1h=1.0,
+    )
+
+    assert signal.direction == "long"
+    assert signal.details["score_1h"] == pytest.approx(0.30, rel=1e-6)
+    assert signal.details["score_1h_source"] == "neutral_allowed_light_credit"
+    assert signal.signal_score >= 0.75
 
 
 def test_green_bar_growing_short_adx_range_filter_blocks_full_size() -> None:
@@ -1275,6 +1432,27 @@ def test_build_macd_v2_config_from_runtime_loads_position_score_tiers() -> None:
         {"score_min": 0.75, "target_portion": 0.25},
         {"score_min": 0.68, "target_portion": 0.20},
     ]
+
+
+def test_build_macd_v2_config_from_runtime_loads_pocket_management_overrides() -> None:
+    config = build_macd_v2_config_from_runtime(
+        {
+            "fund_flow": {
+                "macd_mtf_strategy_v2": {
+                    "pocket_management_overrides": {
+                        "green_bar_growing|short_retest_reject": {
+                            "leverage_floor": 4,
+                            "tp_pct": 0.05,
+                            "take_profit_pct_levels": [0.01, 0.016, 0.028],
+                            "take_profit_reduce_pct_levels": [0.2, 0.25, 0.15],
+                        }
+                    }
+                }
+            }
+        }
+    )
+
+    assert config.pocket_management_overrides["green_bar_growing|short_retest_reject"]["leverage_floor"] == 4
 
 
 def test_non_watchlist_symbol_keeps_original_dual_pressure_cap() -> None:

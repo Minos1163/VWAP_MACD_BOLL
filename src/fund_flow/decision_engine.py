@@ -112,6 +112,7 @@ class FundFlowDecisionEngine:
         self.stop_loss_pct = self._normalize_pct_ratio(stop_loss_raw, 0.01)
         self.take_profit_pct = self._normalize_pct_ratio(take_profit_raw, 0.03)
         self.entry_hard_gates_enabled = bool(ff.get("entry_hard_gates_enabled", False))
+        self.entry_hard_gate_require_regime_trend = bool(ff.get("entry_hard_gate_require_regime_trend", True))
         self.entry_hard_gate_adx_min = max(0.0, self._to_float(ff.get("entry_hard_gate_adx_min"), 18.0))
         self.entry_hard_gate_atr_min = max(
             0.0, self._normalize_pct_ratio(ff.get("entry_hard_gate_atr_min"), 0.003)
@@ -130,6 +131,18 @@ class FundFlowDecisionEngine:
         self.entry_hard_gate_skip_spread_if_missing_rules = (
             [rule for rule in raw_spread_skip_rules if isinstance(rule, dict)]
             if isinstance(raw_spread_skip_rules, list)
+            else []
+        )
+        raw_entry_hard_gate_bypass_rules = ff.get("entry_hard_gate_bypass_rules", [])
+        self.entry_hard_gate_bypass_rules = (
+            [rule for rule in raw_entry_hard_gate_bypass_rules if isinstance(rule, dict)]
+            if isinstance(raw_entry_hard_gate_bypass_rules, list)
+            else []
+        )
+        raw_direction_lock_bypass_rules = ff.get("direction_lock_bypass_rules", [])
+        self.direction_lock_bypass_rules = (
+            [rule for rule in raw_direction_lock_bypass_rules if isinstance(rule, dict)]
+            if isinstance(raw_direction_lock_bypass_rules, list)
             else []
         )
         self.entry_hard_gate_flow_min_pass = max(
@@ -366,12 +379,11 @@ class FundFlowDecisionEngine:
         guide_cfg_raw = ff.get("direction_guide", ff.get("macd_bb_direction_guide", {}))
         guide_cfg = guide_cfg_raw if isinstance(guide_cfg_raw, dict) else {}
         self._direction_guide_enabled = bool(guide_cfg.get("enabled", True))
-        # 修改默认: 改为 MACD+KDJ 作为主方向指导 (符合MACD+KDJ组合技巧)
         self._direction_guide_model = self._normalize_direction_guide_model(
-            guide_cfg.get("model", "MACD_KDJ")  # 默认改为 MACD+KDJ
+            guide_cfg.get("model", "MACD_BB")
         )
         self._direction_guide_enhanced_fallback_enabled = bool(
-            guide_cfg.get("enhanced_fallback_enabled", True)
+            guide_cfg.get("enhanced_fallback_enabled", False)
         )
         self._direction_guide_enhanced_fallback_threshold = max(
             0.0,
@@ -379,7 +391,7 @@ class FundFlowDecisionEngine:
         )
         self._direction_guide_trend_relaxed_neutral_zone = max(
             0.0,
-            min(0.20, self._to_float(guide_cfg.get("trend_relaxed_neutral_zone"), 0.006)),
+            min(0.20, self._to_float(guide_cfg.get("trend_relaxed_neutral_zone"), 0.03)),
         )
         
         # ====== 新增: MACD+KDJ+资金流混合配置 ======
@@ -411,6 +423,10 @@ class FundFlowDecisionEngine:
         self._kdj_divergence_bonus = max(0.0, min(0.5, self._to_float(hybrid_cfg.get("kdj_divergence_bonus"), 0.10)))
         guide_neutral_zone = self._to_float(guide_cfg.get("neutral_zone"), 0.01)
         self._direction_guide_neutral_zone = max(0.0, min(0.20, guide_neutral_zone))
+        self._direction_guide_conflict_neutral_zone = max(
+            self._direction_guide_neutral_zone,
+            min(0.20, self._to_float(guide_cfg.get("conflict_neutral_zone"), 0.03)),
+        )
         self._direction_price_action_override_enabled = bool(
             guide_cfg.get("price_action_override_enabled", True)
         )
@@ -424,7 +440,7 @@ class FundFlowDecisionEngine:
         )
         self._direction_price_action_override_max_guide_score = max(
             0.0,
-            min(0.30, self._to_float(guide_cfg.get("price_action_override_max_guide_score", 0.12), 0.12)),
+            min(0.30, self._to_float(guide_cfg.get("price_action_override_max_guide_score", 0.30), 0.30)),
         )
         self._trend_both_trial_enabled = bool(trend_capture_cfg.get("trend_both_trial_enabled", True))
         self._trend_both_trial_min_score = max(
@@ -581,6 +597,7 @@ class FundFlowDecisionEngine:
             vwap_score_tier_cfg = v2_cfg.get("vwap_score_position_tiers", {}) if isinstance(v2_cfg.get("vwap_score_position_tiers"), dict) else {}
             position_size_cfg = v2_cfg.get("position_size_config", {}) if isinstance(v2_cfg.get("position_size_config"), dict) else {}
             symbol_risk_cfg = v2_cfg.get("symbol_risk_tiers", {}) if isinstance(v2_cfg.get("symbol_risk_tiers"), dict) else {}
+            pocket_management_cfg = v2_cfg.get("pocket_management_overrides", {}) if isinstance(v2_cfg.get("pocket_management_overrides"), dict) else {}
             default_signal_threshold = self._to_float(
                 thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score")),
                 0.850,
@@ -801,6 +818,7 @@ class FundFlowDecisionEngine:
                 if isinstance(filter_cfg.get("pocket_entry_overrides"), dict) else {},
                 pocket_scoring_overrides=copy.deepcopy(v2_cfg.get("pocket_scoring_overrides", {}))
                 if isinstance(v2_cfg.get("pocket_scoring_overrides"), dict) else {},
+                pocket_management_overrides=copy.deepcopy(pocket_management_cfg),
                 enable_stable_continuation_slow_4h_shrink_exit=bool(
                     stop_cfg.get("enable_stable_continuation_slow_4h_shrink_exit", True)
                 ),
@@ -1169,12 +1187,31 @@ class FundFlowDecisionEngine:
         return v / 100.0
 
     @staticmethod
+    def _normalize_portion_ratio(value: Any, default_ratio: float) -> float:
+        if value is None:
+            return max(0.0, min(1.0, float(default_ratio)))
+        try:
+            if isinstance(value, str):
+                raw = value.strip()
+                if raw.endswith("%"):
+                    return max(0.0, min(1.0, abs(float(raw[:-1])) / 100.0))
+                v = float(raw)
+            else:
+                v = float(value)
+        except Exception:
+            return max(0.0, min(1.0, float(default_ratio)))
+        v = abs(v)
+        if v <= 1.0:
+            return v
+        return max(0.0, min(1.0, v / 100.0))
+
+    @staticmethod
     def _normalize_direction_guide_model(value: Any) -> str:
         raw = str(value or "").strip().upper()
         if raw in {"MACD_BB", "MACD+BB", "MACD_BOLL", "MACD_BOLLINGER"}:
             return "MACD_BB"
         if raw in {"MACD_KDJ", "MACD+KDJ"}:
-            return "MACD_KDJ"
+            return "MACD_BB"
         if raw in {"EV_PRIMARY", "EV"}:
             return "EV_PRIMARY"
         return "MACD_BB"
@@ -1202,6 +1239,41 @@ class FundFlowDecisionEngine:
         if len(cleaned) < min_len:
             return []
         return cleaned
+
+    @staticmethod
+    def _build_macd_tf_diagnostics(timeframes: Any) -> Dict[str, Dict[str, Any]]:
+        diagnostics: Dict[str, Dict[str, Any]] = {}
+        tf_map = timeframes if isinstance(timeframes, dict) else {}
+        for tf in ("15m", "1h", "4h"):
+            tf_ctx = tf_map.get(tf)
+            tf_dict = tf_ctx if isinstance(tf_ctx, dict) else {}
+            raw_series = tf_dict.get("macd_hist_series")
+            raw_array = tf_dict.get("macd_hist_array")
+            series = raw_series if isinstance(raw_series, (list, tuple)) else []
+            array = raw_array if isinstance(raw_array, (list, tuple)) else []
+            hist_present = tf_dict.get("macd_hist") is not None
+            prev_present = tf_dict.get("macd_hist_prev") is not None
+            series_source = "missing"
+            series_len = 0
+            if len(series) > 0:
+                series_source = "series"
+                series_len = len(series)
+            elif len(array) > 0:
+                series_source = "array"
+                series_len = len(array)
+            elif hist_present or prev_present:
+                series_source = "fallback_pair"
+                series_len = 2 if hist_present and prev_present else 1
+
+            diagnostics[tf] = {
+                "timeframe_present": bool(tf_dict),
+                "series_source": series_source,
+                "series_len": int(series_len),
+                "macd_hist_present": bool(hist_present),
+                "macd_hist_prev_present": bool(prev_present),
+                "close_series_len": len(tf_dict.get("close_series") or tf_dict.get("close_array") or []),
+            }
+        return diagnostics
 
     def _detect_direction_price_action_override(
         self,
@@ -1402,6 +1474,8 @@ class FundFlowDecisionEngine:
             "disable_flip_bullish",
             "disable_flip_bullish_trial",
             "disable_green_bar_growing",
+            "flip_bullish_mode",
+            "green_bar_growing_mode",
             "min_signal_score_override",
             "preflip_trial_min_signal_score_override",
             "min_vwap_score_override",
@@ -1425,15 +1499,36 @@ class FundFlowDecisionEngine:
 
         local_config = self.macd_v2_config
         override_updates: Dict[str, Any] = {}
-        if "disable_flip_bullish" in override:
+        flip_bullish_mode = str(override.get("flip_bullish_mode") or "").strip().lower()
+        if flip_bullish_mode == "disabled":
+            override_updates["disable_flip_bullish_entries"] = True
+            override_updates["force_disable_flip_bullish_entries"] = True
+        elif flip_bullish_mode == "trial_only":
+            override_updates["disable_flip_bullish_entries"] = True
+            override_updates["force_disable_flip_bullish_entries"] = False
+            override_updates["disable_flip_bullish_trial_entries"] = False
+            override_updates["enable_4h_preflip_trial_entries"] = True
+        elif flip_bullish_mode == "enabled_with_strict_threshold":
+            override_updates["disable_flip_bullish_entries"] = False
+            override_updates["force_disable_flip_bullish_entries"] = False
+        elif "disable_flip_bullish" in override:
             disable_flip_bullish = bool(override.get("disable_flip_bullish"))
             if disable_flip_bullish != self.macd_v2_config.disable_flip_bullish_entries:
                 override_updates["disable_flip_bullish_entries"] = disable_flip_bullish
+            if disable_flip_bullish:
+                override_updates["force_disable_flip_bullish_entries"] = True
         if "disable_flip_bullish_trial" in override:
             disable_flip_bullish_trial = bool(override.get("disable_flip_bullish_trial"))
             if disable_flip_bullish_trial != self.macd_v2_config.disable_flip_bullish_trial_entries:
                 override_updates["disable_flip_bullish_trial_entries"] = disable_flip_bullish_trial
-        if "disable_green_bar_growing" in override:
+        green_bar_growing_mode = str(override.get("green_bar_growing_mode") or "").strip().lower()
+        if green_bar_growing_mode == "disabled":
+            override_updates["disable_green_bar_growing_entries"] = True
+        elif green_bar_growing_mode == "enabled_with_strict_threshold":
+            override_updates["disable_green_bar_growing_entries"] = False
+        elif green_bar_growing_mode == "trial_only":
+            override_updates["disable_green_bar_growing_entries"] = False
+        elif "disable_green_bar_growing" in override:
             disable_green_bar_growing = bool(override.get("disable_green_bar_growing"))
             if disable_green_bar_growing != self.macd_v2_config.disable_green_bar_growing_entries:
                 override_updates["disable_green_bar_growing_entries"] = disable_green_bar_growing
@@ -1464,6 +1559,66 @@ class FundFlowDecisionEngine:
 
         local_config = replace(local_config, **override_updates)
         return MACDStrategyV2Engine(local_config), override
+
+    @staticmethod
+    def _annotate_primary_open_blocker(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        enriched = dict(metadata or {})
+        for key in (
+            "symbol_override_block",
+            "signal_type_disabled",
+            "pocket_override_block",
+            "direction_lock_block",
+            "entry_hard_gate_block",
+        ):
+            enriched[key] = bool(enriched.get(key, False))
+
+        blocked_reason = str(enriched.get("blocked_reason") or "").strip().lower()
+        reject_code = str(enriched.get("reject_reason_code") or "").strip().lower()
+        reject_stage = str(enriched.get("reject_stage") or "").strip().lower()
+        symbol_override = enriched.get("symbol_signal_override")
+        if isinstance(symbol_override, dict):
+            has_symbol_mode = any(
+                str(symbol_override.get(name) or "").strip()
+                for name in ("flip_bullish_mode", "green_bar_growing_mode")
+            )
+            has_legacy_disable = any(
+                symbol_override.get(name) is True
+                for name in ("disable_flip_bullish", "disable_green_bar_growing")
+            )
+            if has_symbol_mode or has_legacy_disable:
+                enriched["symbol_override_source"] = "symbol_signal_override"
+
+        if blocked_reason.startswith("direction_lock_hard_block"):
+            enriched["direction_lock_block"] = True
+            enriched["primary_open_blocker"] = "direction_lock_block"
+            return enriched
+
+        if enriched.get("entry_hard_gate_reason") or enriched.get("entry_hard_gate_failed_bucket"):
+            enriched["entry_hard_gate_block"] = True
+            enriched["primary_open_blocker"] = "entry_hard_gate_block"
+            return enriched
+
+        if reject_code in {
+            "flip_bullish_disabled",
+            "flip_bullish_trial_disabled",
+            "green_bar_growing_disabled",
+        }:
+            enriched["signal_type_disabled"] = True
+            if enriched.get("symbol_override_source") == "symbol_signal_override":
+                enriched["symbol_override_block"] = True
+                enriched["primary_open_blocker"] = "symbol_override_block"
+            else:
+                enriched["primary_open_blocker"] = "signal_type_disabled"
+            return enriched
+
+        if reject_stage == "pocket_entry_requirements" or reject_code.startswith("pocket_"):
+            enriched["pocket_override_block"] = True
+            enriched["primary_open_blocker"] = "pocket_override_block"
+            return enriched
+
+        if blocked_reason:
+            enriched["primary_open_blocker"] = blocked_reason.split(":", 1)[0]
+        return enriched
 
     @staticmethod
     def _normalize_signal_side(value: Any) -> str:
@@ -1732,6 +1887,8 @@ class FundFlowDecisionEngine:
         leverage = max(self.min_leverage, min(self.max_leverage, leverage))
 
         local_metadata = dict(metadata)
+        local_metadata["regime_fallback_allowed"] = True
+        local_metadata["regime_fallback_score"] = float(score)
         local_metadata["signal_direction"] = side
         local_metadata["signal_score"] = score
         local_metadata["is_trial_entry"] = is_trial_entry
@@ -1891,13 +2048,26 @@ class FundFlowDecisionEngine:
         metadata["direction_lock"] = direction_lock
         metadata["direction_lock_hard_gate"] = True
 
+        bypass_rule = self._match_direction_lock_bypass_rule(
+            symbol=str(decision.symbol or ""),
+            decision=decision,
+            direction_lock=direction_lock,
+        )
+        if bypass_rule is not None:
+            metadata["direction_lock_bypass_rule"] = dict(bypass_rule)
+            metadata = self._annotate_primary_open_blocker(metadata)
+            return replace(decision, metadata=metadata)
+
         if self._direction_lock_allows_operation(direction_lock, decision.operation):
+            metadata = self._annotate_primary_open_blocker(metadata)
             return replace(decision, metadata=metadata)
 
         metadata["blocked_reason"] = f"direction_lock_hard_block:{direction_lock}"
         metadata["blocked_operation"] = decision.operation.value
         metadata["blocked_decision_reason"] = decision.reason
         metadata["direction_lock_source"] = source
+        metadata["direction_lock_block"] = True
+        metadata = self._annotate_primary_open_blocker(metadata)
         return FundFlowDecision(
             operation=Operation.HOLD,
             symbol=decision.symbol,
@@ -1906,6 +2076,60 @@ class FundFlowDecisionEngine:
             reason=f"direction_lock_hard_block:{direction_lock}",
             metadata=metadata,
         )
+
+    def _match_direction_lock_bypass_rule(
+        self,
+        *,
+        symbol: str,
+        decision: FundFlowDecision,
+        direction_lock: str,
+    ) -> Optional[Dict[str, Any]]:
+        symbol_norm = str(symbol or "").strip().upper()
+        metadata = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+        signal_type_norm = str(metadata.get("signal_type_1h", "") or "").strip().lower()
+        vwap_state_norm = str(metadata.get("vwap_state", "") or "").strip().lower()
+        signal_score = max(0.0, self._to_float(metadata.get("signal_score"), 0.0))
+        vwap_score = max(0.0, self._to_float(metadata.get("vwap_score"), 0.0))
+        stable_continuation_active = bool(metadata.get("stable_continuation_active", False))
+        decision_side = "long" if decision.operation == Operation.BUY else "short" if decision.operation == Operation.SELL else ""
+        direction_lock_norm = str(direction_lock or "").strip().upper()
+
+        for raw_rule in self.direction_lock_bypass_rules:
+            rule = dict(raw_rule)
+            rule_direction_lock = str(rule.get("direction_lock", "") or "").strip().upper()
+            rule_decision_side = str(rule.get("decision_side", "") or "").strip().lower()
+            rule_signal_type = str(rule.get("signal_type_1h", "") or "").strip().lower()
+            rule_vwap_state = str(rule.get("vwap_state", "") or "").strip().lower()
+            rule_symbol = str(rule.get("symbol", "") or "").strip().upper()
+            rule_symbols = (
+                [str(item or "").strip().upper() for item in rule.get("symbols", []) if str(item or "").strip()]
+                if isinstance(rule.get("symbols"), list)
+                else []
+            )
+            min_signal_score = max(0.0, self._to_float(rule.get("min_signal_score"), 0.0))
+            min_vwap_score = max(0.0, self._to_float(rule.get("min_vwap_score"), 0.0))
+            require_stable_continuation_active = bool(rule.get("require_stable_continuation_active", False))
+
+            if rule_direction_lock and rule_direction_lock != direction_lock_norm:
+                continue
+            if rule_decision_side and rule_decision_side != decision_side:
+                continue
+            if rule_signal_type and rule_signal_type != signal_type_norm:
+                continue
+            if rule_vwap_state and rule_vwap_state != vwap_state_norm:
+                continue
+            if rule_symbol and rule_symbol != symbol_norm:
+                continue
+            if rule_symbols and symbol_norm not in rule_symbols:
+                continue
+            if signal_score < min_signal_score:
+                continue
+            if vwap_score < min_vwap_score:
+                continue
+            if require_stable_continuation_active and not stable_continuation_active:
+                continue
+            return rule
+        return None
 
     def _macd_v2_fast_exit_reason(
         self,
@@ -2053,6 +2277,7 @@ class FundFlowDecisionEngine:
     def _validate_macd_v2_entry_hard_gates(
         self,
         *,
+        symbol: str = "",
         direction: str,
         price: float,
         structural_vwap: float,
@@ -2063,6 +2288,8 @@ class FundFlowDecisionEngine:
         signal_type_1h: str = "",
         vwap_state: str = "",
         vwap_score: float = 0.0,
+        signal_score: float = 0.0,
+        stable_continuation_active: bool = False,
     ) -> Tuple[bool, str, Dict[str, Any]]:
         if self.pure_strategy_runtime_enabled and self.pure_strategy_runtime_bypasses.get("entry_hard_gate", False):
             return True, "", {"pure_strategy_runtime_entry_hard_gate_bypassed": True}
@@ -2093,16 +2320,35 @@ class FundFlowDecisionEngine:
         else:
             spread_ok = spread_bps <= self.entry_hard_gate_spread_bps_max
         regime = str(regime_info.get("regime", "") or "").upper()
+        bypass_rule = self._match_entry_hard_gate_bypass_rule(
+            symbol=symbol,
+            direction=direction,
+            signal_type_1h=signal_type_1h,
+            vwap_state=vwap_state,
+            vwap_score=vwap_score,
+            signal_score=signal_score,
+            stable_continuation_active=stable_continuation_active,
+        )
+        if bypass_rule is not None:
+            gate_metadata["entry_hard_gate_bypass_rule"] = dict(bypass_rule)
 
         l1_checks = {
-            "regime_trend": regime == "TREND",
             "adx_sufficient": adx >= self.entry_hard_gate_adx_min,
             "atr_in_range": self.entry_hard_gate_atr_min <= atr_pct <= self.entry_hard_gate_atr_max,
             "spread_ok": spread_ok,
         }
+        if self.entry_hard_gate_require_regime_trend:
+            l1_checks["regime_trend"] = regime == "TREND"
         l1_failed = [name for name, passed in l1_checks.items() if not passed]
         if l1_failed:
-            return False, f"L1_structure_failed:{','.join(l1_failed)}", gate_metadata
+            allowed_l1_failures = {
+                str(name or "").strip()
+                for name in (bypass_rule or {}).get("allow_l1_failures", [])
+                if str(name or "").strip()
+            }
+            if not allowed_l1_failures or not set(l1_failed).issubset(allowed_l1_failures):
+                return False, f"L1_structure_failed:{','.join(l1_failed)}", gate_metadata
+            gate_metadata["entry_hard_gate_bypassed_l1_failures"] = list(l1_failed)
 
         cvd_ratio = self._to_float(
             tf_15m.get("cvd_ratio", market_flow_context.get("cvd_ratio")),
@@ -2165,6 +2411,9 @@ class FundFlowDecisionEngine:
         required_micro_pass = min(self.entry_hard_gate_micro_min_pass, len(available_micro_checks))
         micro_score = sum(1 for passed in available_micro_checks.values() if passed)
         if micro_score < required_micro_pass:
+            if bool((bypass_rule or {}).get("allow_microstructure_fail", False)):
+                gate_metadata["entry_hard_gate_bypassed_microstructure"] = True
+                return True, "", gate_metadata
             return (
                 False,
                 "L3_microstructure_failed:"
@@ -2173,6 +2422,58 @@ class FundFlowDecisionEngine:
             )
 
         return True, "", gate_metadata
+
+    def _match_entry_hard_gate_bypass_rule(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        signal_type_1h: str,
+        vwap_state: str,
+        vwap_score: float,
+        signal_score: float,
+        stable_continuation_active: bool,
+    ) -> Optional[Dict[str, Any]]:
+        symbol_norm = str(symbol or "").strip().upper()
+        direction_norm = str(direction or "").strip().lower()
+        signal_type_norm = str(signal_type_1h or "").strip().lower()
+        vwap_state_norm = str(vwap_state or "").strip().lower()
+        vwap_score_value = max(0.0, self._to_float(vwap_score, 0.0))
+        signal_score_value = max(0.0, self._to_float(signal_score, 0.0))
+
+        for raw_rule in self.entry_hard_gate_bypass_rules:
+            rule = dict(raw_rule)
+            rule_direction = str(rule.get("direction", "") or "").strip().lower()
+            rule_signal_type = str(rule.get("signal_type_1h", "") or "").strip().lower()
+            rule_vwap_state = str(rule.get("vwap_state", "") or "").strip().lower()
+            rule_symbol = str(rule.get("symbol", "") or "").strip().upper()
+            rule_symbols = (
+                [str(item or "").strip().upper() for item in rule.get("symbols", []) if str(item or "").strip()]
+                if isinstance(rule.get("symbols"), list)
+                else []
+            )
+            min_vwap_score = max(0.0, self._to_float(rule.get("min_vwap_score"), 0.0))
+            min_signal_score = max(0.0, self._to_float(rule.get("min_signal_score"), 0.0))
+            require_stable_continuation_active = bool(rule.get("require_stable_continuation_active", False))
+
+            if rule_direction and rule_direction != direction_norm:
+                continue
+            if rule_signal_type and rule_signal_type != signal_type_norm:
+                continue
+            if rule_vwap_state and rule_vwap_state != vwap_state_norm:
+                continue
+            if rule_symbol and rule_symbol != symbol_norm:
+                continue
+            if rule_symbols and symbol_norm not in rule_symbols:
+                continue
+            if signal_score_value < min_signal_score:
+                continue
+            if vwap_score_value < min_vwap_score:
+                continue
+            if require_stable_continuation_active and not stable_continuation_active:
+                continue
+            return rule
+        return None
 
     def _match_missing_spread_skip_rule(
         self,
@@ -2786,6 +3087,74 @@ class FundFlowDecisionEngine:
         params["signal_pool_id"] = str(params.get("signal_pool_id", base_pool) or base_pool)
         return params
 
+    def _resolve_pocket_management_override(
+        self,
+        *,
+        signal_type_1h: str,
+        vwap_state: str,
+    ) -> Dict[str, Any]:
+        if self.macd_v2_config is None:
+            return {}
+        return self.macd_v2_config.resolve_pocket_management_override(signal_type_1h, vwap_state)
+
+    def _apply_pocket_leverage_constraints(
+        self,
+        *,
+        leverage: int,
+        pocket_management_override: Dict[str, Any],
+        macd_v2_engine: Any,
+        symbol: str,
+    ) -> int:
+        resolved = int(leverage)
+        leverage_floor = max(0, int(self._to_float(pocket_management_override.get("leverage_floor"), 0)))
+        if leverage_floor > 0:
+            resolved = max(resolved, leverage_floor)
+        leverage_cap = max(0, int(self._to_float(pocket_management_override.get("leverage_cap"), 0)))
+        if leverage_cap > 0:
+            resolved = min(resolved, leverage_cap)
+        if (
+            getattr(macd_v2_engine, "is_watchlist_symbol", None)
+            and macd_v2_engine.is_watchlist_symbol(symbol)
+            and int(getattr(macd_v2_engine.config, "symbol_risk_watchlist_max_leverage", 0) or 0) > 0
+        ):
+            resolved = min(
+                resolved,
+                int(getattr(macd_v2_engine.config, "symbol_risk_watchlist_max_leverage", 0) or 0),
+            )
+        return max(self.min_leverage, min(self.max_leverage, resolved))
+
+    def _build_tp_levels_from_override(
+        self,
+        *,
+        price: float,
+        direction: str,
+        override: Dict[str, Any],
+    ) -> List[Dict[str, float]]:
+        pct_levels_raw = override.get("take_profit_pct_levels")
+        reduce_levels_raw = override.get("take_profit_reduce_pct_levels")
+        if not isinstance(pct_levels_raw, list) or not isinstance(reduce_levels_raw, list):
+            return []
+
+        pct_levels: List[float] = []
+        for item in pct_levels_raw:
+            pct = self._normalize_pct_ratio(item, 0.0)
+            if pct > 0:
+                pct_levels.append(pct)
+        reduce_levels: List[float] = []
+        for item in reduce_levels_raw:
+            reduce_pct = max(0.0, min(1.0, self._to_float(item, 0.0)))
+            if reduce_pct > 0:
+                reduce_levels.append(reduce_pct)
+
+        levels: List[Dict[str, float]] = []
+        for pct, reduce_pct in zip(pct_levels, reduce_levels):
+            if str(direction).lower() == "long":
+                level_price = price * (1.0 + pct)
+            else:
+                level_price = price * (1.0 - pct)
+            levels.append({"price": float(level_price), "reduce_pct": float(reduce_pct)})
+        return levels
+
     def _build_tp_levels_metadata(
         self,
         *,
@@ -3182,67 +3551,8 @@ class FundFlowDecisionEngine:
         self,
         market_flow_context: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """Use 5m MACD/KDJ snapshot as the first fallback when 15m primary indicators are flat."""
-        if not isinstance(market_flow_context, dict):
-            return None
-
-        snap = market_flow_context.get("_ma10_macd_confluence")
-        if not isinstance(snap, dict) or not snap:
-            return None
-
-        confluence = self._compute_entry_confluence_v2(
-            symbol="",
-            market_flow_context=market_flow_context,
-            cfg=self._trend_capture_config(),
-        )
-
-        long_score = 0.0
-        short_score = 0.0
-
-        if bool(confluence.get("confluence_macd_trigger_long", False)):
-            long_score += 0.35
-        elif bool(confluence.get("confluence_macd_early_long", False)):
-            long_score += 0.15
-
-        if bool(confluence.get("confluence_macd_trigger_short", False)):
-            short_score += 0.35
-        elif bool(confluence.get("confluence_macd_early_short", False)):
-            short_score += 0.15
-
-        if bool(confluence.get("confluence_kdj_ok_long", False)):
-            long_score += 0.25
-        if bool(confluence.get("confluence_kdj_ok_short", False)):
-            short_score += 0.25
-
-        if bool(confluence.get("confluence_hard_block_long", False)):
-            long_score = 0.0
-        if bool(confluence.get("confluence_hard_block_short", False)):
-            short_score = 0.0
-
-        score_delta = long_score - short_score
-        if abs(score_delta) < self._direction_neutral_zone:
-            return None
-
-        direction = "LONG_ONLY" if score_delta > 0 else "SHORT_ONLY"
-        return {
-            "dir": direction,
-            "score": max(-1.0, min(1.0, score_delta)),
-            "long_score": round(long_score, 4),
-            "short_score": round(short_score, 4),
-            "source": "ma10_macd_confluence_5m",
-            "snapshot": {
-                "ma10_1h_bias": snap.get("ma10_1h_bias"),
-                "macd_5m_hist_norm": snap.get("macd_5m_hist_norm"),
-                "macd_5m_hist_delta": snap.get("macd_5m_hist_delta"),
-                "macd_5m_cross": snap.get("macd_5m_cross"),
-                "macd_5m_zone": snap.get("macd_5m_zone"),
-                "kdj_k": snap.get("kdj_k"),
-                "kdj_d": snap.get("kdj_d"),
-                "kdj_j": snap.get("kdj_j"),
-                "kdj_cross": snap.get("kdj_cross"),
-                "kdj_zone": snap.get("kdj_zone"),
-            },
-        }
+        del market_flow_context
+        return None
 
     def _score_lw(
         self,
@@ -3270,24 +3580,14 @@ class FundFlowDecisionEngine:
                 "hybrid_result": {...},
             }
         """
-        # 获取原始MACD和KDJ值用于混合方法
-        macd_raw = self._to_float(features.get("macd"), 0.0) * 0.003  # 反归一化
-        kdj_j_raw = self._to_float(features.get("kdj"), 0.0) * 50.0 + 50.0  # 反归一化
-        
-        # 调用新的MACD+KDJ+资金流混合方法
-        hybrid_result = self._score_macd_kdj_fund_flow_hybrid(features, macd_raw, kdj_j_raw)
-        
         components: Dict[str, Any] = {}
         combo_compare = self._score_dual_combo(features)
-        lw_score = self._to_float(combo_compare.get("winner_score"), 0.0)
-        components["combo_macd_kdj"] = round(self._to_float(combo_compare.get("score_macd_kdj"), 0.0), 3)
+        lw_score = self._to_float(combo_compare.get("score_macd_bb"), 0.0)
         components["combo_macd_bb"] = round(self._to_float(combo_compare.get("score_macd_bb"), 0.0), 3)
-        components["combo_winner"] = 1.0 if str(combo_compare.get("winner")) == "MACD+KDJ" else -1.0
+        components["combo_winner"] = -1.0
         components["macd"] = round(self._to_float(features.get("macd"), 0.0), 3)
-        components["kdj"] = round(self._to_float(features.get("kdj"), 0.0), 3)
         components["bb"] = round(self._to_float(features.get("bb"), 0.0), 3)
         components["macd_cross"] = round(self._to_float(features.get("macd_cross"), 0.0), 3)
-        components["kdj_cross"] = round(self._to_float(features.get("kdj_cross"), 0.0), 3)
         components["bb_break"] = round(self._to_float(features.get("bb_break"), 0.0), 3)
 
         # ========== 确认/否决指标 (CVD, imbalance) ==========
@@ -3298,25 +3598,13 @@ class FundFlowDecisionEngine:
         # ========== 主指标失效检测 ==========
         # 当所有主指标都接近0时，启用CVD/imbalance作为备用方向判断
         primary_indicators_flat = (
-            all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
+            all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "bb"))
             and abs(features.get("macd_cross", 0.0)) < 0.5
-            and abs(features.get("kdj_cross", 0.0)) < 0.5
             and abs(features.get("bb_break", 0.0)) < 0.5
         )
 
         if primary_indicators_flat:
-            confluence_fallback = self._score_primary_flat_confluence_fallback(market_flow_context)
-            if confluence_fallback is not None:
-                lw_score = self._to_float(confluence_fallback.get("score"), 0.0)
-                components["backup_direction"] = True
-                components["backup_score"] = round(lw_score, 3)
-                components["backup_source"] = str(confluence_fallback.get("source", "unknown"))
-                components["backup_long_score"] = self._to_float(confluence_fallback.get("long_score"), 0.0)
-                components["backup_short_score"] = self._to_float(confluence_fallback.get("short_score"), 0.0)
-                components["backup_snapshot"] = confluence_fallback.get("snapshot", {})
-                confirmation = 0.0
-                has_conflict = False
-            elif abs(cvd_val) > 0.1 or abs(imb_val) > 0.1:
+            if abs(cvd_val) > 0.1 or abs(imb_val) > 0.1:
                 # 主指标失效，使用CVD和imbalance作为最终兜底方向判断
                 cvd_direction_weight = 0.60
                 imbalance_direction_weight = 0.40
@@ -3370,29 +3658,15 @@ class FundFlowDecisionEngine:
         else:
             direction = "SHORT_ONLY"
 
-        # 使用混合方法的结果作为主要方向判断
-        # 混合方法已经包含了MACD主趋势+KDJ辅买卖点+资金流融合
-        if primary_indicators_flat and components.get("backup_source") == "ma10_macd_confluence_5m":
-            final_direction = direction
-            final_score = lw_score
-        else:
-            final_direction = hybrid_result.get("dir", direction)
-            final_score = hybrid_result.get("score", lw_score)
-        
-        # 将混合方法的结果也返回用于参考
-        components["hybrid"] = hybrid_result.get("components", {})
-        components["hybrid_regime"] = hybrid_result.get("regime", "UNKNOWN")
-        components["kdj_entry_signal"] = hybrid_result.get("kdj_entry_signal", "NEUTRAL")
-        
         return {
-            "dir": final_direction,
-            "score": round(final_score, 3),
+            "dir": direction,
+            "score": round(lw_score, 3),
             "components": components,
             "conflict": has_conflict,
             "confirmation": round(confirmation, 3),
             "combo_compare": combo_compare,
-            "active_model": str(combo_compare.get("winner", "MACD+KDJ")),
-            "hybrid_result": hybrid_result,
+            "active_model": "MACD+BB",
+            "hybrid_result": {},
         }
 
     def _score_ev(
@@ -3422,7 +3696,7 @@ class FundFlowDecisionEngine:
 
         # ========== 可靠度加权后的主指标 ==========
         reliability_weighted: Dict[str, float] = {}
-        for key in ("macd", "kdj", "bb"):
+        for key in ("macd", "bb"):
             val = features.get(key, 0.0)
 
             # 获取该指标的可靠度
@@ -3438,12 +3712,10 @@ class FundFlowDecisionEngine:
             components[key] = round(reliability_weighted[key], 3)
 
         ev_combo = self._score_dual_combo(reliability_weighted)
-        ev_score = self._to_float(ev_combo.get("winner_score"), 0.0)
-        components["combo_macd_kdj"] = round(self._to_float(ev_combo.get("score_macd_kdj"), 0.0), 3)
+        ev_score = self._to_float(ev_combo.get("score_macd_bb"), 0.0)
         components["combo_macd_bb"] = round(self._to_float(ev_combo.get("score_macd_bb"), 0.0), 3)
-        components["combo_winner"] = 1.0 if str(ev_combo.get("winner")) == "MACD+KDJ" else -1.0
+        components["combo_winner"] = -1.0
         components["macd_cross"] = round(self._to_float(features.get("macd_cross"), 0.0), 3)
-        components["kdj_cross"] = round(self._to_float(features.get("kdj_cross"), 0.0), 3)
         components["bb_break"] = round(self._to_float(features.get("bb_break"), 0.0), 3)
 
         # ========== 确认/否决指标 (不参与方向决定) ==========
@@ -3460,24 +3732,13 @@ class FundFlowDecisionEngine:
         # ========== 主指标失效检测 ==========
         # 当所有主指标都接近0时，启用CVD/imbalance作为备用方向判断
         primary_indicators_flat = (
-            all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "kdj", "bb"))
+            all(abs(features.get(k, 0.0)) < 0.05 for k in ("macd", "bb"))
             and abs(features.get("macd_cross", 0.0)) < 0.5
-            and abs(features.get("kdj_cross", 0.0)) < 0.5
             and abs(features.get("bb_break", 0.0)) < 0.5
         )
 
         if primary_indicators_flat:
-            confluence_fallback = self._score_primary_flat_confluence_fallback(market_flow_context)
-            if confluence_fallback is not None:
-                ev_score = self._to_float(confluence_fallback.get("score"), 0.0)
-                components["backup_direction"] = True
-                components["backup_score"] = round(ev_score, 3)
-                components["backup_source"] = str(confluence_fallback.get("source", "unknown"))
-                components["backup_long_score"] = self._to_float(confluence_fallback.get("long_score"), 0.0)
-                components["backup_short_score"] = self._to_float(confluence_fallback.get("short_score"), 0.0)
-                components["backup_snapshot"] = confluence_fallback.get("snapshot", {})
-                components["primary_flat"] = True
-            elif abs(cvd_val) > 0.1 or abs(imb_val) > 0.1:
+            if abs(cvd_val) > 0.1 or abs(imb_val) > 0.1:
                 # 主指标失效，使用CVD和imbalance作为最终兜底方向判断
                 cvd_alpha, cvd_beta = self._ev_reliability.get("cvd", (10.0, 10.0))
                 imb_alpha, imb_beta = self._ev_reliability.get("imbalance", (10.0, 10.0))
@@ -3512,7 +3773,7 @@ class FundFlowDecisionEngine:
             "components": components,
             "reliabilities": reliabilities,
             "combo_compare": ev_combo,
-            "active_model": str(ev_combo.get("winner", "MACD+KDJ")),
+            "active_model": "MACD+BB",
         }
 
     def _update_ev_reliability(
@@ -3675,10 +3936,10 @@ class FundFlowDecisionEngine:
             "MACD_KDJ": "MACD+KDJ",
             "EV_PRIMARY": "EV主方向",
         }
-        guide_score_source = "lw_hybrid"
+        guide_score_source = "macd_bb_only"
         effective_neutral_zone = float(self._direction_guide_neutral_zone)
         if adx >= self.regime_adx_trend_on:
-            effective_neutral_zone = min(
+            effective_neutral_zone = max(
                 effective_neutral_zone,
                 float(self._direction_guide_trend_relaxed_neutral_zone),
             )
@@ -3709,6 +3970,17 @@ class FundFlowDecisionEngine:
             guide_direction = str(price_action_override.get("direction", guide_direction)).upper()
             guide_score = self._to_float(price_action_override.get("score"), guide_score)
             guide_score_source = "price_action_override"
+
+        if (
+            guide_direction in {"LONG_ONLY", "SHORT_ONLY"}
+            and ev_dir in {"LONG_ONLY", "SHORT_ONLY"}
+            and guide_direction != ev_dir
+            and abs(float(guide_score)) <= float(self._direction_guide_conflict_neutral_zone)
+            and not bool(price_action_override.get("applied", False))
+        ):
+            guide_direction = "BOTH"
+            guide_score = 0.0
+            guide_score_source = "ev_lw_conflict_neutralized"
 
         final_dir = guide_direction if self._direction_guide_enabled else ev_dir
         final_score = guide_score if self._direction_guide_enabled else ev_score
@@ -4158,12 +4430,17 @@ class FundFlowDecisionEngine:
         
         # 提取多时间框架数据
         timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
+        tf_diagnostics = self._build_macd_tf_diagnostics(timeframes)
         if not isinstance(timeframes, dict):
             return FundFlowDecision(
                 operation=Operation.HOLD,
                 symbol=symbol,
                 reason="macd_v2_missing_timeframes",
-                metadata={"error": "missing timeframes data"}
+                metadata={
+                    "error": "missing timeframes data",
+                    "strategy_mode": "macd_mtf_strategy_v2",
+                    "macd_tf_diagnostics": tf_diagnostics,
+                }
             )
         
         # 获取15M、1H、4H数据
@@ -4176,7 +4453,11 @@ class FundFlowDecisionEngine:
                 operation=Operation.HOLD,
                 symbol=symbol,
                 reason="macd_v2_missing_tf_data",
-                metadata={"error": "missing 15m/1h/4h data"}
+                metadata={
+                    "error": "missing 15m/1h/4h data",
+                    "strategy_mode": "macd_mtf_strategy_v2",
+                    "macd_tf_diagnostics": tf_diagnostics,
+                }
             )
 
         current_time = tf_15m.get("timestamp", tf_1h.get("timestamp"))
@@ -4312,6 +4593,7 @@ class FundFlowDecisionEngine:
             oi_delta_ratio=oi_delta_ratio,
         )
         
+        signal_debug_details = signal.details if isinstance(signal.details, dict) else {}
         # 构建元数据
         metadata = {
             "strategy_mode": "macd_mtf_strategy_v2",
@@ -4326,9 +4608,9 @@ class FundFlowDecisionEngine:
             "vwap_deviation": signal.vwap_deviation,
             "vwap_state": signal.vwap_state,
             "vwap_location_score": signal.vwap_location_score,
-            "stable_continuation_active": bool((signal.details or {}).get("stable_continuation_active", False)),
-            "stable_continuation_side": (signal.details or {}).get("stable_continuation_side"),
-            "stable_continuation_reason": (signal.details or {}).get("stable_continuation_reason"),
+            "stable_continuation_active": bool(signal_debug_details.get("stable_continuation_active", False)),
+            "stable_continuation_side": signal_debug_details.get("stable_continuation_side"),
+            "stable_continuation_reason": signal_debug_details.get("stable_continuation_reason"),
             "structural_vwap": structural_vwap,
             "bb_middle_1h": bb_middle_1h,
             "bb_upper_1h": bb_upper_1h,
@@ -4349,8 +4631,27 @@ class FundFlowDecisionEngine:
             "direction_lock": regime_info.get("direction", "BOTH"),
             "last_open": regime_info.get("last_open", 0.0),
             "last_close": regime_info.get("last_close", 0.0),
-            "macd_v2_debug": signal.details if isinstance(signal.details, dict) else {},
+            "macd_tf_diagnostics": tf_diagnostics,
+            "macd_v2_debug": signal_debug_details,
         }
+        for key in (
+            "reject_reason_code",
+            "reject_stage",
+            "pocket_entry_override_label",
+            "signal_score_threshold_used",
+            "min_vwap_score_used",
+            "min_entry_score_used",
+            "direction_lock_applied",
+            "entry_hard_filter_blocked",
+            "entry_hard_filters",
+            "entry_hard_gate_blocked",
+            "entry_hard_gate_reason",
+            "entry_hard_gate_checks",
+            "entry_hard_gate_flow_checks",
+            "entry_hard_gate_micro_checks",
+        ):
+            if key in signal_debug_details:
+                metadata[key] = signal_debug_details.get(key)
         if symbol_signal_override:
             metadata["symbol_signal_override"] = symbol_signal_override
         regime_state = self._build_macd_v2_4h_regime_state(
@@ -4359,6 +4660,9 @@ class FundFlowDecisionEngine:
             tf_4h=tf_4h,
         )
         metadata["macd_4h_regime_state"] = regime_state
+        metadata["regime_fallback_allowed"] = bool(regime_state.get("entry_allowed", False))
+        metadata["regime_fallback_score"] = float(self._to_float(regime_state.get("score"), 0.0))
+        metadata = self._annotate_primary_open_blocker(metadata)
         regime_runtime_mode = str(regime_state.get("side_override_mode", "BOTH") or "BOTH")
         regime_side = str(regime_state.get("side", "neutral") or "neutral")
         long_allowed_by_regime = regime_runtime_mode in {"BOTH", "LONG_ONLY"}
@@ -4415,9 +4719,21 @@ class FundFlowDecisionEngine:
                 position_side=pos_side,
                 position_context=current_pos if isinstance(current_pos, dict) else {},
             )
+            close_signal_type = str(
+                (current_pos or {}).get("signal_type_1h") or signal.signal_type_1h or ""
+            )
+            close_vwap_state = str(
+                (current_pos or {}).get("vwap_state") or signal.vwap_state or ""
+            )
+            shrink_pocket_override = self._resolve_pocket_management_override(
+                signal_type_1h=close_signal_type,
+                vwap_state=close_vwap_state,
+            )
+            pocket_shrink_exit_enabled = bool(shrink_pocket_override.get("enable_4h_shrink_exit", True))
             if (
                 pos_side
                 and self.macd_v2_config
+                and pocket_shrink_exit_enabled
                 and getattr(self.macd_v2_config, "enable_4h_shrink_exit", False)
                 and bool(shrink_exit_policy.get("active", False))
             ):
@@ -4431,6 +4747,8 @@ class FundFlowDecisionEngine:
                         getattr(self.macd_v2_config, "shrink_exit_loss_mitigation_ignore_if_pnl_gt", 0.01)
                     )
                 )
+                if bool(shrink_pocket_override.get("disable_shrink_loss_mitigation", False)):
+                    shrink_loss_mitigation_active = False
                 if shrink_loss_mitigation_active:
                     close_ratio = min(
                         1.0,
@@ -4513,6 +4831,7 @@ class FundFlowDecisionEngine:
                         regime_entry,
                         runtime_override_mode=regime_runtime_mode,
                     )
+            metadata = self._annotate_primary_open_blocker(metadata)
             return FundFlowDecision(
                 operation=Operation.HOLD,
                 symbol=symbol,
@@ -4546,6 +4865,7 @@ class FundFlowDecisionEngine:
                 )
 
             gates_passed, gate_reason, gate_metadata = self._validate_macd_v2_entry_hard_gates(
+                symbol=symbol,
                 direction="long",
                 price=price,
                 structural_vwap=structural_vwap,
@@ -4556,16 +4876,24 @@ class FundFlowDecisionEngine:
                 signal_type_1h=signal.signal_type_1h,
                 vwap_state=signal.vwap_state,
                 vwap_score=signal.vwap_score,
+                signal_score=signal.signal_score,
+                stable_continuation_active=bool((signal.details or {}).get("stable_continuation_active", False)),
             )
             metadata.update(gate_metadata)
             if not gates_passed:
                 metadata["entry_hard_gate_blocked"] = True
                 metadata["entry_hard_gate_reason"] = gate_reason
+                threshold_used = self._to_float(metadata.get("signal_score_threshold_used"), 0.0)
+                metadata["entry_hard_gate_threshold_passed"] = bool(
+                    threshold_used > 0 and signal.signal_score >= threshold_used
+                )
+                metadata["entry_hard_gate_failed_bucket"] = str(gate_reason or "").split(":", 1)[0]
                 self._log_gate_check_report(
                     symbol, signal, metadata, regime_info, market_flow_context,
                     gate_label=f"ENTRY_HARD_GATE_LONG({gate_reason})", passed=False,
                     hold_reason=gate_reason,
                 )
+                metadata = self._annotate_primary_open_blocker(metadata)
                 return FundFlowDecision(
                     operation=Operation.HOLD,
                     symbol=symbol,
@@ -4628,12 +4956,22 @@ class FundFlowDecisionEngine:
                     )
             
             # 开多仓
+            pocket_management_override = self._resolve_pocket_management_override(
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                vwap_state=str(signal.vwap_state or ""),
+            )
             leverage = macd_v2_engine.calculate_leverage(
                 signal.signal_score,
                 signal.ema_multiplier,
                 signal.signal_type_1h,
                 symbol=symbol,
                 is_trial_entry=bool(signal.is_trial_entry),
+            )
+            leverage = self._apply_pocket_leverage_constraints(
+                leverage=leverage,
+                pocket_management_override=pocket_management_override,
+                macd_v2_engine=macd_v2_engine,
+                symbol=symbol,
             )
             session_position_scale = macd_v2_engine.resolve_session_position_scale(
                 current_time,
@@ -4657,6 +4995,15 @@ class FundFlowDecisionEngine:
                 vwap_structure_overrides=self.vwap_structure_overrides,
             )
             portion = max(0.0, min(1.0, portion * structure_scale))
+            pocket_position_scale = self._to_float(pocket_management_override.get("position_scale"), 1.0)
+            if pocket_position_scale > 0:
+                portion = max(0.0, min(1.0, portion * pocket_position_scale))
+            pocket_max_target_portion = self._normalize_portion_ratio(
+                pocket_management_override.get("max_target_portion"),
+                0.0,
+            )
+            if pocket_max_target_portion > 0:
+                portion = min(portion, pocket_max_target_portion)
             metadata["session_risk"] = {
                 "position_scale": float(session_position_scale),
                 "state": str(signal.vwap_state or signal.signal_type_1h or ""),
@@ -4673,22 +5020,39 @@ class FundFlowDecisionEngine:
             }
             suggested_stop = self._to_optional_float(signal.suggested_stop_price)
             stop_loss_price = suggested_stop
+            pocket_stop_loss_pct = self._normalize_pct_ratio(
+                pocket_management_override.get("sl_pct"),
+                stop_loss_pct,
+            ) if pocket_management_override else stop_loss_pct
             if stop_loss_price is None or stop_loss_price <= 0 or stop_loss_price >= price:
-                stop_loss_price = price * (1.0 - stop_loss_pct) if stop_loss_pct > 0 else None
-            take_profit_price = price * (1.0 + take_profit_pct) if take_profit_pct > 0 else None
+                stop_loss_price = price * (1.0 - pocket_stop_loss_pct) if pocket_stop_loss_pct > 0 else None
+            pocket_take_profit_pct = self._normalize_pct_ratio(
+                pocket_management_override.get("tp_pct"),
+                take_profit_pct,
+            ) if pocket_management_override else take_profit_pct
+            take_profit_price = price * (1.0 + pocket_take_profit_pct) if pocket_take_profit_pct > 0 else None
+            tp_levels = self._build_tp_levels_from_override(
+                price=price,
+                direction="long",
+                override=pocket_management_override,
+            )
             metadata["tp_sl"] = {
-                "tp_pct": take_profit_pct,
-                "sl_pct": stop_loss_pct,
+                "tp_pct": pocket_take_profit_pct,
+                "sl_pct": pocket_stop_loss_pct,
                 "tp_enabled": take_profit_price is not None,
                 "sl_enabled": stop_loss_price is not None,
             }
+            if pocket_management_override:
+                metadata["pocket_management_override"] = dict(pocket_management_override)
+            if tp_levels:
+                metadata["tp_levels"] = tp_levels
 
             return self._apply_symbol_side_override(
                 FundFlowDecision(
                     operation=Operation.BUY,
                     symbol=symbol,
                     target_portion_of_balance=portion,
-                    leverage=max(self.min_leverage, min(self.max_leverage, leverage)),
+                    leverage=leverage,
                     max_price=price * (1.0 + self.entry_slippage),
                     take_profit_price=take_profit_price,
                     stop_loss_price=stop_loss_price,
@@ -4726,6 +5090,7 @@ class FundFlowDecisionEngine:
                 )
 
             gates_passed, gate_reason, gate_metadata = self._validate_macd_v2_entry_hard_gates(
+                symbol=symbol,
                 direction="short",
                 price=price,
                 structural_vwap=structural_vwap,
@@ -4736,16 +5101,24 @@ class FundFlowDecisionEngine:
                 signal_type_1h=signal.signal_type_1h,
                 vwap_state=signal.vwap_state,
                 vwap_score=signal.vwap_score,
+                signal_score=signal.signal_score,
+                stable_continuation_active=bool((signal.details or {}).get("stable_continuation_active", False)),
             )
             metadata.update(gate_metadata)
             if not gates_passed:
                 metadata["entry_hard_gate_blocked"] = True
                 metadata["entry_hard_gate_reason"] = gate_reason
+                threshold_used = self._to_float(metadata.get("signal_score_threshold_used"), 0.0)
+                metadata["entry_hard_gate_threshold_passed"] = bool(
+                    threshold_used > 0 and signal.signal_score >= threshold_used
+                )
+                metadata["entry_hard_gate_failed_bucket"] = str(gate_reason or "").split(":", 1)[0]
                 self._log_gate_check_report(
                     symbol, signal, metadata, regime_info, market_flow_context,
                     gate_label=f"ENTRY_HARD_GATE_SHORT({gate_reason})", passed=False,
                     hold_reason=gate_reason,
                 )
+                metadata = self._annotate_primary_open_blocker(metadata)
                 return FundFlowDecision(
                     operation=Operation.HOLD,
                     symbol=symbol,
@@ -4808,12 +5181,22 @@ class FundFlowDecisionEngine:
                     )
             
             # 开空仓
+            pocket_management_override = self._resolve_pocket_management_override(
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                vwap_state=str(signal.vwap_state or ""),
+            )
             leverage = macd_v2_engine.calculate_leverage(
                 signal.signal_score,
                 signal.ema_multiplier,
                 signal.signal_type_1h,
                 symbol=symbol,
                 is_trial_entry=bool(signal.is_trial_entry),
+            )
+            leverage = self._apply_pocket_leverage_constraints(
+                leverage=leverage,
+                pocket_management_override=pocket_management_override,
+                macd_v2_engine=macd_v2_engine,
+                symbol=symbol,
             )
             session_position_scale = macd_v2_engine.resolve_session_position_scale(
                 current_time,
@@ -4837,6 +5220,15 @@ class FundFlowDecisionEngine:
                 vwap_structure_overrides=self.vwap_structure_overrides,
             )
             portion = max(0.0, min(1.0, portion * structure_scale))
+            pocket_position_scale = self._to_float(pocket_management_override.get("position_scale"), 1.0)
+            if pocket_position_scale > 0:
+                portion = max(0.0, min(1.0, portion * pocket_position_scale))
+            pocket_max_target_portion = self._normalize_portion_ratio(
+                pocket_management_override.get("max_target_portion"),
+                0.0,
+            )
+            if pocket_max_target_portion > 0:
+                portion = min(portion, pocket_max_target_portion)
             metadata["session_risk"] = {
                 "position_scale": float(session_position_scale),
                 "state": str(signal.vwap_state or signal.signal_type_1h or ""),
@@ -4853,22 +5245,39 @@ class FundFlowDecisionEngine:
             }
             suggested_stop = self._to_optional_float(signal.suggested_stop_price)
             stop_loss_price = suggested_stop
+            pocket_stop_loss_pct = self._normalize_pct_ratio(
+                pocket_management_override.get("sl_pct"),
+                stop_loss_pct,
+            ) if pocket_management_override else stop_loss_pct
             if stop_loss_price is None or stop_loss_price <= 0 or stop_loss_price <= price:
-                stop_loss_price = price * (1.0 + stop_loss_pct) if stop_loss_pct > 0 else None
-            take_profit_price = price * (1.0 - take_profit_pct) if take_profit_pct > 0 else None
+                stop_loss_price = price * (1.0 + pocket_stop_loss_pct) if pocket_stop_loss_pct > 0 else None
+            pocket_take_profit_pct = self._normalize_pct_ratio(
+                pocket_management_override.get("tp_pct"),
+                take_profit_pct,
+            ) if pocket_management_override else take_profit_pct
+            take_profit_price = price * (1.0 - pocket_take_profit_pct) if pocket_take_profit_pct > 0 else None
+            tp_levels = self._build_tp_levels_from_override(
+                price=price,
+                direction="short",
+                override=pocket_management_override,
+            )
             metadata["tp_sl"] = {
-                "tp_pct": take_profit_pct,
-                "sl_pct": stop_loss_pct,
+                "tp_pct": pocket_take_profit_pct,
+                "sl_pct": pocket_stop_loss_pct,
                 "tp_enabled": take_profit_price is not None,
                 "sl_enabled": stop_loss_price is not None,
             }
+            if pocket_management_override:
+                metadata["pocket_management_override"] = dict(pocket_management_override)
+            if tp_levels:
+                metadata["tp_levels"] = tp_levels
 
             return self._apply_symbol_side_override(
                 FundFlowDecision(
                     operation=Operation.SELL,
                     symbol=symbol,
                     target_portion_of_balance=portion,
-                    leverage=max(self.min_leverage, min(self.max_leverage, leverage)),
+                    leverage=leverage,
                     min_price=price * (1.0 - self.entry_slippage),
                     take_profit_price=take_profit_price,
                     stop_loss_price=stop_loss_price,
@@ -4912,12 +5321,17 @@ class FundFlowDecisionEngine:
         
         # 提取多时间框架数据
         timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
+        tf_diagnostics = self._build_macd_tf_diagnostics(timeframes)
         if not isinstance(timeframes, dict):
             return FundFlowDecision(
                 operation=Operation.HOLD,
                 symbol=symbol,
                 reason="macd_mtf_missing_timeframes",
-                metadata={"error": "missing timeframes data"}
+                metadata={
+                    "error": "missing timeframes data",
+                    "strategy_mode": "macd_mtf_strategy",
+                    "macd_tf_diagnostics": tf_diagnostics,
+                }
             )
         
         # 获取15M、1H、4H数据
@@ -4930,7 +5344,11 @@ class FundFlowDecisionEngine:
                 operation=Operation.HOLD,
                 symbol=symbol,
                 reason="macd_mtf_missing_tf_data",
-                metadata={"error": f"missing 15m/1h/4h data"}
+                metadata={
+                    "error": f"missing 15m/1h/4h data",
+                    "strategy_mode": "macd_mtf_strategy",
+                    "macd_tf_diagnostics": tf_diagnostics,
+                }
             )
         
         # 提取MACD柱状图数据
@@ -4992,6 +5410,7 @@ class FundFlowDecisionEngine:
             "entry_type_15m": signal.entry_type_15m,
             "entry_score_15m": signal.entry_score_15m,
             "volume_ratio": volume_ratio,
+            "macd_tf_diagnostics": tf_diagnostics,
             "regime": regime_info.get("regime"),
             "direction_lock": regime_info.get("direction", "BOTH"),
         }
