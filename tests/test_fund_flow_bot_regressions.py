@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 from types import SimpleNamespace
 
+from src.config.config_loader import ConfigLoader
 from src.app.fund_flow_bot import FundFlowDecision, FundFlowOperation, TradingBot
 
 
@@ -415,27 +416,106 @@ def test_live_config_restores_long_channel_and_relaxes_pocket_thresholds():
     assert ff["extreme_volatility_cooldown_quantile_value"] == 0.95
     assert ff["extreme_volatility_cooldown_quantile_window"] == 96
     assert ff["extreme_volatility_cooldown_quantile_min_samples"] == 24
+    assert ff["time_exit_minutes"] == 60
     assert strategy_cfg["entry_thresholds"]["min_entry_score"] == 0.25
+    assert strategy_cfg["entry_thresholds"]["red_bar_shrinking"] == 1.5
+    assert strategy_cfg["entry_thresholds"]["flip_bearish"] == 0.80
+    assert strategy_cfg["entry_thresholds"]["green_bar_shrinking"] == 1.5
+    assert strategy_cfg["entry_thresholds"]["green_bar_growing"] == 1.20
+    assert strategy_cfg["entry_thresholds"]["red_bar_growing"] == 1.20
+    assert strategy_cfg["scoring_weights"]["weight_1h_direction"] == 0.25
+    assert strategy_cfg["scoring_weights"]["weight_4h_direction"] == 0.35
+    assert strategy_cfg["scoring_weights"]["weight_boll_position"] == 0.25
+    assert strategy_cfg["scoring_weights"]["weight_vwap"] == 0.05
+    assert strategy_cfg["scoring_weights"]["weight_15m_entry"] == 0.0
+    assert strategy_cfg["scoring_weights"]["weight_volume"] == 0.10
     assert entry_filters["min_vwap_score_for_entry"] == 0.12
     assert penalty_config["min_vwap_score_for_entry"] == 0.12
     assert entry_filters["disable_flip_bullish_trial_entries"] is False
     assert entry_filters["long_entry_mode"] == "all"
+    assert entry_filters["disable_red_bar_shrinking_entries"] is True
+    assert entry_filters["disable_green_bar_growing_entries"] is True
+    assert entry_filters["disable_green_bar_shrinking_entries"] is True
+    assert entry_filters["require_macd_home_advantage"] is True
+    assert entry_filters["vwap_execution_penalty_only"] is True
     doge_override = next(item for item in entry_filters["symbol_signal_overrides"] if item["symbol"] == "DOGEUSDT")
+    bch_override = next(item for item in entry_filters["symbol_signal_overrides"] if item["symbol"] == "BCHUSDT")
+    jup_override = next(item for item in entry_filters["symbol_signal_overrides"] if item["symbol"] == "JUPUSDT")
     assert doge_override["flip_bullish_mode"] == "trial_only"
     assert doge_override["green_bar_growing_mode"] == "enabled_with_strict_threshold"
+    assert "flip_bullish_mode" not in bch_override
+    assert jup_override["flip_bullish_mode"] == "trial_only"
     assert "disable_flip_bullish" not in doge_override
     assert "disable_green_bar_growing" not in doge_override
     assert pocket_overrides["red_bar_growing|long_dual_support"]["min_signal_score"] == 0.84
     assert pocket_overrides["red_bar_growing|long_dual_support"]["min_vwap_score"] == 0.12
     assert pocket_overrides["red_bar_growing|long_dual_support"]["min_entry_score"] == 0.35
+    assert pocket_overrides["green_bar_growing|long_dual_support"]["min_signal_score"] == 0.90
+    assert pocket_overrides["green_bar_growing|long_dual_support"]["min_vwap_score"] == 0.12
+    assert pocket_overrides["green_bar_growing|long_dual_support"]["min_entry_score"] == 0.35
+    assert pocket_overrides["green_bar_growing|long_dual_support"]["disallow_trial_entry"] is True
+    assert pocket_overrides["green_bar_growing|long_below_both"]["disabled"] is True
     assert pocket_overrides["green_bar_growing|short_dual_pressure"]["min_signal_score"] == 0.84
     assert pocket_overrides["green_bar_growing|short_dual_pressure"]["min_vwap_score"] == 0.14
-    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_signal_score"] == 0.84
-    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_vwap_score"] == 0.12
+    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_signal_score"] == 0.90
+    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_vwap_score"] == 0.16
+    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["min_entry_score"] == 0.35
+    assert pocket_overrides["red_bar_growing|short_dual_pressure"]["disallow_trial_entry"] is True
+    assert pocket_overrides["red_bar_growing|short_retest_reject"]["disabled"] is True
+    assert pocket_overrides["red_bar_growing|short_under_structure_wait_reject"]["disabled"] is True
+    assert pocket_overrides["red_bar_growing|short_above_both"]["disabled"] is True
+    assert pocket_overrides["green_bar_growing|long_above_structure_wait_reclaim"]["disabled"] is True
     assert pocket_overrides["green_bar_growing|short_under_structure_wait_reject"]["min_signal_score"] == 0.90
     assert pocket_overrides["green_bar_growing|short_under_structure_wait_reject"]["min_vwap_score"] == 0.14
     assert pocket_overrides["green_bar_growing|short_below_session_above_structure"]["min_signal_score"] == 0.90
     assert pocket_overrides["green_bar_growing|short_below_session_above_structure"]["min_vwap_score"] == 0.14
+    assert pocket_overrides["green_bar_shrinking|short_retest_reject"]["disabled"] is True
+    assert pocket_overrides["red_bar_shrinking|short_retest_reject"]["disabled"] is True
+    assert strategy_cfg["stop_loss_config"]["boll_stop_atr_multiplier"] == 0.3
+    assert strategy_cfg["stop_loss_config"]["max_stop_distance_pct"] == 0.025
+    assert entry_filters["flip_bullish_min_vwap_score"] == 0.08
+    assert entry_filters["flip_bullish_require_15m_growing"] is False
+    assert entry_filters["flip_bearish_min_adx_1h"] == 25.0
+    assert entry_filters["flip_bearish_retest_reject_min_vwap_score"] == 0.18
+    assert strategy_cfg["vwap_config"]["vwap_deviation_hard_block"] == 0.05
+
+
+def test_build_config_fingerprint_summary_counts_current_guardrails():
+    cfg_path = Path("config/trading_config_fund_flow.json")
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = json.loads(cfg_path.read_text(encoding="utf-8"))
+    bot.config_path = str(cfg_path.resolve())
+    bot._config_mtime = cfg_path.stat().st_mtime
+
+    summary = bot._build_config_fingerprint_summary()
+
+    assert summary["config_path"].endswith("config\\trading_config_fund_flow.json")
+    assert summary["long_entry_mode"] == "all"
+    assert summary["disable_flip_bullish_entries"] is False
+    assert summary["disable_flip_bullish_trial_entries"] is False
+    assert summary["disable_green_bar_growing_entries"] is True
+    assert summary["disable_red_bar_shrinking_entries"] is True
+    assert summary["symbol_signal_overrides_count"] == 37
+    assert summary["flip_bullish_trial_only_count"] == 17
+    assert summary["green_bar_growing_strict_threshold_count"] == 20
+
+
+def test_main_config_blacklist_removes_ada_doge_fet_from_active_symbols():
+    cfg = json.loads(Path("config/trading_config_fund_flow.json").read_text(encoding="utf-8"))
+
+    assert cfg["fund_flow"]["symbol_blacklist"] == [
+        "KASUSDT",
+        "JSTUSDT",
+        "WLDUSDT",
+        "ADAUSDT",
+        "DOGEUSDT",
+        "FETUSDT",
+    ]
+
+    active_symbols = ConfigLoader.get_trading_symbols(cfg)
+    assert "ADAUSDT" not in active_symbols
+    assert "DOGEUSDT" not in active_symbols
+    assert "FETUSDT" not in active_symbols
 
 
 def test_pure_strategy_runtime_bypasses_dynamic_max_active_symbols():

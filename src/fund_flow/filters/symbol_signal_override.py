@@ -14,6 +14,14 @@ from typing import Optional, Dict, Any, List
 import logging
 
 
+VALID_SIGNAL_MODES = {"disabled", "trial_only", "enabled_with_strict_threshold"}
+
+
+def _normalize_signal_mode(value: Any) -> Optional[str]:
+    text = str(value or "").strip().lower()
+    return text if text in VALID_SIGNAL_MODES else None
+
+
 @dataclass
 class SymbolSignalOverride:
     """单 symbol 的信号配置覆盖"""
@@ -24,6 +32,8 @@ class SymbolSignalOverride:
     disable_flip_bullish_trial: Optional[bool] = None
     disable_green_bar_growing: Optional[bool] = None
     disable_long_dual_support: Optional[bool] = None
+    flip_bullish_mode: Optional[str] = None
+    green_bar_growing_mode: Optional[str] = None
     
     # 评分门槛覆盖
     min_signal_score_override: Optional[float] = None
@@ -47,12 +57,40 @@ class SymbolSignalOverride:
             disable_flip_bullish_trial=data.get("disable_flip_bullish_trial"),
             disable_green_bar_growing=data.get("disable_green_bar_growing"),
             disable_long_dual_support=data.get("disable_long_dual_support"),
+            flip_bullish_mode=_normalize_signal_mode(data.get("flip_bullish_mode")),
+            green_bar_growing_mode=_normalize_signal_mode(data.get("green_bar_growing_mode")),
             min_signal_score_override=data.get("min_signal_score_override"),
             preflip_trial_min_signal_score_override=data.get("preflip_trial_min_signal_score_override"),
             min_vwap_score_override=data.get("min_vwap_score_override"),
             ema_multiplier_override=data.get("ema_multiplier_override"),
             extra_config=data.get("extra_config", {}),
         )
+
+    def get_signal_mode(self, signal_type: str) -> Optional[str]:
+        signal = str(signal_type or "").strip().lower()
+        if signal == "flip_bullish":
+            if self.flip_bullish_mode:
+                return self.flip_bullish_mode
+            if self.disable_flip_bullish is True:
+                return "disabled"
+            if self.disable_flip_bullish is False and (
+                self.min_signal_score_override is not None
+                or self.min_vwap_score_override is not None
+            ):
+                return "enabled_with_strict_threshold"
+            return None
+        if signal == "green_bar_growing":
+            if self.green_bar_growing_mode:
+                return self.green_bar_growing_mode
+            if self.disable_green_bar_growing is True:
+                return "disabled"
+            if self.disable_green_bar_growing is False and (
+                self.min_signal_score_override is not None
+                or self.min_vwap_score_override is not None
+            ):
+                return "enabled_with_strict_threshold"
+            return None
+        return None
 
 
 class SymbolSignalOverrideRegistry:
@@ -117,6 +155,13 @@ class SymbolSignalOverrideRegistry:
         """
         self._stats["total_checks"] += 1
         override = self._registry.get(str(symbol or "").strip().upper())
+        mode = override.get_signal_mode(signal_type) if override is not None else None
+        if mode == "disabled":
+            self._stats["override_applied"] += 1
+            return True
+        if mode in {"trial_only", "enabled_with_strict_threshold"}:
+            self._stats["override_applied"] += 1
+            return False
         
         if signal_type == "flip_bullish":
             # symbol 级覆盖优先

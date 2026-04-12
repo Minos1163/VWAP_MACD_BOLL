@@ -157,6 +157,22 @@ def test_macd_v2_engine_for_symbol_supports_signal_mode_overrides() -> None:
     assert local_engine.config.flip_bullish_min_vwap_score == 0.15
 
 
+def test_macd_v2_config_reads_red_bar_shrinking_global_disable() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "entry_filters": {
+            "disable_red_bar_shrinking_entries": True,
+        }
+    }
+
+    engine = FundFlowDecisionEngine(cfg)
+
+    assert engine.macd_v2_config.disable_red_bar_shrinking_entries is True
+    strategy_config = build_strategy_config(cfg)
+    assert strategy_config.disable_red_bar_shrinking_entries is True
+
+
 def test_enforce_direction_lock_on_decision_marks_structured_primary_blocker() -> None:
     engine = FundFlowDecisionEngine(_cfg())
     decision = FundFlowDecision(
@@ -284,8 +300,45 @@ def test_macd_v2_missing_tf_data_includes_timeframe_diagnostics() -> None:
     assert decision.reason == "macd_v2_missing_tf_data"
     diag = decision.metadata["macd_tf_diagnostics"]
     assert diag["15m"]["timeframe_present"] is True
+    assert diag["15m"]["diagnostic_code"] == "series_missing_but_fallback_present"
     assert diag["1h"]["timeframe_present"] is False
+    assert diag["1h"]["diagnostic_code"] == "timeframe_missing"
     assert diag["4h"]["timeframe_present"] is False
+    assert diag["4h"]["diagnostic_code"] == "timeframe_missing"
+
+
+def test_macd_v2_missing_tf_data_distinguishes_snapshot_empty_from_series_gap() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    engine = FundFlowDecisionEngine(cfg)
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=100.0,
+        market_flow_context={
+            "timeframes": {
+                "15m": {"macd_hist": 0.1, "macd_hist_prev": 0.05},
+                "1h": {},
+                "4h": {"close_series": [99.0, 100.0, 101.0]},
+            },
+            "timeframe_request_diagnostics": {
+                "15m": {"requested": True, "snapshot_empty": False},
+                "1h": {"requested": True, "snapshot_empty": True},
+                "4h": {"requested": True, "snapshot_empty": False},
+            },
+        },
+        regime_info={"regime": "TREND", "direction": "BOTH", "guide_direction": "BOTH"},
+    )
+
+    assert decision.operation == Operation.HOLD
+    assert decision.reason == "macd_v2_missing_tf_data"
+    diag = decision.metadata["macd_tf_diagnostics"]
+    assert diag["15m"]["diagnostic_code"] == "series_missing_but_fallback_present"
+    assert diag["1h"]["diagnostic_code"] == "snapshot_empty"
+    assert diag["4h"]["diagnostic_code"] == "series_and_fallback_missing"
+    assert diag["1h"]["requested"] is True
+    assert diag["1h"]["snapshot_empty"] is True
 
 
 def test_decide_macd_v2_hard_blocks_long_when_direction_lock_is_short_only():
@@ -404,6 +457,237 @@ def test_macd_v2_decision_metadata_includes_timeframe_diagnostics_when_series_ex
     assert diag["15m"]["series_source"] == "series"
     assert diag["1h"]["series_source"] == "series"
     assert diag["4h"]["series_source"] == "series"
+    assert diag["15m"]["diagnostic_code"] == "series_present"
+    assert diag["1h"]["diagnostic_code"] == "series_present"
+    assert diag["4h"]["diagnostic_code"] == "series_present"
+
+
+def test_macd_v2_state_machine_ignores_nan_macd_line_fields_and_falls_back_to_series() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "scoring_weights": {
+            "weight_1h_direction": 0.25,
+            "weight_4h_direction": 0.35,
+            "weight_boll_position": 0.25,
+            "weight_vwap": 0.05,
+            "weight_15m_entry": 0.0,
+            "weight_volume": 0.10,
+        },
+        "entry_thresholds": {
+            "default": 0.1,
+            "min_entry_score": 0.1,
+            "min_signal_score": 0.1,
+            "red_bar_growing": 0.1,
+            "red_bar_shrinking": 1.5,
+            "flip_bearish": 0.1,
+            "flip_bullish": 0.1,
+            "green_bar_growing": 0.1,
+            "green_bar_shrinking": 1.5,
+        },
+        "entry_filters": {
+            "primary_direction_timeframe": "4h",
+            "require_macd_home_advantage": True,
+            "vwap_execution_penalty_only": True,
+            "disable_red_bar_shrinking_entries": True,
+            "disable_green_bar_shrinking_entries": True,
+            "disable_flip_bullish_entries": False,
+            "disable_green_bar_growing_entries": False,
+            "min_signal_score": 0.1,
+            "min_vwap_score_for_entry": 0.0,
+        },
+    }
+    engine = FundFlowDecisionEngine(cfg)
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=99.0,
+        market_flow_context={
+            "timeframes": {
+                "15m": {
+                    "macd_hist_series": [0.02, 0.03, 0.04, 0.05],
+                    "volume": 200.0,
+                    "avg_volume": 100.0,
+                    "bb_middle": 100.0,
+                    "bb_upper": 103.0,
+                    "bb_lower": 97.0,
+                    "close": 99.0,
+                },
+                "1h": {
+                    "macd_hist_series": [0.01, 0.03, 0.06, 0.10],
+                    "macd": float("nan"),
+                    "close": 99.0,
+                    "vwap": 100.5,
+                    "structural_vwap": 100.0,
+                    "bb_middle": 100.0,
+                    "bb_upper": 110.0,
+                    "bb_lower": 90.0,
+                    "atr": 1.0,
+                    "adx": 20.0,
+                    "close_series": [98.0, 98.5, 98.8, 99.0],
+                    "vwap_series": [100.8, 100.7, 100.6, 100.5],
+                    "structural_vwap_series": [100.2, 100.1, 100.0, 100.0],
+                },
+                "4h": {
+                    "macd_hist_series": [-0.20, -0.12, -0.06, -0.02],
+                    "macd": float("nan"),
+                    "bb_middle": 100.0,
+                    "bb_upper": 110.0,
+                    "bb_lower": 90.0,
+                    "adx": 22.0,
+                    "close_series": [104.0, 102.0, 100.0, 99.0],
+                },
+            }
+        },
+        regime_info={"regime": "TREND", "direction": "BOTH", "guide_direction": "BOTH", "adx": 22.0, "atr_pct": 0.01},
+    )
+
+    debug = decision.metadata["macd_v2_debug"]
+    assert debug["market_quadrant"] == "III"
+    assert debug["macd_home_side"] == "short"
+
+
+def test_macd_v2_state_machine_ignores_missing_macd_line_fields_and_falls_back_to_series() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "scoring_weights": {
+            "weight_1h_direction": 0.25,
+            "weight_4h_direction": 0.35,
+            "weight_boll_position": 0.25,
+            "weight_vwap": 0.05,
+            "weight_15m_entry": 0.0,
+            "weight_volume": 0.10,
+        },
+        "entry_thresholds": {
+            "default": 0.1,
+            "min_entry_score": 0.1,
+            "min_signal_score": 0.1,
+            "red_bar_growing": 0.1,
+            "red_bar_shrinking": 1.5,
+            "flip_bearish": 0.1,
+            "flip_bullish": 0.1,
+            "green_bar_growing": 0.1,
+            "green_bar_shrinking": 1.5,
+        },
+        "entry_filters": {
+            "primary_direction_timeframe": "4h",
+            "require_macd_home_advantage": True,
+            "vwap_execution_penalty_only": True,
+            "disable_red_bar_shrinking_entries": True,
+            "disable_green_bar_shrinking_entries": True,
+            "disable_flip_bullish_entries": False,
+            "disable_green_bar_growing_entries": False,
+            "min_signal_score": 0.1,
+            "min_vwap_score_for_entry": 0.0,
+        },
+    }
+    engine = FundFlowDecisionEngine(cfg)
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=99.0,
+        market_flow_context={
+            "timeframes": {
+                "15m": {
+                    "macd_hist_series": [0.02, 0.03, 0.04, 0.05],
+                    "volume": 200.0,
+                    "avg_volume": 100.0,
+                    "bb_middle": 100.0,
+                    "bb_upper": 103.0,
+                    "bb_lower": 97.0,
+                    "close": 99.0,
+                },
+                "1h": {
+                    "macd_hist_series": [0.01, 0.03, 0.06, 0.10],
+                    "close": 99.0,
+                    "vwap": 100.5,
+                    "structural_vwap": 100.0,
+                    "bb_middle": 100.0,
+                    "bb_upper": 110.0,
+                    "bb_lower": 90.0,
+                    "atr": 1.0,
+                    "adx": 20.0,
+                    "close_series": [98.0, 98.5, 98.8, 99.0],
+                    "vwap_series": [100.8, 100.7, 100.6, 100.5],
+                    "structural_vwap_series": [100.2, 100.1, 100.0, 100.0],
+                },
+                "4h": {
+                    "macd_hist_series": [-0.20, -0.12, -0.06, -0.02],
+                    "bb_middle": 100.0,
+                    "bb_upper": 110.0,
+                    "bb_lower": 90.0,
+                    "adx": 22.0,
+                    "close_series": [104.0, 102.0, 100.0, 99.0],
+                },
+            }
+        },
+        regime_info={"regime": "TREND", "direction": "BOTH", "guide_direction": "BOTH", "adx": 22.0, "atr_pct": 0.01},
+    )
+
+    debug = decision.metadata["macd_v2_debug"]
+    assert debug["market_quadrant"] == "III"
+    assert debug["macd_home_side"] == "short"
+
+
+def test_macd_v2_decision_metadata_exposes_state_machine_fields_and_replacement_defaults() -> None:
+    cfg = _cfg()
+    cfg["fund_flow"]["strategy_mode"] = "macd_mtf_strategy_v2"
+    engine = FundFlowDecisionEngine(cfg)
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=99.0,
+        market_flow_context={
+            "timeframes": {
+                "15m": {
+                    "macd_hist_series": [0.02, 0.03, 0.04, 0.05],
+                    "volume": 200.0,
+                    "avg_volume": 100.0,
+                    "bb_middle": 100.0,
+                    "bb_upper": 103.0,
+                    "bb_lower": 97.0,
+                    "close": 99.0,
+                },
+                "1h": {
+                    "macd_hist_series": [0.01, 0.03, 0.06, 0.10],
+                    "close": 99.0,
+                    "vwap": 100.5,
+                    "structural_vwap": 100.0,
+                    "bb_middle": 100.0,
+                    "bb_upper": 110.0,
+                    "bb_lower": 90.0,
+                    "atr": 1.0,
+                    "adx": 20.0,
+                    "close_series": [98.0, 98.5, 98.8, 99.0],
+                    "vwap_series": [100.8, 100.7, 100.6, 100.5],
+                    "structural_vwap_series": [100.2, 100.1, 100.0, 100.0],
+                },
+                "4h": {
+                    "macd_hist_series": [-0.20, -0.12, -0.06, -0.02],
+                    "bb_middle": 100.0,
+                    "bb_upper": 110.0,
+                    "bb_lower": 90.0,
+                    "adx": 22.0,
+                    "close_series": [104.0, 102.0, 100.0, 99.0],
+                },
+            }
+        },
+        regime_info={"regime": "TREND", "direction": "BOTH", "guide_direction": "BOTH", "adx": 22.0, "atr_pct": 0.01},
+    )
+
+    assert decision.metadata["market_quadrant"] == "III"
+    assert decision.metadata["macd_home_side"] == "short"
+    assert decision.metadata["boll_value_zone"] == "weak"
+    assert isinstance(decision.metadata["boll_position_score"], float)
+    assert isinstance(decision.metadata["vwap_execution_state"], str)
+    assert decision.metadata["vwap_execution_state"] != ""
+    assert "entry_tier" in decision.metadata
+    assert decision.metadata["capacity_replacement_candidate"] is False
+    assert decision.metadata["capacity_replacement_target"] == ""
 
 
 def test_decide_hold_when_signal_not_enough():

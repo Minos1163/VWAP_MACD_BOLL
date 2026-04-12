@@ -280,6 +280,7 @@ class TradingBot:
         self._dca_stage_by_pos: Dict[str, int] = {}
         self._winner_pyramid_stage_by_pos: Dict[str, int] = {}
         self._partial_tp_state_by_pos: Dict[str, Dict[str, Any]] = {}
+        self._position_entry_metadata: Dict[str, Dict[str, Any]] = {}
         self._opened_symbols_this_cycle: set[str] = set()
         self._volatility_spike_streak_by_symbol: Dict[str, int] = {}
         self._volatility_last_bucket_by_symbol: Dict[str, str] = {}
@@ -354,6 +355,114 @@ class TradingBot:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _iter_symbol_signal_override_items(raw_overrides: Any) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if isinstance(raw_overrides, dict):
+            for symbol, override in raw_overrides.items():
+                if not isinstance(override, dict):
+                    continue
+                items.append({"symbol": str(symbol or "").strip().upper(), **override})
+            return items
+        if isinstance(raw_overrides, list):
+            for item in raw_overrides:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("symbol", "")).strip().upper()
+                if not symbol:
+                    continue
+                normalized = dict(item)
+                normalized["symbol"] = symbol
+                items.append(normalized)
+        return items
+
+    @staticmethod
+    def _build_timeframe_request_diagnostics(
+        timeframe: str,
+        limit: int,
+        snapshot: Any,
+        *,
+        source: str = "live_request",
+    ) -> Dict[str, Any]:
+        tf_dict = snapshot if isinstance(snapshot, dict) else {}
+        return {
+            "timeframe": str(timeframe or "").strip().lower(),
+            "requested": True,
+            "limit": int(limit),
+            "source": str(source or "live_request"),
+            "snapshot_empty": not bool(tf_dict),
+            "timeframe_present": bool(tf_dict),
+            "macd_hist_series_present": isinstance(tf_dict.get("macd_hist_series"), (list, tuple))
+            and len(tf_dict.get("macd_hist_series") or []) > 0,
+            "macd_hist_array_present": isinstance(tf_dict.get("macd_hist_array"), (list, tuple))
+            and len(tf_dict.get("macd_hist_array") or []) > 0,
+            "macd_hist_prev_present": tf_dict.get("macd_hist_prev") is not None,
+            "close_series_present": isinstance(tf_dict.get("close_series"), (list, tuple))
+            and len(tf_dict.get("close_series") or []) > 0,
+        }
+
+    @classmethod
+    def _build_timeframe_context_diagnostics(
+        cls,
+        timeframes: Any,
+        request_diagnostics: Any = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        tf_map = timeframes if isinstance(timeframes, dict) else {}
+        request_map = request_diagnostics if isinstance(request_diagnostics, dict) else {}
+        diagnostics: Dict[str, Dict[str, Any]] = {}
+        for timeframe in ("15m", "1h", "4h"):
+            tf_ctx = tf_map.get(timeframe)
+            tf_dict = tf_ctx if isinstance(tf_ctx, dict) else {}
+            req = request_map.get(timeframe) if isinstance(request_map.get(timeframe), dict) else {}
+            diagnostics[timeframe] = {
+                "requested": bool(req.get("requested", False)),
+                "snapshot_empty": bool(req.get("snapshot_empty", False)),
+                "timeframe_present": bool(tf_dict),
+                "macd_hist_series_present": isinstance(tf_dict.get("macd_hist_series"), (list, tuple))
+                and len(tf_dict.get("macd_hist_series") or []) > 0,
+                "macd_hist_array_present": isinstance(tf_dict.get("macd_hist_array"), (list, tuple))
+                and len(tf_dict.get("macd_hist_array") or []) > 0,
+                "macd_hist_prev_present": tf_dict.get("macd_hist_prev") is not None,
+                "close_series_present": isinstance(tf_dict.get("close_series"), (list, tuple))
+                and len(tf_dict.get("close_series") or []) > 0,
+            }
+        return diagnostics
+
+    def _build_config_fingerprint_summary(self) -> Dict[str, Any]:
+        ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
+        v2_cfg = ff_cfg.get("macd_mtf_strategy_v2", {}) if isinstance(ff_cfg.get("macd_mtf_strategy_v2"), dict) else {}
+        entry_filters = v2_cfg.get("entry_filters", {}) if isinstance(v2_cfg.get("entry_filters"), dict) else {}
+        items = self._iter_symbol_signal_override_items(entry_filters.get("symbol_signal_overrides"))
+        flip_trial_only_count = sum(
+            1
+            for item in items
+            if str(item.get("flip_bullish_mode") or "").strip().lower() == "trial_only"
+        )
+        green_strict_threshold_count = sum(
+            1
+            for item in items
+            if str(item.get("green_bar_growing_mode") or "").strip().lower() == "enabled_with_strict_threshold"
+        )
+        modified_at = ""
+        mtime = float(getattr(self, "_config_mtime", 0.0) or 0.0)
+        if mtime > 0:
+            try:
+                modified_at = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                modified_at = ""
+        return {
+            "config_path": str(getattr(self, "config_path", "") or ""),
+            "modified_at": modified_at,
+            "long_entry_mode": str(entry_filters.get("long_entry_mode", "all") or "all").strip().lower(),
+            "disable_flip_bullish_entries": bool(entry_filters.get("disable_flip_bullish_entries", False)),
+            "disable_flip_bullish_trial_entries": bool(entry_filters.get("disable_flip_bullish_trial_entries", False)),
+            "disable_green_bar_growing_entries": bool(entry_filters.get("disable_green_bar_growing_entries", False)),
+            "disable_red_bar_shrinking_entries": bool(entry_filters.get("disable_red_bar_shrinking_entries", False)),
+            "symbol_signal_overrides_count": len(items),
+            "flip_bullish_trial_only_count": int(flip_trial_only_count),
+            "green_bar_growing_strict_threshold_count": int(green_strict_threshold_count),
+        }
+
     def _reload_config_if_changed(self) -> bool:
         current_mtime = self._get_config_mtime()
         if current_mtime <= 0:
@@ -381,6 +490,17 @@ class TradingBot:
         print("\n" + "=" * 66)
         print(f"♻️ 配置热更新生效 @ {ts}")
         print(f"📄 配置文件: {self.config_path}")
+        config_fingerprint = self._build_config_fingerprint_summary()
+        print(
+            "🧬 配置指纹: "
+            f"long_entry_mode={config_fingerprint['long_entry_mode']}, "
+            f"flip_disabled={config_fingerprint['disable_flip_bullish_entries']}, "
+            f"flip_trial_disabled={config_fingerprint['disable_flip_bullish_trial_entries']}, "
+            f"green_disabled={config_fingerprint['disable_green_bar_growing_entries']}, "
+            f"symbol_overrides={config_fingerprint['symbol_signal_overrides_count']}, "
+            f"flip_trial_only={config_fingerprint['flip_bullish_trial_only_count']}, "
+            f"green_strict={config_fingerprint['green_bar_growing_strict_threshold_count']}"
+        )
         if set(old_symbols) != set(new_symbols):
             removed = [s for s in old_symbols if s not in new_symbols]
             added = [s for s in new_symbols if s not in old_symbols]
@@ -1349,6 +1469,21 @@ class TradingBot:
         print("=" * 66)
         print("🚀 资金流策略机器人启动")
         print(f"📄 配置文件: {self.config_path}")
+        config_fingerprint = self._build_config_fingerprint_summary()
+        print(
+            "🧬 配置指纹: "
+            f"mtime={config_fingerprint['modified_at'] or 'unknown'}, "
+            f"long_entry_mode={config_fingerprint['long_entry_mode']}, "
+            f"flip_disabled={config_fingerprint['disable_flip_bullish_entries']}, "
+            f"flip_trial_disabled={config_fingerprint['disable_flip_bullish_trial_entries']}, "
+            f"green_disabled={config_fingerprint['disable_green_bar_growing_entries']}"
+        )
+        print(
+            "🧬 Guardrail计数: "
+            f"symbol_overrides={config_fingerprint['symbol_signal_overrides_count']}, "
+            f"flip_trial_only={config_fingerprint['flip_bullish_trial_only_count']}, "
+            f"green_strict={config_fingerprint['green_bar_growing_strict_threshold_count']}"
+        )
         print(f"📁 日志目录: {self.logs_dir}")
         print(f"🗂️ 分桶日志根目录(6H): {self.log_root_dir}")
         print(f"🧾 成交回报日志(UTC): {self._resolve_trade_fill_log_path_utc()}")
@@ -1512,6 +1647,14 @@ class TradingBot:
                 "liquidation_price": self._to_float(primary.get("liquidation_price"), 0.0),
                 "notional": self._to_float(primary.get("notional"), 0.0),
             }
+            meta = self._position_entry_metadata.get(symbol.upper(), {})
+            if isinstance(meta, dict):
+                for key in ("signal_type_1h", "vwap_state", "entry_tier", "signal_score"):
+                    if key in meta:
+                        snapshot[key] = meta.get(key)
+                if "pocket_management_override" in meta and isinstance(meta.get("pocket_management_override"), dict):
+                    snapshot["pocket_management_override"] = dict(meta.get("pocket_management_override"))
+                snapshot["unrealized_pnl_ratio"] = self._position_unrealized_pnl_ratio(snapshot)
             if len(side_set) > 1:
                 snapshot["hedge_conflict"] = True
                 snapshot["side"] = "BOTH"
@@ -3874,6 +4017,170 @@ class TradingBot:
         cap = max(0, int(self._to_float(caps.get(pocket_key), 0)))
         return pocket_key, cap
 
+    @staticmethod
+    def _decision_metadata_dict(decision: Any) -> Dict[str, Any]:
+        md = getattr(decision, "metadata", None)
+        if isinstance(md, dict):
+            return md
+        normalized: Dict[str, Any] = {}
+        if decision is not None:
+            try:
+                decision.metadata = normalized
+            except Exception:
+                pass
+        return normalized
+
+    @staticmethod
+    def _position_unrealized_pnl_ratio(snapshot: Dict[str, Any]) -> float:
+        if not isinstance(snapshot, dict):
+            return 0.0
+        if snapshot.get("unrealized_pnl_ratio") is not None:
+            try:
+                return float(snapshot.get("unrealized_pnl_ratio"))
+            except Exception:
+                return 0.0
+        if snapshot.get("pnl_percent") is not None:
+            try:
+                return float(snapshot.get("pnl_percent")) / 100.0
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def _ensure_capacity_replacement_metadata(
+        self,
+        decision: Any,
+        *,
+        replacement_candidate: bool = False,
+        replacement_target: Any = "",
+    ) -> Dict[str, Any]:
+        md = self._decision_metadata_dict(decision)
+        md["capacity_replacement_candidate"] = bool(replacement_candidate)
+        if isinstance(replacement_target, dict):
+            md["capacity_replacement_target"] = dict(replacement_target)
+        elif replacement_target in (None, ""):
+            md["capacity_replacement_target"] = ""
+        else:
+            md["capacity_replacement_target"] = str(replacement_target)
+        return md
+
+    def _apply_min_open_floor_override(
+        self,
+        decision: Any,
+        target_portion: float,
+        *,
+        min_open_portion: Optional[float] = None,
+    ) -> float:
+        md = self._decision_metadata_dict(decision)
+        override = md.get("pocket_management_override") if isinstance(md.get("pocket_management_override"), dict) else {}
+        if not override or not bool(override.get("promote_to_min_open", False)):
+            return target_portion
+        entry_tier = str(md.get("entry_tier") or "").strip().lower()
+        if entry_tier not in {"tier1", "tier2"}:
+            return target_portion
+        min_score = self._to_float(override.get("promote_to_min_open_min_signal_score"), 0.0)
+        signal_score = self._to_float(md.get("signal_score"), 0.0)
+        if signal_score < min_score:
+            return target_portion
+        floor = self._to_float(
+            min_open_portion,
+            self._to_float(getattr(self.fund_flow_risk_engine, "min_open_portion", 0.0), 0.0),
+        )
+        return max(target_portion, max(0.0, floor))
+
+    def _pick_capacity_replacement_target(
+        self,
+        item: Dict[str, Any],
+        active_positions: Dict[str, Dict[str, Any]],
+        ai_review_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        decision = item.get("decision")
+        md = self._decision_metadata_dict(decision)
+        entry_tier = str(md.get("entry_tier") or "").strip().lower()
+        if entry_tier != "tier1":
+            return None
+        candidate_priority = self._candidate_priority_score(item, ai_review_cfg)
+        ranked: List[Tuple[int, float, str, Dict[str, Any]]] = []
+        for symbol, snapshot in (active_positions or {}).items():
+            if not isinstance(snapshot, dict):
+                continue
+            existing_tier = str(snapshot.get("entry_tier") or "").strip().lower()
+            pnl_ratio = self._position_unrealized_pnl_ratio(snapshot)
+            signal_score = self._to_float(snapshot.get("signal_score"), 0.0)
+            if existing_tier == "tier1":
+                continue
+            if existing_tier == "tier3":
+                ranked.append((0, pnl_ratio, str(symbol).upper(), snapshot))
+            elif pnl_ratio <= 0.0:
+                ranked.append((1, pnl_ratio, str(symbol).upper(), snapshot))
+        if not ranked:
+            return None
+        ranked.sort(key=lambda item_row: (item_row[0], item_row[1], item_row[2]))
+        _bucket, target_pnl_ratio, target_symbol, target_snapshot = ranked[0]
+        target_score = self._to_float(target_snapshot.get("signal_score"), 0.0)
+        if candidate_priority < (target_score + 0.10):
+            return None
+        return {
+            "symbol": target_symbol,
+            "entry_tier": str(target_snapshot.get("entry_tier") or ""),
+            "signal_score": float(target_score),
+            "unrealized_pnl_ratio": float(target_pnl_ratio),
+        }
+
+    def select_open_candidates_with_replacement(
+        self,
+        open_candidates: List[Dict[str, Any]],
+        *,
+        active_positions: Dict[str, Dict[str, Any]],
+        active_count: int,
+        ai_review_cfg: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        current_active = int(active_count)
+        group_counts: Dict[str, int] = {}
+        replacement_used = False
+        for item in sorted(
+            open_candidates,
+            key=lambda x: self._candidate_priority_score(x, ai_review_cfg),
+            reverse=True,
+        ):
+            candidate = dict(item)
+            decision = candidate.get("decision")
+            self._ensure_capacity_replacement_metadata(decision)
+            cap = max(1, int(self._to_float(candidate.get("max_active_symbols"), 1)))
+            group_key, group_cap = self._capacity_group_cap(candidate, ai_review_cfg)
+            candidate["_capacity_group_key"] = group_key
+            candidate["_capacity_group_cap"] = group_cap
+            if group_key and group_cap > 0 and group_counts.get(group_key, 0) >= group_cap:
+                continue
+            replacement_target = None
+            if current_active >= cap:
+                if replacement_used:
+                    continue
+                replacement_target = self._pick_capacity_replacement_target(
+                    candidate,
+                    active_positions,
+                    ai_review_cfg,
+                )
+                if replacement_target is None:
+                    continue
+                replacement_used = True
+                candidate["capacity_replacement_candidate"] = True
+                candidate["capacity_replacement_target"] = dict(replacement_target)
+                self._ensure_capacity_replacement_metadata(
+                    decision,
+                    replacement_candidate=True,
+                    replacement_target=replacement_target,
+                )
+            else:
+                candidate["capacity_replacement_candidate"] = False
+                candidate["capacity_replacement_target"] = None
+                self._ensure_capacity_replacement_metadata(decision)
+                current_active += 1
+            if group_key and group_cap > 0:
+                group_counts[group_key] = group_counts.get(group_key, 0) + 1
+            selected.append(candidate)
+        return selected
+
     def _atr_position_scale_config(self) -> Dict[str, Any]:
         ff_cfg = self.config.get("fund_flow", {}) if isinstance(self.config, dict) else {}
         raw_bands = ff_cfg.get("atr_position_scale_bands", [])
@@ -6163,6 +6470,11 @@ class TradingBot:
     ) -> Dict[str, Any]:
         out = dict(raw_context or {})
         timeframes = {}
+        request_diagnostics = (
+            out.get("timeframe_request_diagnostics")
+            if isinstance(out.get("timeframe_request_diagnostics"), dict)
+            else {}
+        )
         if hasattr(flow_snapshot, "timeframes") and isinstance(getattr(flow_snapshot, "timeframes"), dict):
             timeframes = dict(getattr(flow_snapshot, "timeframes"))
         out["timeframes"] = timeframes
@@ -6221,6 +6533,12 @@ class TradingBot:
             out["active_timeframe"] = tf
         else:
             out["active_timeframe"] = "raw"
+        if request_diagnostics:
+            out["timeframe_request_diagnostics"] = dict(request_diagnostics)
+        out["timeframe_context_diagnostics"] = self._build_timeframe_context_diagnostics(
+            timeframes,
+            request_diagnostics,
+        )
         return out
 
     def _extract_orderbook_flow(self, symbol: str) -> Dict[str, float]:
@@ -6366,6 +6684,7 @@ class TradingBot:
         dual_risk_limit = max(60, int(self._to_float(dual_risk_cfg.get("limit", trend_limit), trend_limit)))
 
         trend_filters_by_timeframe: Dict[str, Dict[str, Any]] = {}
+        timeframe_request_diagnostics: Dict[str, Dict[str, Any]] = {}
         requested_timeframes = [
             (primary_timeframe, trend_limit),
             (entry_timeframe, entry_limit),
@@ -6375,9 +6694,14 @@ class TradingBot:
             requested_timeframes.append((dual_risk_timeframe, dual_risk_limit))
 
         for timeframe, limit in requested_timeframes:
-            if timeframe in trend_filters_by_timeframe:
+            if timeframe in timeframe_request_diagnostics:
                 continue
             tf_metrics = self.market_data.get_trend_filter_metrics(symbol, interval=timeframe, limit=limit) or {}
+            timeframe_request_diagnostics[timeframe] = self._build_timeframe_request_diagnostics(
+                timeframe,
+                limit,
+                tf_metrics,
+            )
             if tf_metrics:
                 trend_filters_by_timeframe[timeframe] = tf_metrics
 
@@ -6386,6 +6710,12 @@ class TradingBot:
             trend_filter = dict(self._startup_trend_filter_cache.get(symbol.upper(), {}))
             if trend_filter:
                 trend_filters_by_timeframe.setdefault(primary_timeframe, dict(trend_filter))
+                timeframe_request_diagnostics[primary_timeframe] = self._build_timeframe_request_diagnostics(
+                    primary_timeframe,
+                    trend_limit,
+                    trend_filter,
+                    source="startup_cache",
+                )
 
         exec_quality_cfg = self._execution_quality_1m_config()
         exec_timeframe = str(exec_quality_cfg.get("timeframe", "1m") or "1m").strip().lower()
@@ -6416,6 +6746,7 @@ class TradingBot:
             "trend_filter_timeframe": primary_timeframe,
             "trend_filter_1m": trend_filter_1m,
             "trend_filters_by_timeframe": trend_filters_by_timeframe,
+            "timeframe_request_diagnostics": timeframe_request_diagnostics,
             "order_flow_1m": order_flow_1m,
             "execution_quality_timeframe": exec_timeframe,
         }
@@ -6426,6 +6757,9 @@ class TradingBot:
         trend_filter = market_data.get("trend_filter", {}) if isinstance(market_data, dict) else {}
         trend_filter_timeframe = market_data.get("trend_filter_timeframe", "15m") if isinstance(market_data, dict) else "15m"
         trend_filters_by_timeframe = market_data.get("trend_filters_by_timeframe", {}) if isinstance(market_data, dict) else {}
+        timeframe_request_diagnostics = (
+            market_data.get("timeframe_request_diagnostics", {}) if isinstance(market_data, dict) else {}
+        )
         execution_quality_1m = self._build_execution_quality_1m(market_data if isinstance(market_data, dict) else {})
         change_15m = self._to_float(realtime.get("change_15m"), 0.0) / 100.0
         change_24h = self._to_float(realtime.get("change_24h"), 0.0) / 100.0
@@ -6478,6 +6812,9 @@ class TradingBot:
             "trend_filter": trend_filter if isinstance(trend_filter, dict) else {},
             "trend_filter_timeframe": trend_filter_timeframe,
             "trend_filters_by_timeframe": trend_filters_by_timeframe if isinstance(trend_filters_by_timeframe, dict) else {},
+            "timeframe_request_diagnostics": timeframe_request_diagnostics
+            if isinstance(timeframe_request_diagnostics, dict)
+            else {},
             "execution_quality_1m": execution_quality_1m,
             "execution_quality_timeframe": market_data.get("execution_quality_timeframe", "1m")
             if isinstance(market_data, dict)
@@ -7666,6 +8003,16 @@ class TradingBot:
             decision.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL)
             and execution_status in ("success", "pending")
         ):
+            if isinstance(md, dict):
+                self._position_entry_metadata[str(symbol).upper()] = {
+                    "signal_type_1h": str(md.get("signal_type_1h") or ""),
+                    "vwap_state": str(md.get("vwap_state") or ""),
+                    "entry_tier": str(md.get("entry_tier") or ""),
+                    "signal_score": self._to_float(md.get("signal_score"), 0.0),
+                    "pocket_management_override": dict(md.get("pocket_management_override", {}))
+                    if isinstance(md.get("pocket_management_override"), dict)
+                    else {},
+                }
             self._record_alpha_dilution_stage(
                 "actually_executed",
                 symbol,
@@ -7680,6 +8027,8 @@ class TradingBot:
             post_close_side = self._extract_position_side(position_for_log)
             post_close_amount = self._extract_position_amount(position_for_log)
             close_action = "REDUCE" if (post_close_side == pre_close_side and post_close_amount > 0.0) else "EXIT"
+            if close_action == "EXIT":
+                self._position_entry_metadata.pop(str(symbol).upper(), None)
             exec_meta = dict(md) if isinstance(md, dict) else {}
             exec_meta["execution_reason"] = str(decision.reason or "")
             try:
@@ -10039,6 +10388,10 @@ class TradingBot:
                     engine_override=engine_override,
                     base_max_active_symbols=item_max_active_symbols,
                 )
+                decision.target_portion_of_balance = self._apply_min_open_floor_override(
+                    decision,
+                    self._to_float(decision.target_portion_of_balance, 0.0),
+                )
                 if isinstance(decision_md, dict):
                     decision_md["dynamic_max_active_symbols"] = dynamic_cap_meta
                 pending_new_entries.append(
@@ -10267,12 +10620,18 @@ class TradingBot:
                 for symbol, pos in position_snapshot.items()
                 if str(symbol).strip() and isinstance(pos, dict)
             }
+            active_positions_snapshot: Dict[str, Dict[str, Any]] = {}
             try:
-                active_positions = self._position_snapshot_by_symbol()
-                if isinstance(active_positions, dict):
-                    active_symbols_estimate.update(str(s).upper() for s in active_positions.keys())
+                snapshot_live = self._position_snapshot_by_symbol()
+                if isinstance(snapshot_live, dict):
+                    active_positions_snapshot = {
+                        str(symbol).upper(): dict(snapshot)
+                        for symbol, snapshot in snapshot_live.items()
+                        if str(symbol).strip() and isinstance(snapshot, dict)
+                    }
+                    active_symbols_estimate.update(active_positions_snapshot.keys())
             except Exception:
-                pass
+                active_positions_snapshot = {}
             if not active_symbols_estimate:
                 try:
                     cached_positions = self.position_data.get_all_positions()
@@ -10281,54 +10640,74 @@ class TradingBot:
                 except Exception:
                     active_symbols_estimate = set()
             active_symbols_estimate.update(str(s).upper() for s in self._opened_symbols_this_cycle)
-            capacity_group_selected: Dict[str, int] = {}
-            for rank, item in enumerate(pending_new_entries, start=1):
+
+            executed_full_close_symbols: set[str] = set()
+
+            for item in close_candidates:
                 decision_i = _item_decision(item)
                 if decision_i is None:
                     continue
-                is_close_candidate = decision_i.operation == FundFlowOperation.CLOSE
-                active_count = len(active_symbols_estimate)
-                item_max_active_symbols = max(
-                    1,
-                    int(self._to_float(item.get("max_active_symbols"), max_active_symbols)),
-                )
-                bypass_capacity_guard = bool(item.get("bypass_capacity_guard", False)) or is_close_candidate
-                if (not bypass_capacity_guard) and active_count >= item_max_active_symbols:
-                    print(
-                        f"⏭️ {item.get('symbol')} 候选开仓被跳过:"
-                        f"持仓交易对已满({active_count}/{item_max_active_symbols})，"
-                        f"候选排名={rank}"
-                    )
-                    continue
-                if not bypass_capacity_guard:
-                    group_key, group_cap = self._capacity_group_cap(item, ai_review_cfg)
-                    if group_key and group_cap > 0 and capacity_group_selected.get(group_key, 0) >= group_cap:
-                        print(
-                            f"⏭️ {item.get('symbol')} 候选开仓被跳过:"
-                            f"capacity_group_cap {group_key} {capacity_group_selected.get(group_key, 0)}/{group_cap}，"
-                            f"候选排名={rank}"
-                        )
-                        continue
-
+                symbol_i = str(item.get("symbol") or getattr(decision_i, "symbol", "") or "").upper()
                 account_summary_i = item.get("account_summary")
                 if not isinstance(account_summary_i, dict):
                     account_summary_i = account_summary
-
                 flow_context_i = item.get("flow_context")
                 if not isinstance(flow_context_i, dict):
                     flow_context_i = {}
-
                 trigger_context_i = item.get("trigger_context")
                 if not isinstance(trigger_context_i, dict):
                     trigger_context_i = {}
-
                 portfolio_i = item.get("portfolio")
                 if not isinstance(portfolio_i, dict):
                     portfolio_i = {}
+                current_price_i = self._to_float(item.get("current_price"), 0.0)
+                self._execute_and_log_decision(
+                    symbol=symbol_i,
+                    decision=decision_i,
+                    account_summary=account_summary_i,
+                    current_price=current_price_i,
+                    position=item.get("position"),
+                    flow_context=flow_context_i,
+                    trigger_type=str(item.get("trigger_type")),
+                    trigger_id=str(item.get("trigger_id")),
+                    trigger_context=trigger_context_i,
+                    portfolio=portfolio_i,
+                )
+                if self._to_float(getattr(decision_i, "target_portion_of_balance", 0.0), 0.0) >= 0.999999:
+                    executed_full_close_symbols.add(symbol_i)
+                    active_symbols_estimate.discard(symbol_i)
+                    active_positions_snapshot.pop(symbol_i, None)
 
+            reviewed_open_candidates: List[Dict[str, Any]] = []
+            for rank, item in enumerate(open_candidates, start=1):
+                decision_i = _item_decision(item)
+                if decision_i is None:
+                    continue
+                local_md = self._decision_metadata_dict(decision_i)
+                entry_tier = str(local_md.get("entry_tier") or "").strip().lower()
+                if entry_tier == "blocked":
+                    symbol_i = str(item.get("symbol") or getattr(decision_i, "symbol", "") or "")
+                    print(
+                        f"⛔ {symbol_i} blocked tier candidate skipped before AI/capacity "
+                        f"signal={local_md.get('signal_type_1h') or '-'} "
+                        f"vwap={local_md.get('vwap_state') or '-'}"
+                    )
+                    continue
+                account_summary_i = item.get("account_summary")
+                if not isinstance(account_summary_i, dict):
+                    account_summary_i = account_summary
+                flow_context_i = item.get("flow_context")
+                if not isinstance(flow_context_i, dict):
+                    flow_context_i = {}
+                trigger_context_i = item.get("trigger_context")
+                if not isinstance(trigger_context_i, dict):
+                    trigger_context_i = {}
+                portfolio_i = item.get("portfolio")
+                if not isinstance(portfolio_i, dict):
+                    portfolio_i = {}
                 current_price_i = self._to_float(item.get("current_price"), 0.0)
                 symbol_i = str(item.get("symbol") or getattr(decision_i, "symbol", "") or "")
-                bypass_ai_final_review = bool(item.get("bypass_ai_final_review", False)) or is_close_candidate
+                bypass_ai_final_review = bool(item.get("bypass_ai_final_review", False))
                 shortlist_rank = max(0, int(self._to_float(item.get("ai_shortlist_rank"), 0)))
                 if ai_gate_enabled and ai_review_flat_enabled and (not bypass_ai_final_review) and shortlist_rank > 0:
                     local_score = float(item.get("score", 0.0))
@@ -10363,9 +10742,6 @@ class TradingBot:
                             ai_review_cfg=ai_review_cfg,
                             position=item.get("position") if isinstance(item.get("position"), dict) else None,
                         )
-                        local_md = (
-                            decision_i.metadata if isinstance(getattr(decision_i, "metadata", None), dict) else {}
-                        )
                         review_mode = "enforced" if ai_review_enforced else "log_only"
                         local_md["ai_final_review"] = {
                             "mode": review_mode,
@@ -10379,7 +10755,6 @@ class TradingBot:
                             "ds_source": ai_source,
                             "ds_confidence": ai_conf,
                         }
-                        decision_i.metadata = local_md
                         if not ai_review_enforced:
                             print(
                                 f"🤖 {symbol_i} AI终审仅记录: rank={rank} shortlist={shortlist_rank} "
@@ -10424,6 +10799,78 @@ class TradingBot:
                         f"🤖 {symbol_i} 未进入AI终审: rank={rank} shortlist={shortlist_rank} "
                         f"local={decision_i.operation.value.upper()}"
                     )
+                reviewed_open_candidates.append(item)
+
+            selected_open_candidates = self.select_open_candidates_with_replacement(
+                reviewed_open_candidates,
+                active_positions=active_positions_snapshot,
+                active_count=len(active_symbols_estimate),
+                ai_review_cfg=ai_review_cfg,
+            )
+
+            for rank, item in enumerate(selected_open_candidates, start=1):
+                decision_i = _item_decision(item)
+                if decision_i is None:
+                    continue
+                account_summary_i = item.get("account_summary")
+                if not isinstance(account_summary_i, dict):
+                    account_summary_i = account_summary
+                flow_context_i = item.get("flow_context")
+                if not isinstance(flow_context_i, dict):
+                    flow_context_i = {}
+                trigger_context_i = item.get("trigger_context")
+                if not isinstance(trigger_context_i, dict):
+                    trigger_context_i = {}
+                portfolio_i = item.get("portfolio")
+                if not isinstance(portfolio_i, dict):
+                    portfolio_i = {}
+                current_price_i = self._to_float(item.get("current_price"), 0.0)
+                symbol_i = str(item.get("symbol") or getattr(decision_i, "symbol", "") or "").upper()
+                shortlist_rank = max(0, int(self._to_float(item.get("ai_shortlist_rank"), 0)))
+                replacement_target = item.get("capacity_replacement_target") if isinstance(item.get("capacity_replacement_target"), dict) else {}
+                replacement_symbol = str(replacement_target.get("symbol") or "").upper()
+
+                if replacement_symbol and replacement_symbol not in executed_full_close_symbols:
+                    replacement_position = position_snapshot.get(replacement_symbol)
+                    if not isinstance(replacement_position, dict):
+                        replacement_position = active_positions_snapshot.get(replacement_symbol, {})
+                    replacement_price = 0.0
+                    try:
+                        replacement_market = self.get_market_data_for_symbol(replacement_symbol)
+                        replacement_realtime = replacement_market.get("realtime", {}) if isinstance(replacement_market, dict) else {}
+                        replacement_price = self._to_float(replacement_realtime.get("price"), 0.0)
+                    except Exception:
+                        replacement_price = 0.0
+                    if replacement_price <= 0:
+                        replacement_price = self._to_float(replacement_position.get("entry_price"), 0.0)
+                    replacement_decision = FundFlowDecision(
+                        operation=FundFlowOperation.CLOSE,
+                        symbol=replacement_symbol,
+                        target_portion_of_balance=1.0,
+                        leverage=max(1, int(self._to_float(replacement_position.get("leverage"), 1.0))),
+                        reason=f"capacity_replacement_for:{symbol_i}",
+                        metadata={
+                            "capacity_replacement_candidate": False,
+                            "capacity_replacement_target": symbol_i,
+                            "capacity_replacement_for": symbol_i,
+                        },
+                    )
+                    self._execute_and_log_decision(
+                        symbol=replacement_symbol,
+                        decision=replacement_decision,
+                        account_summary=account_summary,
+                        current_price=replacement_price,
+                        position=replacement_position,
+                        flow_context={},
+                        trigger_type="capacity_replacement",
+                        trigger_id=f"{replacement_symbol}:{symbol_i}",
+                        trigger_context={"replacement_symbol": symbol_i},
+                        portfolio={},
+                    )
+                    executed_full_close_symbols.add(replacement_symbol)
+                    active_symbols_estimate.discard(replacement_symbol)
+                    active_positions_snapshot.pop(replacement_symbol, None)
+
                 if decision_i.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
                     self._record_alpha_dilution_stage(
                         "after_capacity_check",
@@ -10432,8 +10879,11 @@ class TradingBot:
                             "operation": decision_i.operation.value,
                             "candidate_rank": rank,
                             "shortlist_rank": shortlist_rank,
-                            "active_count": active_count,
-                            "max_active_symbols": item_max_active_symbols,
+                            "active_count": len(active_symbols_estimate),
+                            "max_active_symbols": max(
+                                1,
+                                int(self._to_float(item.get("max_active_symbols"), max_active_symbols)),
+                            ),
                         },
                     )
                 self._execute_and_log_decision(
@@ -10448,14 +10898,7 @@ class TradingBot:
                     trigger_context=trigger_context_i,
                     portfolio=portfolio_i,
                 )
-                if not is_close_candidate and decision_i.operation in (FundFlowOperation.BUY, FundFlowOperation.SELL):
-                    group_key, group_cap = self._capacity_group_cap(item, ai_review_cfg)
-                    if group_key and group_cap > 0:
-                        capacity_group_selected[group_key] = capacity_group_selected.get(group_key, 0) + 1
-                item_symbol = str(item.get("symbol") or "").upper()
-                if item_symbol and item_symbol in {str(s).upper() for s in self._opened_symbols_this_cycle}:
-                    active_symbols_estimate.add(item_symbol)
-
+                active_symbols_estimate.add(symbol_i)
 
         context["pending_new_entries"] = pending_new_entries
 

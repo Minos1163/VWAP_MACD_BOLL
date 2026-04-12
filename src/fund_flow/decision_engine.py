@@ -646,6 +646,7 @@ class FundFlowDecisionEngine:
                 weight_1h_direction=self._to_float(weights_cfg.get("weight_1h_direction"), 0.00),
                 weight_4h_direction=self._to_float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction")), 0.55),
                 weight_4h_enhancement=self._to_float(weights_cfg.get("weight_4h_enhancement"), 0.10),
+                weight_boll_position=self._to_float(weights_cfg.get("weight_boll_position"), 0.0),
                 weight_vwap=self._to_float(weights_cfg.get("weight_vwap"), 0.20),
                 weight_15m_entry=self._to_float(weights_cfg.get("weight_15m_entry"), 0.05),
                 weight_volume=self._to_float(weights_cfg.get("weight_volume"), 0.20),
@@ -700,6 +701,7 @@ class FundFlowDecisionEngine:
                 ema_slope_lookback_1h=int(self._to_float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h")), 3)),
                 ema_slope_lookback_4h=int(self._to_float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h")), 2)),
                 disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
+                disable_red_bar_shrinking_entries=bool(filter_cfg.get("disable_red_bar_shrinking_entries", False)),
                 long_entry_mode=str(filter_cfg.get("long_entry_mode", "all") or "all").strip().lower(),
                 long_whitelist_signal_types=[
                     str(x).strip().lower()
@@ -717,6 +719,9 @@ class FundFlowDecisionEngine:
                     if str(x).strip() and "|" in str(x)
                 ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
                 disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
+                disable_green_bar_shrinking_entries=bool(filter_cfg.get("disable_green_bar_shrinking_entries", False)),
+                require_macd_home_advantage=bool(filter_cfg.get("require_macd_home_advantage", False)),
+                vwap_execution_penalty_only=bool(filter_cfg.get("vwap_execution_penalty_only", False)),
                 primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
                 require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
                 allow_neutral_1h_confirmation=bool(filter_cfg.get("allow_neutral_1h_confirmation", False)),
@@ -841,6 +846,7 @@ class FundFlowDecisionEngine:
                 use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
                 ema_stop_atr_multiplier=self._to_float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier")), 0.5),
                 max_stop_loss_pct=self._to_float(stop_cfg.get("max_stop_loss_pct"), 0.03),
+                max_stop_distance_pct=self._to_float(stop_cfg.get("max_stop_distance_pct", stop_cfg.get("max_stop_loss_pct", 0.03)), 0.03),
                 vwap_alert_deviation=self._to_float(stop_cfg.get("vwap_alert_deviation"), 0.005),
                 enable_4h_shrink_exit=bool(stop_cfg.get("enable_4h_shrink_exit", False)),
                 exit_4h_shrink_bars=int(self._to_float(stop_cfg.get("exit_4h_shrink_bars"), 2)),
@@ -1151,7 +1157,8 @@ class FundFlowDecisionEngine:
         if value is None:
             return None
         try:
-            return float(value)
+            converted = float(value)
+            return converted if math.isfinite(converted) else None
         except Exception:
             return None
 
@@ -1241,12 +1248,17 @@ class FundFlowDecisionEngine:
         return cleaned
 
     @staticmethod
-    def _build_macd_tf_diagnostics(timeframes: Any) -> Dict[str, Dict[str, Any]]:
+    def _build_macd_tf_diagnostics(
+        timeframes: Any,
+        request_diagnostics: Any = None,
+    ) -> Dict[str, Dict[str, Any]]:
         diagnostics: Dict[str, Dict[str, Any]] = {}
         tf_map = timeframes if isinstance(timeframes, dict) else {}
+        request_map = request_diagnostics if isinstance(request_diagnostics, dict) else {}
         for tf in ("15m", "1h", "4h"):
             tf_ctx = tf_map.get(tf)
             tf_dict = tf_ctx if isinstance(tf_ctx, dict) else {}
+            request_info = request_map.get(tf) if isinstance(request_map.get(tf), dict) else {}
             raw_series = tf_dict.get("macd_hist_series")
             raw_array = tf_dict.get("macd_hist_array")
             series = raw_series if isinstance(raw_series, (list, tuple)) else []
@@ -1265,13 +1277,29 @@ class FundFlowDecisionEngine:
                 series_source = "fallback_pair"
                 series_len = 2 if hist_present and prev_present else 1
 
+            snapshot_empty = bool(request_info.get("snapshot_empty", False))
+            requested = bool(request_info.get("requested", False)) or bool(tf_dict) or snapshot_empty
+            if series_source in {"series", "array"}:
+                diagnostic_code = "series_present"
+            elif series_source == "fallback_pair":
+                diagnostic_code = "series_missing_but_fallback_present"
+            elif tf_dict:
+                diagnostic_code = "series_and_fallback_missing"
+            elif snapshot_empty:
+                diagnostic_code = "snapshot_empty"
+            else:
+                diagnostic_code = "timeframe_missing"
+
             diagnostics[tf] = {
+                "requested": bool(requested),
+                "snapshot_empty": bool(snapshot_empty),
                 "timeframe_present": bool(tf_dict),
                 "series_source": series_source,
                 "series_len": int(series_len),
                 "macd_hist_present": bool(hist_present),
                 "macd_hist_prev_present": bool(prev_present),
                 "close_series_len": len(tf_dict.get("close_series") or tf_dict.get("close_array") or []),
+                "diagnostic_code": diagnostic_code,
             }
         return diagnostics
 
@@ -1867,10 +1895,11 @@ class FundFlowDecisionEngine:
             signal_type_1h=signal.signal_type_1h,
             vwap_score=max(signal.vwap_score, self._to_float(regime_state.get("min_vwap_score"), 0.0)),
             vwap_state=signal.vwap_state,
-                is_trial_entry=is_trial_entry,
-                entry_scale=entry_scale,
-                session_scale=session_position_scale,
-            )
+            is_trial_entry=is_trial_entry,
+            entry_scale=entry_scale,
+            session_scale=session_position_scale,
+            entry_tier=str((signal.details or {}).get("entry_tier", "") or ""),
+        )
         structure_scale = get_vwap_structure_position_scale(
             vwap_state=signal.vwap_state,
             vwap_structure_overrides=self.vwap_structure_overrides,
@@ -1882,6 +1911,7 @@ class FundFlowDecisionEngine:
             signal.signal_type_1h,
             symbol=symbol,
             is_trial_entry=is_trial_entry,
+            entry_tier=str((signal.details or {}).get("entry_tier", "") or ""),
         )
         leverage = min(leverage, max(1, int(regime_state.get("max_leverage", leverage))))
         leverage = max(self.min_leverage, min(self.max_leverage, leverage))
@@ -4430,7 +4460,12 @@ class FundFlowDecisionEngine:
         
         # 提取多时间框架数据
         timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
-        tf_diagnostics = self._build_macd_tf_diagnostics(timeframes)
+        request_diagnostics = (
+            market_flow_context.get("timeframe_request_diagnostics")
+            if isinstance(market_flow_context.get("timeframe_request_diagnostics"), dict)
+            else {}
+        ) if isinstance(market_flow_context, dict) else {}
+        tf_diagnostics = self._build_macd_tf_diagnostics(timeframes, request_diagnostics)
         if not isinstance(timeframes, dict):
             return FundFlowDecision(
                 operation=Operation.HOLD,
@@ -4474,6 +4509,7 @@ class FundFlowDecisionEngine:
                     "strategy_mode": "macd_mtf_strategy_v2",
                     "filter_name": "time_window_filter",
                     "filter_reason": time_window_reason,
+                    "macd_tf_diagnostics": tf_diagnostics,
                 },
             )
         
@@ -4586,6 +4622,8 @@ class FundFlowDecisionEngine:
             structural_vwap_1h_series=structural_vwap_1h_series,
             adx_1h=adx_1h,
             adx_4h=adx_4h,
+            macd_line_1h=self._to_optional_float(tf_1h.get("macd")),
+            macd_line_4h=self._to_optional_float(tf_4h.get("macd")),
             cvd_upper_wick_ratio=self._to_float(tf_15m.get("upper_wick_ratio"), None),
             cvd_1h_delta_ratio=self._to_float(tf_1h.get("cvd_delta_ratio"), None),
             atr_1h=atr_1h,
@@ -4633,6 +4671,14 @@ class FundFlowDecisionEngine:
             "last_close": regime_info.get("last_close", 0.0),
             "macd_tf_diagnostics": tf_diagnostics,
             "macd_v2_debug": signal_debug_details,
+            "market_quadrant": str(signal_debug_details.get("market_quadrant") or ""),
+            "macd_home_side": str(signal_debug_details.get("macd_home_side") or ""),
+            "boll_value_zone": str(signal_debug_details.get("boll_value_zone") or ""),
+            "boll_position_score": float(self._to_float(signal_debug_details.get("boll_position_score"), 0.0)),
+            "vwap_execution_state": str(signal_debug_details.get("vwap_execution_state") or signal.vwap_state or ""),
+            "entry_tier": str(signal_debug_details.get("entry_tier") or ""),
+            "capacity_replacement_candidate": False,
+            "capacity_replacement_target": "",
         }
         for key in (
             "reject_reason_code",
@@ -4966,6 +5012,7 @@ class FundFlowDecisionEngine:
                 signal.signal_type_1h,
                 symbol=symbol,
                 is_trial_entry=bool(signal.is_trial_entry),
+                entry_tier=str((signal.details or {}).get("entry_tier", "") or ""),
             )
             leverage = self._apply_pocket_leverage_constraints(
                 leverage=leverage,
@@ -4989,6 +5036,7 @@ class FundFlowDecisionEngine:
                 is_trial_entry=bool(signal.is_trial_entry),
                 entry_scale=float(signal.entry_scale or 1.0),
                 session_scale=session_position_scale,
+                entry_tier=str((signal.details or {}).get("entry_tier", "") or ""),
             )
             structure_scale = get_vwap_structure_position_scale(
                 vwap_state=signal.vwap_state,
@@ -5191,6 +5239,7 @@ class FundFlowDecisionEngine:
                 signal.signal_type_1h,
                 symbol=symbol,
                 is_trial_entry=bool(signal.is_trial_entry),
+                entry_tier=str((signal.details or {}).get("entry_tier", "") or ""),
             )
             leverage = self._apply_pocket_leverage_constraints(
                 leverage=leverage,
@@ -5214,6 +5263,7 @@ class FundFlowDecisionEngine:
                 is_trial_entry=bool(signal.is_trial_entry),
                 entry_scale=float(signal.entry_scale or 1.0),
                 session_scale=session_position_scale,
+                entry_tier=str((signal.details or {}).get("entry_tier", "") or ""),
             )
             structure_scale = get_vwap_structure_position_scale(
                 vwap_state=signal.vwap_state,
@@ -5321,7 +5371,12 @@ class FundFlowDecisionEngine:
         
         # 提取多时间框架数据
         timeframes = market_flow_context.get("timeframes") if isinstance(market_flow_context, dict) else {}
-        tf_diagnostics = self._build_macd_tf_diagnostics(timeframes)
+        request_diagnostics = (
+            market_flow_context.get("timeframe_request_diagnostics")
+            if isinstance(market_flow_context.get("timeframe_request_diagnostics"), dict)
+            else {}
+        ) if isinstance(market_flow_context, dict) else {}
+        tf_diagnostics = self._build_macd_tf_diagnostics(timeframes, request_diagnostics)
         if not isinstance(timeframes, dict):
             return FundFlowDecision(
                 operation=Operation.HOLD,

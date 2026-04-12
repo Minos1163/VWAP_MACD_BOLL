@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 import logging
+import math
 import numpy as np
 
 
@@ -48,6 +49,9 @@ def check_pocket_entry_override(
 
     if not isinstance(pocket_cfg, dict) or not pocket_cfg:
         return True, "POCKET_GATE:NO_OVERRIDE"
+
+    if pocket_cfg.get("disabled", False):
+        return False, f"POCKET_GATE[{pocket_key}]:DISABLED"
 
     if pocket_cfg.get("disallow_trial_entry", False) and is_trial_entry:
         return False, (
@@ -162,6 +166,7 @@ class MACDStrategyV2Config:
     weight_1h_direction: float = 0.40  # 1H方向辅助评分权重
     weight_4h_direction: float = 0.20  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
+    weight_boll_position: float = 0.0
     weight_vwap: float = 0.20  # VWAP评分权重
     weight_15m_entry: float = 0.05  # 15M入场时机评分权重（软确认）
     weight_volume: float = 0.15  # 成交量确认评分权重
@@ -201,13 +206,17 @@ class MACDStrategyV2Config:
     ema_slope_lookback_1h: int = 3  # 兼容旧配置：等价于BOLL中轨斜率lookback
     ema_slope_lookback_4h: int = 2  # 兼容旧配置：等价于BOLL中轨斜率lookback
     disable_red_bar_growing_long_entries: bool = False
+    disable_red_bar_shrinking_entries: bool = False
     long_entry_mode: str = "all"
     long_whitelist_signal_types: List[str] = field(default_factory=list)
     long_whitelist_vwap_states: List[str] = field(default_factory=list)
     long_whitelist_pockets: List[str] = field(default_factory=list)
     disable_green_bar_growing_entries: bool = True
+    disable_green_bar_shrinking_entries: bool = False
     disable_green_bar_shrinking_short_dual_pressure_entries: bool = True
     disable_red_bar_shrinking_long_dual_support_entries: bool = True
+    require_macd_home_advantage: bool = False
+    vwap_execution_penalty_only: bool = False
     primary_direction_timeframe: str = "4h"  # 默认使用4H主趋势，兼容旧配置时可显式切回1h
     require_1h_confirmation_when_4h_primary: bool = False
     allow_neutral_1h_confirmation: bool = False
@@ -281,6 +290,7 @@ class MACDStrategyV2Config:
     use_dynamic_stop: bool = True
     ema_stop_atr_multiplier: float = 0.5
     max_stop_loss_pct: float = 0.025
+    max_stop_distance_pct: float = 0.025
     vwap_alert_deviation: float = 0.005
 
     # BOLL强趋势处理（新增）
@@ -535,6 +545,7 @@ def build_macd_v2_config_from_runtime(
         weight_1h_direction=float(weights_cfg.get("weight_1h_direction", 0.00)),
         weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.55))),
         weight_4h_enhancement=float(weights_cfg.get("weight_4h_enhancement", 0.10)),
+        weight_boll_position=float(weights_cfg.get("weight_boll_position", 0.0)),
         weight_vwap=float(weights_cfg.get("weight_vwap", 0.20)),
         weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.05)),
         weight_volume=float(weights_cfg.get("weight_volume", 0.20)),
@@ -585,6 +596,7 @@ def build_macd_v2_config_from_runtime(
         ema_slope_lookback_1h=int(float(filter_cfg.get("bb_slope_lookback_1h", filter_cfg.get("ema_slope_lookback_1h", 3)))),
         ema_slope_lookback_4h=int(float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h", 2)))),
         disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
+        disable_red_bar_shrinking_entries=bool(filter_cfg.get("disable_red_bar_shrinking_entries", False)),
         long_entry_mode=str(filter_cfg.get("long_entry_mode", "all") or "all").strip().lower(),
         long_whitelist_signal_types=[
             str(x).strip().lower()
@@ -602,6 +614,9 @@ def build_macd_v2_config_from_runtime(
             if str(x).strip() and "|" in str(x)
         ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
         disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
+        disable_green_bar_shrinking_entries=bool(filter_cfg.get("disable_green_bar_shrinking_entries", False)),
+        require_macd_home_advantage=bool(filter_cfg.get("require_macd_home_advantage", False)),
+        vwap_execution_penalty_only=bool(filter_cfg.get("vwap_execution_penalty_only", False)),
         primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
         require_1h_confirmation_when_4h_primary=bool(filter_cfg.get("require_1h_confirmation_when_4h_primary", False)),
         allow_neutral_1h_confirmation=bool(filter_cfg.get("allow_neutral_1h_confirmation", False)),
@@ -668,6 +683,7 @@ def build_macd_v2_config_from_runtime(
         use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
         ema_stop_atr_multiplier=float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier", 0.5))),
         max_stop_loss_pct=float(stop_cfg.get("max_stop_loss_pct", 0.025)),
+        max_stop_distance_pct=float(stop_cfg.get("max_stop_distance_pct", stop_cfg.get("max_stop_loss_pct", 0.025))),
         vwap_alert_deviation=float(stop_cfg.get("vwap_alert_deviation", 0.005)),
         enable_4h_shrink_exit=bool(stop_cfg.get("enable_4h_shrink_exit", False)),
         exit_4h_shrink_bars=int(float(stop_cfg.get("exit_4h_shrink_bars", 2))),
@@ -774,6 +790,124 @@ class MACDStrategyV2Engine:
         if extra:
             payload.update(extra)
         return payload
+
+    @staticmethod
+    def _classify_market_quadrant(macd_line_4h: float, close_price: float, bb_middle_1h: float) -> str:
+        if not math.isfinite(float(macd_line_4h or 0.0)):
+            return "unknown"
+        if bb_middle_1h <= 0:
+            return "unknown"
+        if macd_line_4h > 0 and close_price >= bb_middle_1h:
+            return "I"
+        if macd_line_4h > 0 and close_price < bb_middle_1h:
+            return "II"
+        if macd_line_4h < 0 and close_price < bb_middle_1h:
+            return "III"
+        if macd_line_4h < 0 and close_price >= bb_middle_1h:
+            return "IV"
+        return "unknown"
+
+    def _calc_boll_position_score(
+        self,
+        *,
+        close_price: float,
+        bb_upper: float,
+        bb_lower: float,
+        bb_middle: float,
+        direction: str,
+    ) -> float:
+        if bb_upper <= bb_lower or bb_middle <= 0 or close_price <= 0:
+            return 0.0
+        ratio = (close_price - bb_lower) / max(bb_upper - bb_lower, 1e-12)
+        ratio = self._clamp(ratio, 0.0, 1.0)
+        if str(direction).lower() == "long":
+            if ratio < 0.50:
+                return 0.0
+            if ratio <= 0.55:
+                return float(self.config.weight_boll_position)
+            if ratio <= 0.80:
+                return float(self.config.weight_boll_position) * 0.80
+            if ratio <= 0.90:
+                return float(self.config.weight_boll_position) * 0.60
+            return float(self.config.weight_boll_position) * 0.40
+        if str(direction).lower() == "short":
+            mirrored = 1.0 - ratio
+            if mirrored < 0.50:
+                return 0.0
+            if mirrored <= 0.55:
+                return float(self.config.weight_boll_position)
+            if mirrored <= 0.80:
+                return float(self.config.weight_boll_position) * 0.80
+            if mirrored <= 0.90:
+                return float(self.config.weight_boll_position) * 0.60
+            return float(self.config.weight_boll_position) * 0.40
+        return 0.0
+
+    @staticmethod
+    def _check_flip_bullish_bottom_structure(
+        *,
+        macd_line_current: float,
+        macd_line_series: Optional[np.ndarray],
+    ) -> Tuple[bool, int]:
+        if macd_line_series is None:
+            return False, 0
+        values = np.asarray(macd_line_series, dtype=float)
+        if values.size < 5:
+            return False, 0
+        last_idx = values.size - 1
+        while last_idx >= 0 and values[last_idx] >= 0:
+            last_idx -= 1
+        if last_idx < 1:
+            return False, 0
+        bars = 0
+        for idx in range(last_idx, 0, -1):
+            if values[idx] >= 0 or values[idx - 1] >= 0:
+                break
+            if abs(values[idx]) < abs(values[idx - 1]):
+                bars += 1
+            else:
+                break
+        return bars >= 2, bars
+
+    @staticmethod
+    def _resolve_vwap_execution_state(
+        *,
+        direction: str,
+        close_price: float,
+        vwap: float,
+        max_gap: float = 0.01,
+    ) -> str:
+        if vwap <= 0 or close_price <= 0:
+            return "unknown"
+        gap = abs(close_price - vwap) / vwap
+        if str(direction).lower() == "long":
+            if close_price > vwap:
+                return "favorable"
+            return "discount_reclaim_ok" if gap < max_gap else "discount_reclaim_too_far"
+        if str(direction).lower() == "short":
+            if close_price < vwap:
+                return "favorable"
+            return "premium_reject_ok" if gap < max_gap else "premium_reject_too_far"
+        return "unknown"
+
+    @staticmethod
+    def _resolve_entry_tier(
+        *,
+        market_quadrant: str,
+        signal_type_1h: str,
+        vwap_execution_state: str,
+    ) -> str:
+        quadrant = str(market_quadrant or "").strip().upper()
+        signal_type = str(signal_type_1h or "").strip().lower()
+        vwap_state = str(vwap_execution_state or "").strip().lower()
+        if quadrant in {"I", "III"} and signal_type in {"flip_bullish", "flip_bearish"} and vwap_state == "favorable":
+            return "tier1"
+        if quadrant in {"II", "IV"} and signal_type in {"flip_bullish", "flip_bearish"} and vwap_state in {
+            "discount_reclaim_ok",
+            "premium_reject_ok",
+        }:
+            return "tier2"
+        return "blocked"
 
     @staticmethod
     def _extract_reject_reason_metadata(reason: str) -> Tuple[str, str]:
@@ -2321,7 +2455,9 @@ class MACDStrategyV2Engine:
     def check_flip_bearish_vwap_context(
         self,
         signal_type_1h: str,
+        market_quadrant: str,
         vwap_state: str,
+        vwap_execution_state: str,
         vwap_score: float,
         structural_vwap: float,
         session_deviation: float,
@@ -2331,10 +2467,15 @@ class MACDStrategyV2Engine:
             return True, [], {}
 
         reasons: List[str] = []
+        quadrant = str(market_quadrant or "").strip().upper()
+        execution_state = str(vwap_execution_state or "").strip().lower()
         allowed_states = {"short_retest_reject"}
-        if structural_vwap <= 0:
+        if quadrant == "III":
+            allowed_states.add("favorable")
+        favorable_allowed = quadrant == "III" and execution_state == "favorable"
+        if structural_vwap <= 0 and not favorable_allowed:
             reasons.append("structural_vwap_missing")
-        if vwap_state not in allowed_states:
+        if not favorable_allowed and vwap_state not in allowed_states:
             reasons.append(f"vwap_state={vwap_state}")
         retest_reject_min_vwap_score = max(0.0, self.config.flip_bearish_retest_reject_min_vwap_score)
         if (
@@ -2348,7 +2489,9 @@ class MACDStrategyV2Engine:
 
         details = {
             "flip_bearish_allowed_vwap_states": sorted(allowed_states),
+            "market_quadrant": quadrant,
             "vwap_state": vwap_state,
+            "vwap_execution_state": vwap_execution_state,
             "vwap_score": vwap_score,
             "flip_bearish_retest_reject_min_vwap_score": retest_reject_min_vwap_score,
             "structural_vwap": structural_vwap,
@@ -2533,17 +2676,16 @@ class MACDStrategyV2Engine:
         details = {}
         
         if direction == 'long':
-            if bb_middle_1h > 0 and close_1h >= bb_middle_1h:
-                stop = bb_middle_1h - atr_1h * self.config.ema_stop_atr_multiplier
-                details['stop_anchor'] = 'bb_middle'
-            elif bb_lower_1h > 0:
+            if bb_lower_1h > 0:
                 stop = bb_lower_1h - atr_1h * 0.2
                 details['stop_anchor'] = 'bb_lower'
+                if atr_1h > 0:
+                    stop = bb_lower_1h - atr_1h * self.config.ema_stop_atr_multiplier
             else:
-                stop = entry_price * (1 - self.config.max_stop_loss_pct)
+                stop = entry_price * (1 - self.config.max_stop_distance_pct)
                 details['stop_anchor'] = 'default'
             
-            max_stop = entry_price * (1 - self.config.max_stop_loss_pct)
+            max_stop = entry_price * (1 - self.config.max_stop_distance_pct)
             stop = max(stop, max_stop)
             
             if vwap > 0:
@@ -2551,24 +2693,23 @@ class MACDStrategyV2Engine:
                 details['vwap_alert_price'] = vwap_alert
             
         elif direction == 'short':
-            if bb_middle_1h > 0 and close_1h <= bb_middle_1h:
-                stop = bb_middle_1h + atr_1h * self.config.ema_stop_atr_multiplier
-                details['stop_anchor'] = 'bb_middle'
-            elif bb_upper_1h > 0:
+            if bb_upper_1h > 0:
                 stop = bb_upper_1h + atr_1h * 0.2
                 details['stop_anchor'] = 'bb_upper'
+                if atr_1h > 0:
+                    stop = bb_upper_1h + atr_1h * self.config.ema_stop_atr_multiplier
             else:
-                stop = entry_price * (1 + self.config.max_stop_loss_pct)
+                stop = entry_price * (1 + self.config.max_stop_distance_pct)
                 details['stop_anchor'] = 'default'
             
-            max_stop = entry_price * (1 + self.config.max_stop_loss_pct)
+            max_stop = entry_price * (1 + self.config.max_stop_distance_pct)
             stop = min(stop, max_stop)
             
             if vwap > 0:
                 vwap_alert = vwap * (1 + self.config.vwap_alert_deviation)
                 details['vwap_alert_price'] = vwap_alert
         else:
-            stop = entry_price * (1 - self.config.max_stop_loss_pct)
+            stop = entry_price * (1 - self.config.max_stop_distance_pct)
             details['stop_anchor'] = 'default'
         
         stop_pct = abs(entry_price - stop) / entry_price
@@ -2609,6 +2750,8 @@ class MACDStrategyV2Engine:
         structural_vwap_1h_series: Optional[np.ndarray] = None,
         adx_1h: float = 0.0,
         adx_4h: float = 0.0,
+        macd_line_1h: Optional[float] = None,
+        macd_line_4h: Optional[float] = None,
         bb_middle_slope_1h: Optional[float] = None,
         bb_middle_slope_4h: Optional[float] = None,
         cvd_upper_wick_ratio: Optional[float] = None,
@@ -2656,6 +2799,41 @@ class MACDStrategyV2Engine:
                 period=self.config.boll_period,
                 std_dev=self.config.boll_std_dev,
             )
+        if macd_line_1h is not None and not math.isfinite(float(macd_line_1h)):
+            macd_line_1h = None
+        if macd_line_4h is not None and not math.isfinite(float(macd_line_4h)):
+            macd_line_4h = None
+        macd_line_series_1h: Optional[np.ndarray] = None
+        if macd_line_1h is None and close_1h_series is not None:
+            macd_line_series_1h, _signal_line_series_1h, _hist_series_1h = self.calculate_macd(
+                np.asarray(close_1h_series, dtype=float),
+                self.config.macd_1h_fast,
+                self.config.macd_1h_slow,
+                self.config.macd_1h_signal,
+            )
+            macd_line_1h = self._series_value(macd_line_series_1h, default=0.0)
+        if macd_line_4h is None and close_4h_series is not None:
+            macd_line_series_4h, _signal_line_series_4h, _hist_series_4h = self.calculate_macd(
+                np.asarray(close_4h_series, dtype=float),
+                self.config.macd_4h_fast,
+                self.config.macd_4h_slow,
+                self.config.macd_4h_signal,
+            )
+            macd_line_4h = self._series_value(macd_line_series_4h, default=0.0)
+        market_quadrant = self._classify_market_quadrant(
+            float(macd_line_4h or 0.0),
+            float(close_price or 0.0),
+            float(bb_middle_1h or 0.0),
+        )
+        macd_home_side = "long" if float(macd_line_4h or 0.0) > 0 else ("short" if float(macd_line_4h or 0.0) < 0 else "neutral")
+        boll_value_zone = "strong" if float(close_price or 0.0) >= float(bb_middle_1h or 0.0) else "weak"
+        debug_details.update(
+            market_quadrant=market_quadrant,
+            macd_home_side=macd_home_side,
+            boll_value_zone=boll_value_zone,
+            macd_line_1h=float(macd_line_1h or 0.0),
+            macd_line_4h=float(macd_line_4h or 0.0),
+        )
 
         primary_mode = str(self.config.primary_direction_timeframe or "4h").strip().lower()
         light_1h_confirmation = self.use_light_1h_confirmation()
@@ -2769,9 +2947,83 @@ class MACDStrategyV2Engine:
             is_trial_entry=is_trial_entry,
             entry_scale=entry_scale,
         )
+        signal_type_1h = str(details_1h.get("signal_type") or "").strip().lower()
+        state_machine_enabled = bool(
+            self.config.require_macd_home_advantage
+            or self.config.weight_boll_position > 0
+            or self.config.vwap_execution_penalty_only
+            or self.config.disable_green_bar_shrinking_entries
+        )
+        if (
+            signal_type_1h == "red_bar_shrinking"
+            and bool(self.config.disable_red_bar_shrinking_entries)
+        ):
+            debug_details = self._set_stage(
+                debug_details,
+                "signal_type_family_filter",
+                shrinking_state_filter_reason="red_bar_shrinking_family",
+            )
+            return self._neutral_signal(
+                reason="red_bar_shrinking_disabled",
+                signal_type_1h=details_1h.get("signal_type"),
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+        if signal_type_1h == "green_bar_shrinking" and bool(self.config.disable_green_bar_shrinking_entries):
+            debug_details = self._set_stage(
+                debug_details,
+                "signal_type_family_filter",
+                shrinking_state_filter_reason="green_bar_shrinking_family",
+            )
+            return self._neutral_signal(
+                reason="green_bar_shrinking_disabled",
+                signal_type_1h=details_1h.get("signal_type"),
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
+        state_machine_reason = ""
+        vwap_execution_state = "legacy"
+        if state_machine_enabled:
+            trade_direction = None
+            if bool(self.config.require_macd_home_advantage) and macd_home_side == "neutral":
+                state_machine_reason = "macd_home_advantage_block"
+            elif market_quadrant == "I" and signal_type_1h == "flip_bullish":
+                trade_direction = "long"
+            elif market_quadrant == "II" and signal_type_1h == "flip_bullish":
+                trade_direction = "long"
+            elif market_quadrant == "III" and signal_type_1h == "flip_bearish":
+                trade_direction = "short"
+            elif market_quadrant == "IV" and signal_type_1h == "flip_bearish":
+                trade_direction = "short"
+            else:
+                state_machine_reason = "quadrant_signal_block"
+            if trade_direction == "long" and signal_type_1h == "flip_bullish":
+                structure_ok, structure_bars = self._check_flip_bullish_bottom_structure(
+                    macd_line_current=float(macd_line_1h or 0.0),
+                    macd_line_series=macd_line_series_1h,
+                )
+                debug_details["flip_bullish_bottom_structure_bars"] = int(structure_bars)
+                if not structure_ok:
+                    trade_direction = None
+                    state_machine_reason = "flip_bullish_bottom_structure_block"
+            vwap_execution_state = self._resolve_vwap_execution_state(
+                direction=trade_direction or "",
+                close_price=float(close_price or 0.0),
+                vwap=float(vwap or 0.0),
+                max_gap=0.01,
+            )
+            debug_details["vwap_execution_state"] = vwap_execution_state
+            if trade_direction == "long" and market_quadrant == "II" and vwap_execution_state != "discount_reclaim_ok":
+                trade_direction = None
+                state_machine_reason = "quadrant_vwap_execution_block"
+            if trade_direction == "short" and market_quadrant == "IV" and vwap_execution_state != "premium_reject_ok":
+                trade_direction = None
+                state_machine_reason = "quadrant_vwap_execution_block"
         if trade_direction is None:
             return self._neutral_signal(
-                reason=direction_reject_reason or "主方向无明确结论",
+                reason=state_machine_reason or direction_reject_reason or "主方向无明确结论",
                 signal_type_1h=details_1h.get('signal_type'),
                 details=self._build_debug_details(
                     **debug_details,
@@ -2940,7 +3192,9 @@ class MACDStrategyV2Engine:
         if strict_1h_filters_enabled:
             vwap_context_ok, vwap_context_reasons, vwap_context_details = self.check_flip_bearish_vwap_context(
                 signal_type_1h=details_1h.get('signal_type', ''),
+                market_quadrant=market_quadrant,
                 vwap_state=vwap_state,
+                vwap_execution_state=vwap_execution_state,
                 vwap_score=vwap_score,
                 structural_vwap=float(vwap_details.get("structural_vwap", structural_vwap)),
                 session_deviation=float(vwap_details.get("session_deviation", vwap_deviation)),
@@ -3164,7 +3418,9 @@ class MACDStrategyV2Engine:
         if signal_type_1h == 'flip_bearish':
             bearish_vwap_ok, bearish_vwap_reasons, bearish_vwap_details = self.check_flip_bearish_vwap_context(
                 signal_type_1h=signal_type_1h,
+                market_quadrant=market_quadrant,
                 vwap_state=vwap_state,
+                vwap_execution_state=vwap_execution_state,
                 vwap_score=vwap_score,
                 structural_vwap=float(vwap_details.get("structural_vwap", structural_vwap)),
                 session_deviation=float(vwap_details.get("session_deviation", vwap_deviation)),
@@ -3653,15 +3909,17 @@ class MACDStrategyV2Engine:
         weight_1h_direction = float(pocket_scoring_weights["weight_1h_direction"])
         weight_4h_direction = float(pocket_scoring_weights["weight_4h_direction"])
         weight_4h_enhancement = float(pocket_scoring_weights["weight_4h_enhancement"])
+        weight_boll_position = float(self.config.weight_boll_position)
         weight_vwap = float(pocket_scoring_weights["weight_vwap"])
         weight_15m_entry = float(pocket_scoring_weights["weight_15m_entry"])
         weight_volume = float(pocket_scoring_weights["weight_volume"])
         
-        # 4H主趋势评分 × BOLL结构修正
         signal_strength_1h = details_1h.get('signal_strength', 0.5)
         score_1h_base = 0.0
         score_1h = 0.0
         score_1h_source = "no_direction_credit"
+        score_boll_position = 0.0
+        entry_tier = "blocked"
 
         neutral_1h_light_credit = (
             primary_mode == "4h"
@@ -3672,81 +3930,126 @@ class MACDStrategyV2Engine:
             and debug_details.get("confirmation_status") == "neutral_allowed"
         )
 
-        if neutral_1h_light_credit:
-            # In 4H-primary mode, a neutral 1H that is explicitly allowed should not
-            # silently zero out the full 1H bucket and freeze live entries.
-            score_1h_base = weight_1h_direction * 0.75
-            score_1h_source = "neutral_allowed_light_credit"
-            debug_details["light_1h_neutral_credit_applied"] = True
-        elif signal_type_1h in ['flip_bullish', 'flip_bearish']:
-            score_1h_base = weight_1h_direction
-            score_1h_source = "signal_type_flip"
-        elif signal_type_1h in ['red_bar_growing', 'green_bar_growing']:
-            score_1h_base = weight_1h_direction * 0.875
-            score_1h_source = "signal_type_growing"
-        elif trade_direction == direction_1h:
-            score_1h_base = weight_1h_direction * signal_strength_1h
-            score_1h_source = "aligned_direction_strength"
-        else:
-            score_1h_base = 0.0
-            score_1h_source = "no_direction_credit"
+        if not state_machine_enabled:
+            if neutral_1h_light_credit:
+                score_1h_base = weight_1h_direction * 0.75
+                score_1h_source = "neutral_allowed_light_credit"
+                debug_details["light_1h_neutral_credit_applied"] = True
+            elif signal_type_1h in ['flip_bullish', 'flip_bearish']:
+                score_1h_base = weight_1h_direction
+                score_1h_source = "signal_type_flip"
+            elif signal_type_1h in ['red_bar_growing', 'green_bar_growing']:
+                score_1h_base = weight_1h_direction * 0.875
+                score_1h_source = "signal_type_growing"
+            elif trade_direction == direction_1h:
+                score_1h_base = weight_1h_direction * signal_strength_1h
+                score_1h_source = "aligned_direction_strength"
+            else:
+                score_1h_base = 0.0
+                score_1h_source = "no_direction_credit"
 
-        score_1h = min(score_1h_base * ema_score_multiplier, weight_1h_direction)
-        debug_details["score_1h_source"] = score_1h_source
-        score += score_1h
+            score_1h = min(score_1h_base * ema_score_multiplier, weight_1h_direction)
+            debug_details["score_1h_source"] = score_1h_source
+            score += score_1h
 
-        if is_trial_entry:
-            shrink_pct = max(0.0, float(shrink_4h_context["shrink_pct"]))
-            preflip_4h_strength = self._clamp(0.56 + shrink_pct * 0.38, 0.0, 0.92)
-            score_4h_base = weight_4h_direction * preflip_4h_strength
-        elif direction_4h == trade_direction and signal_type_4h in ['flip_bullish', 'flip_bearish']:
-            score_4h_base = weight_4h_direction
-        elif direction_4h == trade_direction and signal_type_4h in ['red_bar_growing', 'green_bar_growing']:
-            score_4h_base = weight_4h_direction * 0.875
-        elif direction_4h == trade_direction:
-            score_4h_base = weight_4h_direction * signal_strength_4h
-        else:
-            score_4h_base = 0.0
+            if is_trial_entry:
+                shrink_pct = max(0.0, float(shrink_4h_context["shrink_pct"]))
+                preflip_4h_strength = self._clamp(0.56 + shrink_pct * 0.38, 0.0, 0.92)
+                score_4h_base = weight_4h_direction * preflip_4h_strength
+            elif direction_4h == trade_direction and signal_type_4h in ['flip_bullish', 'flip_bearish']:
+                score_4h_base = weight_4h_direction
+            elif direction_4h == trade_direction and signal_type_4h in ['red_bar_growing', 'green_bar_growing']:
+                score_4h_base = weight_4h_direction * 0.875
+            elif direction_4h == trade_direction:
+                score_4h_base = weight_4h_direction * signal_strength_4h
+            else:
+                score_4h_base = 0.0
 
-        score_4h = min(score_4h_base * ema_score_multiplier, weight_4h_direction)
-        score += score_4h
-        
-        # 4H附加增强评分（默认关闭） × BOLL结构修正
-        legacy_4h_boost = entry_type_15m not in ['flip_bullish', 'flip_bearish']
-        effective_4h_score = enhancement_score
-        if legacy_4h_boost:
+            score_4h = min(score_4h_base * ema_score_multiplier, weight_4h_direction)
+            score += score_4h
+
+            legacy_4h_boost = entry_type_15m not in ['flip_bullish', 'flip_bearish']
+            effective_4h_score = enhancement_score
+            if legacy_4h_boost:
+                if is_4h_enhanced:
+                    effective_4h_score = 0.84
+                elif enhancement_score > 0:
+                    effective_4h_score = 2.0 / 3.0
+
             if is_4h_enhanced:
-                effective_4h_score = 0.84
+                score_4h_enhancement_base = weight_4h_enhancement * effective_4h_score
             elif enhancement_score > 0:
-                effective_4h_score = 2.0 / 3.0
+                score_4h_enhancement_base = weight_4h_enhancement * 0.5 * effective_4h_score
+            else:
+                score_4h_enhancement_base = 0
 
-        if is_4h_enhanced:
-            score_4h_enhancement_base = weight_4h_enhancement * effective_4h_score
-        elif enhancement_score > 0:
-            score_4h_enhancement_base = weight_4h_enhancement * 0.5 * effective_4h_score
+            score_4h_enhancement = min(
+                score_4h_enhancement_base * ema_score_multiplier,
+                weight_4h_enhancement,
+            )
+            score += score_4h_enhancement
+
+            score_vwap = min(weight_vwap * max(0.0, min(1.0, vwap_location_score)), weight_vwap)
+            score += score_vwap
+
+            if entry_type_15m in ['flip_bullish', 'flip_bearish']:
+                score_15m = weight_15m_entry
+            elif entry_type_15m in ['red_bar_growing', 'green_bar_growing']:
+                score_15m = weight_15m_entry * 0.85
+            elif entry_type_15m in ['red_bar_stable', 'green_bar_stable']:
+                score_15m = min(weight_15m_entry * 0.6 * 1.15, weight_15m_entry)
+            else:
+                score_15m = weight_15m_entry * 0.3
+            score += score_15m
         else:
-            score_4h_enhancement_base = 0
-        
-        score_4h_enhancement = min(
-            score_4h_enhancement_base * ema_score_multiplier,
-            weight_4h_enhancement,
-        )
-        score += score_4h_enhancement
-        
-        # VWAP评分 (15%)
-        score_vwap = min(weight_vwap * max(0.0, min(1.0, vwap_location_score)), weight_vwap)
-        score += score_vwap
-        
-        # 15M入场评分 (20%)
-        if entry_type_15m in ['flip_bullish', 'flip_bearish']:
-            score_15m = weight_15m_entry
-        elif entry_type_15m in ['red_bar_growing', 'green_bar_growing']:
-            score_15m = weight_15m_entry * 0.85
-        elif entry_type_15m in ['red_bar_stable', 'green_bar_stable']:
-            score_15m = min(weight_15m_entry * 0.6 * 1.15, weight_15m_entry)
-        else:
-            score_15m = weight_15m_entry * 0.3
-        score += score_15m
+            if neutral_1h_light_credit:
+                score_1h_base = weight_1h_direction * 0.50
+                score_1h_source = "neutral_allowed_light_credit"
+                debug_details["light_1h_neutral_credit_applied"] = True
+            elif signal_type_1h in ['flip_bullish', 'flip_bearish']:
+                score_1h_base = weight_1h_direction
+                score_1h_source = "signal_type_flip"
+            elif signal_type_1h in ['red_bar_growing', 'green_bar_growing']:
+                score_1h_base = weight_1h_direction * 0.75
+                score_1h_source = "signal_type_growing"
+            elif trade_direction == direction_1h:
+                score_1h_base = weight_1h_direction * signal_strength_1h
+                score_1h_source = "aligned_direction_strength"
+
+            score_1h = min(score_1h_base * ema_score_multiplier, weight_1h_direction)
+            debug_details["score_1h_source"] = score_1h_source
+            score += score_1h
+
+            score_4h_base = weight_4h_direction if macd_home_side == trade_direction else 0.0
+            score_4h = min(score_4h_base * ema_score_multiplier, weight_4h_direction)
+            score += score_4h
+
+            legacy_4h_boost = False
+            effective_4h_score = 0.0
+            score_4h_enhancement_base = 0.0
+            score_4h_enhancement = 0.0
+            score += score_4h_enhancement
+
+            score_boll_position = self._calc_boll_position_score(
+                close_price=float(close_price or 0.0),
+                bb_upper=float(bb_upper_1h or 0.0),
+                bb_lower=float(bb_lower_1h or 0.0),
+                bb_middle=float(bb_middle_1h or 0.0),
+                direction=trade_direction,
+            )
+            score += score_boll_position
+
+            score_vwap = 0.0
+            score += score_vwap
+
+            score_15m = 0.0
+            score += score_15m
+
+            entry_tier = self._resolve_entry_tier(
+                market_quadrant=market_quadrant,
+                signal_type_1h=signal_type_1h,
+                vwap_execution_state=vwap_execution_state,
+            )
         
         # 成交量评分 (15%)
         if volume_ratio > 1.5:
@@ -3770,6 +4073,18 @@ class MACDStrategyV2Engine:
             overheat_penalty = self.config.overheat_growing_penalty
             score = max(0.0, score - overheat_penalty)
 
+        if bool(self.config.vwap_execution_penalty_only):
+            if vwap_execution_state in {"discount_reclaim_too_far", "premium_reject_too_far"}:
+                vwap_soft_penalty = max(vwap_soft_penalty, min(0.30, abs(vwap_deviation) * 0.50 + 0.05))
+            elif vwap_execution_state not in {"favorable", "discount_reclaim_ok", "premium_reject_ok"}:
+                vwap_soft_penalty = max(vwap_soft_penalty, 0.10)
+
+        entry_tier = self._resolve_entry_tier(
+            market_quadrant=market_quadrant,
+            signal_type_1h=signal_type_1h,
+            vwap_execution_state=vwap_execution_state,
+        )
+
         debug_details = self._set_stage(
             debug_details,
             "score_aggregation",
@@ -3782,6 +4097,7 @@ class MACDStrategyV2Engine:
             score_4h=score_4h,
             score_4h_enhancement_base=score_4h_enhancement_base,
             score_4h_enhancement=score_4h_enhancement,
+            score_boll_position=score_boll_position,
             score_vwap=score_vwap,
             score_15m=score_15m,
             score_volume=score_vol,
@@ -3790,6 +4106,7 @@ class MACDStrategyV2Engine:
             pocket_weight_1h_direction=weight_1h_direction,
             pocket_weight_4h_direction=weight_4h_direction,
             pocket_weight_4h_enhancement=weight_4h_enhancement,
+            pocket_weight_boll_position=weight_boll_position,
             pocket_weight_vwap=weight_vwap,
             pocket_weight_15m_entry=weight_15m_entry,
             pocket_weight_volume=weight_volume,
@@ -3798,6 +4115,11 @@ class MACDStrategyV2Engine:
             total_score=score,
             legacy_4h_boost=legacy_4h_boost,
             effective_4h_score=effective_4h_score,
+            market_quadrant=market_quadrant,
+            macd_home_side=macd_home_side,
+            boll_value_zone=boll_value_zone,
+            vwap_execution_state=vwap_execution_state,
+            entry_tier=entry_tier,
         )
         trial_short_promotion_eval = self._evaluate_trial_short_below_structure_continuation_promotion(
             primary_mode=primary_mode,
@@ -4204,6 +4526,11 @@ class MACDStrategyV2Engine:
             'stable_continuation_side': stable_continuation_side,
             'stable_continuation_reason': stable_continuation_eval.get("stable_continuation_reason"),
             'stable_continuation_hist_bars': stable_continuation_eval.get("stable_continuation_hist_bars"),
+            'market_quadrant': market_quadrant,
+            'macd_home_side': macd_home_side,
+            'boll_value_zone': boll_value_zone,
+            'vwap_execution_state': vwap_execution_state,
+            'entry_tier': entry_tier,
             'enhancement_score': enhancement_score,
             'entry_type_15m': entry_type_15m,
             'entry_score_15m': entry_score_15m,
@@ -4233,6 +4560,7 @@ class MACDStrategyV2Engine:
             'score_4h': score_4h,
             'score_4h_enhancement_base': score_4h_enhancement_base,
             'score_4h_enhancement': score_4h_enhancement,
+            'score_boll_position': score_boll_position,
             'score_vwap': score_vwap,
             'score_15m': score_15m,
             'score_volume': score_vol,
@@ -4285,6 +4613,7 @@ class MACDStrategyV2Engine:
         signal_type_1h: Optional[str] = None,
         symbol: Optional[str] = None,
         is_trial_entry: bool = False,
+        entry_tier: Optional[str] = None,
     ) -> int:
         """
         根据评分计算杠杆（实盘配置：2X/3X/4X）
@@ -4296,9 +4625,17 @@ class MACDStrategyV2Engine:
         Returns:
             杠杆倍数
         """
-        base_leverage = 0
+        tier = str(entry_tier or "").strip().lower()
+        if tier == "tier1":
+            base_leverage = 5
+        elif tier == "tier2":
+            base_leverage = 4
+        elif tier == "tier3":
+            base_leverage = 3
+        else:
+            base_leverage = 0
         raw_tiers = self.config.leverage_score_tiers or []
-        if raw_tiers:
+        if base_leverage <= 0 and raw_tiers:
             normalized_tiers: List[Dict[str, float]] = []
             for raw_tier in raw_tiers:
                 if not isinstance(raw_tier, dict):
@@ -4329,15 +4666,15 @@ class MACDStrategyV2Engine:
                     break
             if base_leverage <= 0:
                 return 0
-        elif score >= 0.95:
+        elif base_leverage <= 0 and score >= 0.95:
             base_leverage = 5
-        elif score >= 0.90:
+        elif base_leverage <= 0 and score >= 0.90:
             base_leverage = 5
-        elif score >= 0.85:
+        elif base_leverage <= 0 and score >= 0.85:
             base_leverage = 5
-        elif score >= 0.75:
+        elif base_leverage <= 0 and score >= 0.75:
             base_leverage = 2
-        else:
+        elif base_leverage <= 0:
             return 0
         
         # BOLL强趋势降杠杆（强趋势可能已运行较长时间）
@@ -4385,10 +4722,19 @@ class MACDStrategyV2Engine:
         is_trial_entry: bool = False,
         entry_scale: float = 1.0,
         session_scale: float = 1.0,
+        entry_tier: Optional[str] = None,
     ) -> float:
-        target_portion = float(base_default_portion)
+        tier = str(entry_tier or "").strip().lower()
+        if tier == "tier1":
+            target_portion = 0.30
+        elif tier == "tier2":
+            target_portion = 0.25
+        elif tier == "tier3":
+            target_portion = 0.20
+        else:
+            target_portion = float(base_default_portion)
         raw_tiers = self.config.position_score_tiers or []
-        if raw_tiers:
+        if tier not in {"tier1", "tier2", "tier3"} and raw_tiers:
             normalized_tiers: List[Dict[str, float]] = []
             for raw_tier in raw_tiers:
                 if not isinstance(raw_tier, dict):
@@ -4422,10 +4768,12 @@ class MACDStrategyV2Engine:
                 return 0.0
             target_portion = matched_target
             portion_mult = 1.0
-        else:
+        elif tier not in {"tier1", "tier2", "tier3"}:
             portion_mult = self.calculate_portion_multiplier(score)
             if portion_mult <= 0:
                 return 0.0
+        else:
+            portion_mult = 1.0
 
         max_symbol_position_portion = float(base_max_symbol_position_portion)
 
