@@ -2763,6 +2763,19 @@ class MACDStrategyV2Engine:
         - veto_type: 是否触发否决
         - details: 位置状态与连续评分细节
         """
+        # VWAP权重=0时直接跳过所有计算，避免不必要的副作用
+        if self.config.weight_vwap <= 0:
+            deviation = (price - vwap) / vwap if vwap > 0 else 0.0
+            return 0.0, VetoType.NONE, {
+                "state": "vwap_disabled",
+                "location_score": 0.0,
+                "entry_edge": 0.0,
+                "directional_extension": 0.0,
+                "session_vwap": vwap,
+                "structural_vwap": structural_vwap or 0.0,
+                "session_deviation": deviation,
+                "structural_deviation": 0.0,
+            }
         structural_vwap_value = float(structural_vwap) if structural_vwap is not None else 0.0
         if structural_vwap_value <= 0.0:
             structural_vwap_value = self._series_value(structural_vwap_series, default=0.0)
