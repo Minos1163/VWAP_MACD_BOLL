@@ -42,7 +42,15 @@ class _StubBotMarketData:
 
     def get_trend_filter_metrics(self, _symbol: str, interval: str = "15m", limit: int = 120):
         self.trend_calls.append((interval, limit))
-        return {"ema_30": 100.0, "macd_cross": "NONE", "macd_zone": "NEAR_ZERO"}
+        return {
+            "ema_30": 100.0,
+            "macd_cross": "NONE",
+            "macd_zone": "NEAR_ZERO",
+            "macd_hist_series": [0.1, 0.2, 0.3],
+            "macd_hist_array": [0.1, 0.2, 0.3],
+            "macd_hist_prev": 0.2,
+            "close_series": [100.0, 100.5, 101.0],
+        }
 
     def get_order_flow_snapshot(self, _symbol: str, interval: str = "1m", limit: int = 24):
         return {}
@@ -118,6 +126,44 @@ def test_apply_timeframe_context_injects_full_trend_filter_snapshot():
     assert out["active_timeframe"] == "15m"
 
 
+def test_apply_timeframe_context_preserves_request_diagnostics_and_builds_context_diagnostics():
+    bot = TradingBot.__new__(TradingBot)
+    bot.config = {"fund_flow": {"decision_timeframe": "15m"}}
+    bot._to_float = TradingBot._to_float
+
+    raw_context = {
+        "trend_filters_by_timeframe": {
+            "15m": {
+                "macd_hist_series": [0.1, 0.2, 0.3],
+                "macd_hist_prev": 0.2,
+                "close_series": [100.0, 100.5, 101.0],
+            },
+            "1h": {},
+            "4h": {
+                "close_series": [100.0, 100.5, 101.0],
+            },
+        },
+        "timeframe_request_diagnostics": {
+            "15m": {"requested": True, "snapshot_empty": False},
+            "1h": {"requested": True, "snapshot_empty": True},
+            "4h": {"requested": True, "snapshot_empty": False},
+        },
+    }
+    flow_snapshot = SimpleNamespace(timeframes={})
+
+    out = TradingBot._apply_timeframe_context(bot, raw_context, flow_snapshot)
+
+    assert out["timeframe_request_diagnostics"]["1h"]["snapshot_empty"] is True
+    context_diag = out["timeframe_context_diagnostics"]
+    assert context_diag["15m"]["timeframe_present"] is True
+    assert context_diag["15m"]["macd_hist_series_present"] is True
+    assert context_diag["1h"]["timeframe_present"] is False
+    assert context_diag["1h"]["snapshot_empty"] is True
+    assert context_diag["4h"]["timeframe_present"] is True
+    assert context_diag["4h"]["macd_hist_series_present"] is False
+    assert context_diag["4h"]["close_series_present"] is True
+
+
 def test_get_market_data_for_symbol_requests_4h_when_dual_risk_filter_enabled():
     bot = TradingBot.__new__(TradingBot)
     bot.config = {
@@ -146,5 +192,11 @@ def test_get_market_data_for_symbol_requests_4h_when_dual_risk_filter_enabled():
     out = TradingBot.get_market_data_for_symbol(bot, "BTCUSDT")
 
     assert "4h" in out["trend_filters_by_timeframe"]
+    request_diag = out["timeframe_request_diagnostics"]
+    assert request_diag["1h"]["requested"] is True
+    assert request_diag["1h"]["snapshot_empty"] is False
+    assert request_diag["1h"]["macd_hist_series_present"] is True
+    assert request_diag["4h"]["requested"] is True
+    assert request_diag["4h"]["close_series_present"] is True
     requested_intervals = {interval for interval, _ in bot.market_data.trend_calls}
     assert {"1h", "15m", "4h"} <= requested_intervals

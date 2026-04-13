@@ -128,6 +128,64 @@ def test_time_exit_closes_position_after_hold_window_without_progress():
     assert "time_exit" in decision.reason
 
 
+def test_time_exit_uses_pocket_management_override_from_metadata():
+    bot = _make_bot()
+    pos_key = bot._position_track_key("BTCUSDT", "LONG")
+    bot._position_first_seen_ts[pos_key] = time.time() - (11 * 60)
+
+    decision = bot._evaluate_time_exit(
+        symbol="BTCUSDT",
+        position=_position(),
+        current_price=100.05,
+        flow_context={"cvd_momentum": 0.0},
+        base_decision=FundFlowDecision(
+            operation=FundFlowOperation.HOLD,
+            symbol="BTCUSDT",
+            target_portion_of_balance=0.0,
+            leverage=2,
+            reason="hold",
+            metadata={
+                "pocket_management_override": {
+                    "time_exit_minutes": 10,
+                    "time_exit_min_profit_pct": 0.001,
+                }
+            },
+        ),
+    )
+
+    assert decision is not None
+    assert decision.operation == FundFlowOperation.CLOSE
+    assert "time_exit" in decision.reason
+
+
+def test_time_exit_can_be_disabled_by_pocket_management_override():
+    bot = _make_bot()
+    pos_key = bot._position_track_key("BTCUSDT", "LONG")
+    bot._position_first_seen_ts[pos_key] = time.time() - (61 * 60)
+
+    decision = bot._evaluate_time_exit(
+        symbol="BTCUSDT",
+        position=_position(),
+        current_price=99.9,
+        flow_context={"cvd_momentum": 0.0},
+        base_decision=FundFlowDecision(
+            operation=FundFlowOperation.HOLD,
+            symbol="BTCUSDT",
+            target_portion_of_balance=0.0,
+            leverage=2,
+            reason="hold",
+            metadata={
+                "pocket_management_override": {
+                    "time_exit_enabled": False,
+                    "time_exit_minutes": 10,
+                }
+            },
+        ),
+    )
+
+    assert decision is None
+
+
 def test_time_exit_uses_injected_backtest_clock_instead_of_wall_clock():
     bot = _make_bot()
     pos_key = bot._position_track_key("BTCUSDT", "LONG")
@@ -206,6 +264,37 @@ def test_partial_tp_fires_first_level_in_volatile_mode_at_point_seven_r():
     state = bot._get_or_create_partial_tp_state("BTCUSDT", "LONG")
     assert state["levels_completed"] == [0]
     assert state["last_tp_trigger_ts"] > 0
+
+
+def test_partial_tp_profile_uses_metadata_override_levels():
+    bot = _make_bot()
+
+    decision = bot._evaluate_partial_tp(
+        symbol="BTCUSDT",
+        position=_position(side="SHORT"),
+        current_price=99.1,
+        flow_context={"atr_pct": 0.010, "adx": 32.0},
+        base_decision=FundFlowDecision(
+            operation=FundFlowOperation.HOLD,
+            symbol="BTCUSDT",
+            target_portion_of_balance=0.0,
+            leverage=3,
+            reason="hold",
+            metadata={
+                "pocket_management_override": {
+                    "partial_tp_levels": [
+                        {"close_ratio": 0.40, "trigger_r_multiple": 0.7},
+                        {"close_ratio": 0.25, "trigger_r_multiple": 1.4},
+                    ],
+                    "partial_tp_mode": "static",
+                }
+            },
+        ),
+    )
+
+    assert decision is not None
+    assert decision.operation == FundFlowOperation.CLOSE
+    assert decision.target_portion_of_balance == 0.40
 
 
 def test_position_management_prioritizes_partial_tp_over_fast_exit_full_close():

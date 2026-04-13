@@ -31,6 +31,19 @@ def test_pick_open_candidates_allows_dynamic_cap_expansion_per_candidate():
     assert [item["symbol"] for item in selected] == ["A", "B"]
 
 
+def test_pick_open_candidates_respects_capacity_group_cap():
+    candidates = [
+        {"symbol": "A", "score": 1.20, "_priority_score": 1.20, "_capacity_group_key": "green_bar_growing|short_retest_reject", "_capacity_group_cap": 2, "max_active_symbols": 5},
+        {"symbol": "B", "score": 1.10, "_priority_score": 1.10, "_capacity_group_key": "green_bar_growing|short_retest_reject", "_capacity_group_cap": 2, "max_active_symbols": 5},
+        {"symbol": "C", "score": 1.00, "_priority_score": 1.00, "_capacity_group_key": "green_bar_growing|short_retest_reject", "_capacity_group_cap": 2, "max_active_symbols": 5},
+        {"symbol": "D", "score": 0.90, "_priority_score": 0.90, "_capacity_group_key": "", "_capacity_group_cap": 0, "max_active_symbols": 5},
+    ]
+
+    selected = BotLikeReplayEngine.pick_open_candidates(candidates, active_count=0)
+
+    assert [item["symbol"] for item in selected] == ["A", "B", "D"]
+
+
 def test_open_position_from_decision_respects_explicit_tp_disable_over_global_defaults():
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
     engine.positions = {}
@@ -79,6 +92,251 @@ def test_open_position_from_decision_respects_explicit_tp_disable_over_global_de
     assert engine.positions["BTCUSDT"]["take_profit_levels"] == []
 
 
+def test_open_position_from_decision_persists_pocket_management_and_labels():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.positions = {}
+    engine.pending_orders = {}
+    engine.capital = 10000.0
+    engine.config = SimpleNamespace(
+        fixed_leverage=None,
+        default_leverage=3,
+        min_leverage=2,
+        max_leverage=4,
+        max_symbol_position_portion=0.6,
+        min_open_portion=0.06,
+        reserve_pct=0.2,
+        fee_rate=0.0004,
+        entry_slippage=0.0015,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.02,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+    )
+    engine._sync_position_tracking = lambda *_args, **_kwargs: None
+    engine._fill_pending_order = lambda symbol, order, fill_price, fill_time: engine.positions.setdefault(symbol, dict(order)) or True
+
+    decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.2,
+        leverage=3,
+        max_price=100.0,
+        stop_loss_price=98.0,
+        take_profit_price=None,
+        metadata={
+            "signal_type_1h": "flip_bullish",
+            "vwap_state": "long_reclaim_confirmed",
+            "pocket_management_override": {
+                "time_exit_enabled": False,
+                "enable_4h_shrink_reduce": False,
+            },
+        },
+    )
+
+    opened = engine._open_position_from_decision(
+        symbol="BTCUSDT",
+        decision=decision,
+        analysis={"price": 100.0, "time": "2026-03-25 00:00:00"},
+    )
+
+    assert opened is True
+    assert engine.positions["BTCUSDT"]["signal_type_1h"] == "flip_bullish"
+    assert engine.positions["BTCUSDT"]["vwap_state"] == "long_reclaim_confirmed"
+    assert engine.positions["BTCUSDT"]["pocket_management_override"]["time_exit_enabled"] is False
+
+
+def test_current_positions_payload_includes_signal_labels_for_close_logic():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+
+    payload = engine._current_positions_payload(
+        {
+            "BTCUSDT": {
+                "side": "long",
+                "entry_price": 100.0,
+                "entry_notional": 500.0,
+                "signal_type_1h": "green_bar_growing",
+                "vwap_state": "short_retest_reject",
+                "pocket_management_override": {"enable_4h_shrink_reduce": False},
+            }
+        }
+    )
+
+    assert payload["BTCUSDT"]["signal_type_1h"] == "green_bar_growing"
+    assert payload["BTCUSDT"]["vwap_state"] == "short_retest_reject"
+    assert payload["BTCUSDT"]["pocket_management_override"]["enable_4h_shrink_reduce"] is False
+
+
+def test_build_account_summary_uses_config_max_leverage():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.capital = 10000.0
+    engine.positions = {}
+    engine._last_price_map = {}
+    engine.config = SimpleNamespace(
+        fixed_leverage=None,
+        default_leverage=20,
+        max_leverage=30,
+    )
+    engine._mark_to_market_equity = lambda _price_map: 10123.0
+
+    summary = engine._build_account_summary()
+
+    assert summary["equity"] == 10123.0
+    assert summary["available_balance"] == 10000.0
+    assert summary["max_leverage"] == 30.0
+
+
+def test_fill_pending_order_persists_pocket_management_override_into_position_store():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.positions = {}
+    engine.pending_orders = {}
+    engine.capital = 10000.0
+    engine.config = SimpleNamespace(fee_rate=0.0004)
+    engine.config.breakeven_trigger_pnl_ratio = 0.008
+    engine.config.breakeven_lock_ratio = 0.004
+    engine.symbol_timed_campaigns = {}
+    engine._cancel_pending_order = lambda *_args, **_kwargs: None
+
+    opened = engine._fill_pending_order(
+        "BTCUSDT",
+        {
+            "side": "long",
+            "margin": 1000.0,
+            "position_value": 1000.0,
+            "leverage": 3,
+            "stop_price": 98.0,
+            "take_profit": 104.0,
+            "take_profit_levels": [],
+            "signal_score": 0.91,
+            "signal_type_1h": "flip_bullish",
+            "vwap_score": 0.16,
+            "vwap_state": "long_reclaim_confirmed",
+            "vwap_location_score": 0.8,
+            "ema_multiplier": 1.0,
+            "ema_status": "strong",
+            "pocket_management_override": {"time_exit_enabled": False},
+        },
+        fill_price=100.0,
+        fill_time="2026-03-25 00:00:00",
+    )
+
+    assert opened is True
+    assert engine.positions["BTCUSDT"]["pocket_management_override"]["time_exit_enabled"] is False
+
+
+def test_open_position_from_decision_promotes_high_quality_candidate_to_min_open_floor():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.positions = {}
+    engine.pending_orders = {}
+    engine.capital = 10000.0
+    engine.config = SimpleNamespace(
+        fixed_leverage=None,
+        default_leverage=3,
+        min_leverage=2,
+        max_leverage=4,
+        max_symbol_position_portion=0.6,
+        min_open_portion=0.03,
+        reserve_pct=0.2,
+        fee_rate=0.0004,
+        entry_slippage=0.0015,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.02,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+        breakeven_trigger_pnl_ratio=0.008,
+        breakeven_lock_ratio=0.004,
+    )
+    engine.symbol_timed_campaigns = {}
+    engine._cancel_pending_order = lambda *_args, **_kwargs: None
+    engine._sync_position_tracking = lambda *_args, **_kwargs: None
+    engine._fill_pending_order = lambda symbol, order, fill_price, fill_time: engine.positions.setdefault(symbol, dict(order)) or True
+
+    decision = FundFlowDecision(
+        operation=Operation.SELL,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.025,
+        leverage=3,
+        min_price=100.0,
+        stop_loss_price=102.0,
+        take_profit_price=98.0,
+        metadata={
+            "signal_score": 0.86,
+            "signal_type_1h": "green_bar_growing",
+            "vwap_state": "short_retest_reject",
+            "entry_tier": "tier2",
+            "pocket_management_override": {
+                "promote_to_min_open": True,
+                "promote_to_min_open_min_signal_score": 0.82,
+            },
+        },
+    )
+
+    opened = engine._open_position_from_decision(
+        symbol="BTCUSDT",
+        decision=decision,
+        analysis={"price": 100.0, "time": "2026-03-25 00:00:00"},
+    )
+
+    assert opened is True
+    assert engine.positions["BTCUSDT"]["margin"] >= 10000.0 * (1 - 0.2) * 0.03 - 1e-9
+
+
+def test_open_position_from_decision_does_not_promote_tier3_candidate_to_min_open_floor():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.positions = {}
+    engine.pending_orders = {}
+    engine.capital = 10000.0
+    engine.config = SimpleNamespace(
+        fixed_leverage=None,
+        default_leverage=3,
+        min_leverage=2,
+        max_leverage=4,
+        max_symbol_position_portion=0.6,
+        min_open_portion=0.03,
+        reserve_pct=0.2,
+        fee_rate=0.0004,
+        entry_slippage=0.0015,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.02,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+        breakeven_trigger_pnl_ratio=0.008,
+        breakeven_lock_ratio=0.004,
+    )
+    engine.symbol_timed_campaigns = {}
+    engine._cancel_pending_order = lambda *_args, **_kwargs: None
+    engine._sync_position_tracking = lambda *_args, **_kwargs: None
+    engine._fill_pending_order = lambda symbol, order, fill_price, fill_time: engine.positions.setdefault(symbol, dict(order)) or True
+
+    decision = FundFlowDecision(
+        operation=Operation.SELL,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.025,
+        leverage=3,
+        min_price=100.0,
+        stop_loss_price=102.0,
+        take_profit_price=98.0,
+        metadata={
+            "signal_score": 0.91,
+            "signal_type_1h": "green_bar_growing",
+            "vwap_state": "short_retest_reject",
+            "entry_tier": "tier3",
+            "pocket_management_override": {
+                "promote_to_min_open": True,
+                "promote_to_min_open_min_signal_score": 0.82,
+            },
+        },
+    )
+
+    opened = engine._open_position_from_decision(
+        symbol="BTCUSDT",
+        decision=decision,
+        analysis={"price": 100.0, "time": "2026-03-25 00:00:00"},
+    )
+
+    assert opened is False
+    assert "BTCUSDT" not in engine.positions
+
+
 def test_ensure_candidate_ledger_row_records_decision_specific_tp1_plan():
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
     engine.candidate_ledger_rows = []
@@ -119,6 +377,65 @@ def test_ensure_candidate_ledger_row_records_decision_specific_tp1_plan():
     assert row["tp1_price"] == 101.2
     assert abs(row["tp1_pct"] - 0.012) < 1e-9
     assert row["tp1_reduce_pct"] == 0.15
+
+
+def test_ensure_candidate_ledger_row_records_state_machine_and_target_portion_diagnostics():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.candidate_ledger_rows = []
+    engine._candidate_ledger_index = {}
+    engine.config = SimpleNamespace(
+        default_take_profit_pct=0.04,
+        take_profit_pct_levels=[0.008, 0.012, 0.02],
+        take_profit_reduce_pct_levels=[0.25, 0.3, 0.2],
+    )
+
+    decision = FundFlowDecision(
+        operation=Operation.SELL,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.021,
+        leverage=3,
+        min_price=100.0,
+        stop_loss_price=102.0,
+        take_profit_price=98.0,
+        metadata={
+            "signal_type_1h": "red_bar_growing",
+            "signal_score": 0.58625,
+            "vwap_score": 0.0165,
+            "vwap_state": "short_under_structure_wait_reject",
+            "market_quadrant": "III",
+            "macd_home_side": "short",
+            "boll_value_zone": "weak",
+            "boll_position_score": 0.2,
+            "vwap_execution_state": "premium_reject_ok",
+            "entry_tier": "blocked",
+            "session_risk": {"position_scale": 0.55},
+            "symbol_risk": {"effective_session_scale": 0.33},
+            "vwap_structure_scale": {"position_scale": 1.0},
+            "pocket_management_override": {"position_scale": 1.0, "max_target_portion": 0.15},
+        },
+    )
+    item = {
+        "symbol": "BTCUSDT",
+        "analysis": {"price": 100.0, "time": "2026-03-25 00:00:00"},
+        "decision": decision,
+        "score": 0.58625,
+        "max_active_symbols": 5,
+    }
+
+    row = engine._ensure_candidate_ledger_row(item)
+
+    assert row["entry_tier"] == "blocked"
+    assert row["market_quadrant"] == "III"
+    assert row["macd_home_side"] == "short"
+    assert row["boll_value_zone"] == "weak"
+    assert row["boll_position_score"] == 0.2
+    assert row["vwap_execution_state"] == "premium_reject_ok"
+    assert row["decision_target_portion"] == 0.021
+    assert row["session_position_scale"] == 0.55
+    assert row["effective_session_scale"] == 0.33
+    assert row["vwap_structure_position_scale"] == 1.0
+    assert row["pocket_position_scale"] == 1.0
+    assert row["pocket_max_target_portion"] == 0.15
 
 
 def test_close_position_bot_like_uses_exit_price_override_and_trade_updates():
@@ -494,6 +811,54 @@ def test_open_position_from_decision_records_required_margin_reject_reason():
     assert engine._last_open_reject_reason == "required_margin_too_small"
 
 
+def test_open_position_from_decision_rejects_blocked_entry_tier_before_min_open():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.positions = {}
+    engine.pending_orders = {}
+    engine.capital = 10000.0
+    engine.dynamic_leverage_enabled = False
+    engine.dynamic_leverage_cfg = {}
+    engine.config = SimpleNamespace(
+        fixed_leverage=None,
+        default_leverage=5,
+        min_leverage=0,
+        max_leverage=5,
+        max_symbol_position_portion=0.6,
+        min_open_portion=0.03,
+        reserve_pct=0.2,
+        fee_rate=0.0004,
+        entry_slippage=0.0015,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.02,
+        take_profit_pct_levels=[],
+        take_profit_reduce_pct_levels=[],
+    )
+
+    decision = FundFlowDecision(
+        operation=Operation.BUY,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.02,
+        leverage=5,
+        max_price=100.0,
+        stop_loss_price=98.0,
+        take_profit_price=104.0,
+        metadata={
+            "entry_tier": "blocked",
+            "signal_type_1h": "green_bar_growing",
+            "vwap_state": "long_above_structure_wait_reclaim",
+        },
+    )
+
+    opened = engine._open_position_from_decision(
+        symbol="BTCUSDT",
+        decision=decision,
+        analysis={"price": 100.0, "time": "2026-03-25 00:00:00"},
+    )
+
+    assert opened is False
+    assert engine._last_open_reject_reason == "entry_tier_blocked"
+
+
 def test_build_analysis_with_status_reports_15m_warmup_block():
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
     data = {
@@ -737,6 +1102,61 @@ def test_apply_candidate_pre_filter_blocks_low_quality_candidate():
     assert "PRE_AI_SCORE" in engine.candidate_ledger_rows[0]["pre_filter_reason"]
 
 
+def test_apply_candidate_pre_filter_blocks_render_and_hype_short_retest_reject_combos():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.candidate_pre_filter_enabled = True
+    engine.candidate_pre_filter_cfg = {
+        "candidate_filter_reject_combos": [
+            {
+                "symbol": "HYPEUSDT",
+                "signal_type": "green_bar_growing",
+                "vwap_state": "short_retest_reject",
+                "min_signal_score": 0.0,
+                "min_vwap_score": 0.0,
+                "reason_label": "HYPE_SRR_HARD_BLOCK",
+            },
+            {
+                "symbol": "RENDERUSDT",
+                "signal_type": "green_bar_growing",
+                "vwap_state": "short_retest_reject",
+                "min_signal_score": 0.0,
+                "min_vwap_score": 0.0,
+                "reason_label": "RENDER_SRR_HARD_BLOCK",
+            },
+        ]
+    }
+    engine.signal_funnel = None
+
+    def make_candidate(symbol: str) -> dict:
+        decision = FundFlowDecision(
+            operation=Operation.SELL,
+            symbol=symbol,
+            reason="sell",
+            metadata={
+                "signal_type_1h": "green_bar_growing",
+                "vwap_state": "short_retest_reject",
+                "signal_score": 0.91,
+                "vwap_score": 0.14,
+                "is_trial_entry": False,
+            },
+        )
+        return {
+            "symbol": symbol,
+            "decision": decision,
+            "analysis": {"time": "2026-04-01 06:15:00"},
+            "score": 1.0,
+        }
+
+    result = engine._apply_candidate_pre_filter(
+        [make_candidate("HYPEUSDT"), make_candidate("RENDERUSDT")]
+    )
+
+    assert result == []
+    reasons = {row["symbol"]: row["pre_filter_reason"] for row in engine.candidate_ledger_rows}
+    assert "PRE_AI_REJECT_COMBO:HYPE_SRR_HARD_BLOCK" in reasons["HYPEUSDT"]
+    assert "PRE_AI_REJECT_COMBO:RENDER_SRR_HARD_BLOCK" in reasons["RENDERUSDT"]
+
+
 def test_candidate_filter_payload_includes_symbol_for_symbol_specific_rules():
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
     engine._safe_float = lambda value, default=0.0: BotLikeReplayEngine._safe_float(value, default)
@@ -866,3 +1286,95 @@ def test_enforce_ai_final_review_logs_skipped_topn_candidates():
     assert ledger["AAAUSDT"]["ai_allowed"] is True
     assert ledger["BBBUSDT"]["ai_shortlisted"] is False
     assert ledger["BBBUSDT"]["ai_block_reason"] == "ai_shortlist_topn"
+
+
+def test_enforce_ai_final_review_preserves_actual_score_instead_of_flooring_to_one():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.ai_flat_top_n = 1
+    engine.ai_advice_logs = []
+    engine.ai_review_cfg = {}
+    engine.bot_logic = SimpleNamespace(
+        _ai_entry_guard=lambda **kwargs: (True, ""),
+        _decision_signal_score=lambda decision, flow_context: 0.42,
+    )
+    engine.decision_engine = SimpleNamespace(
+        decide=lambda **kwargs: FundFlowDecision(
+            operation=Operation.BUY,
+            symbol=kwargs["symbol"],
+            reason="buy",
+            metadata={"ds_source": "-", "ds_confidence": 0.0},
+        )
+    )
+    engine._build_portfolio = lambda: {"positions": {}}
+    engine._decision_metadata = lambda decision: decision.metadata if isinstance(decision.metadata, dict) else {}
+    engine._safe_float = lambda value, default=0.0: BotLikeReplayEngine._safe_float(value, default)
+    engine.signal_funnel = None
+
+    item = {
+        "symbol": "AAAUSDT",
+        "decision": FundFlowDecision(
+            operation=Operation.BUY,
+            symbol="AAAUSDT",
+            reason="buy",
+            metadata={"signal_type_1h": "green_bar_growing", "vwap_state": "short_retest_reject"},
+        ),
+        "analysis": {"time": "2026-04-01 00:00:00", "price": 100.0, "flow_context": {}},
+        "score": 0.42,
+        "signal_type_1h": "green_bar_growing",
+        "candidate_pre_filter": {"passed": True, "reason": "PRE_AI_PASS"},
+    }
+
+    approved = engine._enforce_ai_final_review([item])
+
+    assert len(approved) == 1
+    assert approved[0]["score"] == 0.42
+
+
+def test_enforce_ai_final_review_preserves_original_pocket_metadata():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.ai_flat_top_n = 1
+    engine.ai_advice_logs = []
+    engine.ai_review_cfg = {}
+    engine.bot_logic = SimpleNamespace(
+        _ai_entry_guard=lambda **kwargs: (True, ""),
+        _decision_signal_score=lambda decision, flow_context: 0.91,
+    )
+    engine.decision_engine = SimpleNamespace(
+        decide=lambda **kwargs: FundFlowDecision(
+            operation=Operation.BUY,
+            symbol=kwargs["symbol"],
+            reason="buy",
+            metadata={"ds_source": "ai_weight_router", "ds_confidence": 0.82},
+        )
+    )
+    engine._build_portfolio = lambda: {"positions": {}}
+    engine._decision_metadata = lambda decision: decision.metadata if isinstance(decision.metadata, dict) else {}
+    engine._safe_float = lambda value, default=0.0: BotLikeReplayEngine._safe_float(value, default)
+    engine.signal_funnel = None
+
+    item = {
+        "symbol": "AAAUSDT",
+        "decision": FundFlowDecision(
+            operation=Operation.BUY,
+            symbol="AAAUSDT",
+            reason="buy",
+            metadata={
+                "signal_type_1h": "flip_bullish",
+                "vwap_state": "long_reclaim_confirmed",
+                "pocket_management_override": {"time_exit_enabled": False},
+                "signal_score": 0.91,
+            },
+        ),
+        "analysis": {"time": "2026-04-01 00:00:00", "price": 100.0, "flow_context": {}},
+        "score": 0.91,
+        "signal_type_1h": "flip_bullish",
+        "candidate_pre_filter": {"passed": True, "reason": "PRE_AI_PASS"},
+    }
+
+    approved = engine._enforce_ai_final_review([item])
+
+    assert len(approved) == 1
+    md = approved[0]["decision"].metadata
+    assert md["signal_type_1h"] == "flip_bullish"
+    assert md["vwap_state"] == "long_reclaim_confirmed"
+    assert md["pocket_management_override"]["time_exit_enabled"] is False

@@ -659,6 +659,7 @@ class FundFlowDecisionEngine:
                 flip_bullish_min_signal_score=self._to_float(thresholds_cfg.get("flip_bullish"), default_signal_threshold),
                 enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
                 disable_flip_bullish_entries=bool(filter_cfg.get("disable_flip_bullish_entries", False)),
+                disable_flip_bearish_entries=bool(filter_cfg.get("disable_flip_bearish_entries", False)),
                 disable_flip_bullish_trial_entries=bool(filter_cfg.get("disable_flip_bullish_trial_entries", False)),
                 flip_bullish_min_vwap_score=self._to_float(filter_cfg.get("flip_bullish_min_vwap_score"), 0.12),
                 flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
@@ -719,6 +720,7 @@ class FundFlowDecisionEngine:
                     if str(x).strip() and "|" in str(x)
                 ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
                 disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
+                disable_green_bar_growing_short_entries=bool(filter_cfg.get("disable_green_bar_growing_short_entries", False)),
                 disable_green_bar_shrinking_entries=bool(filter_cfg.get("disable_green_bar_shrinking_entries", False)),
                 require_macd_home_advantage=bool(filter_cfg.get("require_macd_home_advantage", False)),
                 vwap_execution_penalty_only=bool(filter_cfg.get("vwap_execution_penalty_only", False)),
@@ -916,20 +918,17 @@ class FundFlowDecisionEngine:
                 short_filter_max_oi_delta_ratio=self._to_float(v2_cfg.get("short_quality_filter", {}).get("max_oi_delta_ratio"), 0.0),
                 short_filter_min_vwap_deviation=self._to_float(v2_cfg.get("short_quality_filter", {}).get("min_vwap_deviation"), 0.005),
             )
-            if (
-                self.pure_strategy_runtime_enabled
-                and self.pure_strategy_runtime_bypasses.get("use_backtest_macd_v2_config", False)
-            ):
-                backtest_cfg = (
-                    self.config.get("fund_flow", {}).get("backtest", {})
-                    if isinstance(self.config.get("fund_flow", {}).get("backtest"), dict)
-                    else {}
-                )
-                disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
-                self.macd_v2_config = build_macd_v2_config_from_runtime(
-                    self.config,
-                    disable_cvd_decision_logic=disable_cvd_decision_logic,
-                )
+            # 始终用 build_macd_v2_config_from_runtime 确保所有字段正确（含 enable_dual_suite, flip_bearish_resonance_guards 等）
+            backtest_cfg = (
+                self.config.get("fund_flow", {}).get("backtest", {})
+                if isinstance(self.config.get("fund_flow", {}).get("backtest"), dict)
+                else {}
+            )
+            disable_cvd_decision_logic = bool(backtest_cfg.get("disable_cvd_decision_logic", True))
+            self.macd_v2_config = build_macd_v2_config_from_runtime(
+                self.config,
+                disable_cvd_decision_logic=disable_cvd_decision_logic,
+            )
             self.macd_v2_engine = MACDStrategyV2Engine(self.macd_v2_config)
             regime_state_cfg = v2_cfg.get("regime_state_machine", {}) if isinstance(v2_cfg.get("regime_state_machine"), dict) else {}
             self.macd_4h_regime_state_cfg = {
@@ -3153,6 +3152,210 @@ class FundFlowDecisionEngine:
             )
         return max(self.min_leverage, min(self.max_leverage, resolved))
 
+    def _apply_resonance_leverage_adjustment(
+        self,
+        *,
+        leverage: int,
+        signal: Any,
+        symbol: str,
+    ) -> int:
+        """
+        基于共振分数的动态杠杆调整
+        
+        Args:
+            leverage: 基础杠杆
+            signal: 信号对象
+            symbol: 交易对
+            
+        Returns:
+            调整后的杠杆
+        """
+        # 获取三共振配置
+        resonance_cfg = (
+            self.config
+            .get("fund_flow", {})
+            .get("macd_mtf_strategy_v2", {})
+            .get("resonance_scoring", {})
+        )
+        
+        if not resonance_cfg.get("enabled", False):
+            return leverage
+        
+        # 获取共振分数
+        signal_details = signal.details if isinstance(signal.details, dict) else {}
+        resonance_score = self._to_float(signal_details.get("resonance_score"), 0.0)
+        
+        if resonance_score <= 0:
+            return leverage
+        
+        # 动态杠杆分层
+        leverage_tiers = resonance_cfg.get("dynamic_leverage", {}).get("leverage_tiers", [])
+        if not leverage_tiers:
+            return leverage
+        
+        # 根据共振分数匹配杠杆层级
+        adjusted_leverage = leverage
+        for tier in leverage_tiers:
+            score_min = self._to_float(tier.get("resonance_score_min"), 0.0)
+            score_max = self._to_float(tier.get("resonance_score_max"), 1.0)
+            
+            if score_min <= resonance_score < score_max:
+                base_leverage = int(tier.get("base_leverage", leverage))
+                # 应用BOLL区域杠杆调整
+                boll_zone = signal_details.get("boll_zone", 0)
+                boll_leverage_cfg = resonance_cfg.get("dynamic_leverage", {}).get("boll_zone_leverage_adjustment", {})
+                
+                if boll_zone == 1:  # zone_1 (上轨或下轨附近)
+                    zone_key = "zone_1_upper" if signal.direction == "long" else "zone_1_lower"
+                    leverage_mult = self._to_float(boll_leverage_cfg.get(zone_key, {}).get("leverage_mult"), 1.0)
+                    adjusted_leverage = int(base_leverage * leverage_mult)
+                elif boll_zone == 2:  # zone_2 (极端位置)
+                    zone_key = "zone_2_upper_extreme" if signal.direction == "long" else "zone_2_lower_extreme"
+                    leverage_mult = self._to_float(boll_leverage_cfg.get(zone_key, {}).get("leverage_mult"), 1.0)
+                    adjusted_leverage = int(base_leverage * leverage_mult)
+                else:
+                    adjusted_leverage = base_leverage
+                break
+        
+        return max(self.min_leverage, min(self.max_leverage, adjusted_leverage))
+
+    def _apply_boll_position_adjustment(
+        self,
+        *,
+        portion: float,
+        signal: Any,
+        symbol: str,
+    ) -> float:
+        """
+        基于BOLL带宽状态的仓位调整
+        
+        Args:
+            portion: 基础仓位比例
+            signal: 信号对象
+            symbol: 交易对
+            
+        Returns:
+            仓位乘数
+        """
+        # 获取BOLL仓位调整配置
+        boll_cfg = (
+            self.config
+            .get("fund_flow", {})
+            .get("macd_mtf_strategy_v2", {})
+            .get("boll_position_adjustment", {})
+        )
+        
+        if not boll_cfg.get("enabled", False):
+            return 1.0
+        
+        # 从信号详情中获取BOLL状态
+        signal_details = signal.details if isinstance(signal.details, dict) else {}
+        boll_bw_state = signal_details.get("boll_bw_state", "normal")
+        boll_zone = signal_details.get("boll_zone", 0)
+        
+        # 带宽状态调整
+        bandwidth_states = boll_cfg.get("bandwidth_states", {})
+        position_mult = 1.0
+        
+        if boll_bw_state == "squeezed":
+            position_mult = self._to_float(bandwidth_states.get("squeezed", {}).get("position_scale"), 0.6)
+        elif boll_bw_state == "expanding":
+            position_mult = self._to_float(bandwidth_states.get("expanding", {}).get("position_scale"), 1.15)
+        else:
+            position_mult = self._to_float(bandwidth_states.get("normal", {}).get("position_scale"), 1.0)
+        
+        # 价格区域调整
+        zone_adjustments = boll_cfg.get("position_zone_adjustments", {})
+        direction = signal.direction if hasattr(signal, 'direction') else 'neutral'
+        
+        # 根据方向和BOLL区域应用调整
+        if direction == "long" and boll_zone == 2:  # 做多但价格已在上轨之上
+            zone_adj = zone_adjustments.get("long_above_upper", {})
+            if zone_adj:
+                position_mult *= self._to_float(zone_adj.get("position_scale"), 0.75)
+        elif direction == "short" and boll_zone == 2:  # 做空但价格已在下轨之下
+            zone_adj = zone_adjustments.get("short_below_lower", {})
+            if zone_adj:
+                position_mult *= self._to_float(zone_adj.get("position_scale"), 0.75)
+        elif direction == "long" and boll_zone == 1:  # 做多且价格从下轨回收
+            zone_adj = zone_adjustments.get("long_near_lower_reclaim", {})
+            if zone_adj:
+                position_mult *= self._to_float(zone_adj.get("position_scale"), 1.1)
+        elif direction == "short" and boll_zone == 1:  # 做空且价格从上轨回落
+            zone_adj = zone_adjustments.get("short_near_upper_reject", {})
+            if zone_adj:
+                position_mult *= self._to_float(zone_adj.get("position_scale"), 1.1)
+        
+        return position_mult
+
+    def _check_rsi_hard_block(
+        self,
+        *,
+        direction: str,
+        signal: Any,
+        symbol: str,
+    ) -> Tuple[bool, str]:
+        """
+        RSI极端区域硬性拦截
+        
+        Args:
+            direction: 交易方向 (long/short)
+            signal: 信号对象
+            symbol: 交易对
+            
+        Returns:
+            (是否拦截, 拦截原因)
+        """
+        # 获取RSI硬性拦截配置
+        rsi_block_cfg = (
+            self.config
+            .get("fund_flow", {})
+            .get("macd_mtf_strategy_v2", {})
+            .get("rsi_hard_block", {})
+        )
+        
+        if not rsi_block_cfg.get("enabled", False):
+            return False, ""
+        
+        # 从信号详情中获取RSI数据
+        signal_details = signal.details if isinstance(signal.details, dict) else {}
+        signal_type_1h = str(getattr(signal, "signal_type_1h", ""))
+        
+        # 检查是否为flip信号族(豁免硬性拦截)
+        exemptions = rsi_block_cfg.get("exemptions", {})
+        if exemptions.get("flip_family_exempt", False) and "flip" in signal_type_1h.lower():
+            return False, ""
+        
+        # 获取RSI值
+        rsi_4h = self._to_float(signal_details.get("rsi_4h"), 50.0)
+        rsi_1h = self._to_float(signal_details.get("rsi_1h"), 50.0)
+        
+        # 检查做多拦截
+        if direction == "long":
+            long_blocks = rsi_block_cfg.get("long_entry_blocks", {})
+            
+            rsi_4h_overbought = self._to_float(long_blocks.get("rsi_4h_overbought", {}).get("threshold"), 75)
+            if rsi_4h > rsi_4h_overbought:
+                return True, f"rsi_4h_overbought_{rsi_4h:.1f}>_{rsi_4h_overbought}"
+            
+            rsi_1h_extreme = self._to_float(long_blocks.get("rsi_1h_extreme_overbought", {}).get("threshold"), 80)
+            if rsi_1h > rsi_1h_extreme:
+                return True, f"rsi_1h_extreme_overbought_{rsi_1h:.1f}>_{rsi_1h_extreme}"
+        
+        # 检查做空拦截
+        elif direction == "short":
+            short_blocks = rsi_block_cfg.get("short_entry_blocks", {})
+            
+            rsi_4h_oversold = self._to_float(short_blocks.get("rsi_4h_oversold", {}).get("threshold"), 25)
+            if rsi_4h < rsi_4h_oversold:
+                return True, f"rsi_4h_oversold_{rsi_4h:.1f}<_{rsi_4h_oversold}"
+            
+            rsi_1h_extreme = self._to_float(short_blocks.get("rsi_1h_extreme_oversold", {}).get("threshold"), 20)
+            if rsi_1h < rsi_1h_extreme:
+                return True, f"rsi_1h_extreme_oversold_{rsi_1h:.1f}<_{rsi_1h_extreme}"
+        
+        return False, ""
+
     def _build_tp_levels_from_override(
         self,
         *,
@@ -4629,9 +4832,51 @@ class FundFlowDecisionEngine:
             atr_1h=atr_1h,
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
+            rsi_val=self._to_float(tf_1h.get("rsi"), 50.0),
+            rsi_4h=self._to_float(tf_4h.get("rsi"), 50.0),
+            rsi_15m=self._to_float(tf_15m.get("rsi"), 50.0),
         )
         
+        # 三共振增强 (MACD + BOLL + RSI) — 替代 VWAP 的核心增强
+        if signal.direction in ("long", "short") and hasattr(macd_v2_engine, 'analyze_with_resonance'):
+            market_regime_for_resonance = metadata.get("market_regime", "TRENDING_BEAR") if 'metadata' in dir() else "TRENDING_BEAR"
+            # 从现有市场数据推断 regime
+            if hasattr(self, '_build_macd_v2_4h_regime_state'):
+                try:
+                    regime_state = self._build_macd_v2_4h_regime_state(
+                        signal=signal,
+                        tf_1h=tf_1h,
+                        tf_4h=tf_4h,
+                    )
+                    if regime_state:
+                        market_regime_for_resonance = regime_state
+                except Exception as e:
+                    logger.warning(f"[{symbol}] 构建regime状态失败: {e}")
+            
+            try:
+                signal = macd_v2_engine.analyze_with_resonance(
+                    signal=signal,
+                    market_regime=market_regime_for_resonance,
+                )
+            except Exception as e:
+                logger.warning(f"[{symbol}] 三共振增强失败，使用原始信号: {e}")
+        
         signal_debug_details = signal.details if isinstance(signal.details, dict) else {}
+
+        # 信号诊断日志（P0 调试必须，后续可降级为 DEBUG）
+        signal_type_log = getattr(signal, 'signal_type_1h', None) or "unknown"
+        direction_log = getattr(signal, 'direction', None) or "neutral"
+        score_log = getattr(signal, 'signal_score', 0) or 0
+        _veto_reason = getattr(signal, 'veto_reason', '')
+        reason_log = _veto_reason or (signal_debug_details.get("reason") if isinstance(signal_debug_details, dict) else None) or "N/A"
+        resonance_log = signal_debug_details.get("resonance_score")
+        boll_zone_log = signal_debug_details.get("boll_zone")
+        logger.info(
+            f"[{symbol}] MACD_V2: dir={direction_log}, signal={signal_type_log}, "
+            f"score={score_log:.3f}, resonance={resonance_log}, "
+            f"boll_zone={boll_zone_log}, reason={reason_log}"
+        )
+
         # 构建元数据
         metadata = {
             "strategy_mode": "macd_mtf_strategy_v2",
@@ -4646,6 +4891,17 @@ class FundFlowDecisionEngine:
             "vwap_deviation": signal.vwap_deviation,
             "vwap_state": signal.vwap_state,
             "vwap_location_score": signal.vwap_location_score,
+            # 三共振元数据 (新增, 替代 VWAP)
+            "resonance_score": signal_debug_details.get("resonance_score"),
+            "boll_zone": signal_debug_details.get("boll_zone"),
+            "boll_bw_state": signal_debug_details.get("boll_bw_state"),
+            "boll_structure_score": signal_debug_details.get("boll_structure_score"),
+            "boll_bandwidth_position_mult": signal_debug_details.get("boll_bandwidth_position_mult"),
+            "rsi_momentum_score": signal_debug_details.get("rsi_momentum_score"),
+            "rsi_divergence_type": signal_debug_details.get("rsi_divergence_type"),
+            "rsi_extreme_status": signal_debug_details.get("rsi_extreme_status"),
+            "resonance_leverage": signal_debug_details.get("resonance_leverage"),
+            "resonance_position_mult": signal_debug_details.get("resonance_position_mult"),
             "stable_continuation_active": bool(signal_debug_details.get("stable_continuation_active", False)),
             "stable_continuation_side": signal_debug_details.get("stable_continuation_side"),
             "stable_continuation_reason": signal_debug_details.get("stable_continuation_reason"),
@@ -5001,6 +5257,24 @@ class FundFlowDecisionEngine:
                         metadata=metadata,
                     )
             
+            # RSI硬性拦截检查 (新增)
+            rsi_blocked, rsi_block_reason = self._check_rsi_hard_block(
+                direction="long",
+                signal=signal,
+                symbol=symbol,
+            )
+            if rsi_blocked:
+                metadata["rsi_hard_block"] = {
+                    "blocked": True,
+                    "reason": rsi_block_reason,
+                }
+                return FundFlowDecision(
+                    operation=Operation.HOLD,
+                    symbol=symbol,
+                    reason=f"rsi_hard_block:{rsi_block_reason}",
+                    metadata=metadata,
+                )
+            
             # 开多仓
             pocket_management_override = self._resolve_pocket_management_override(
                 signal_type_1h=str(signal.signal_type_1h or ""),
@@ -5020,6 +5294,18 @@ class FundFlowDecisionEngine:
                 macd_v2_engine=macd_v2_engine,
                 symbol=symbol,
             )
+            # 三共振动态杠杆调整 (新增)
+            resonance_leverage_adj = self._apply_resonance_leverage_adjustment(
+                leverage=leverage,
+                signal=signal,
+                symbol=symbol,
+            )
+            if resonance_leverage_adj != leverage:
+                metadata["resonance_leverage_adjusted"] = {
+                    "original": leverage,
+                    "adjusted": resonance_leverage_adj,
+                }
+                leverage = resonance_leverage_adj
             session_position_scale = macd_v2_engine.resolve_session_position_scale(
                 current_time,
                 signal.signal_type_1h,
@@ -5227,6 +5513,24 @@ class FundFlowDecisionEngine:
                         reason=_pocket_reason,
                         metadata=metadata,
                     )
+            
+            # RSI硬性拦截检查 (新增)
+            rsi_blocked, rsi_block_reason = self._check_rsi_hard_block(
+                direction="short",
+                signal=signal,
+                symbol=symbol,
+            )
+            if rsi_blocked:
+                metadata["rsi_hard_block"] = {
+                    "blocked": True,
+                    "reason": rsi_block_reason,
+                }
+                return FundFlowDecision(
+                    operation=Operation.HOLD,
+                    symbol=symbol,
+                    reason=f"rsi_hard_block:{rsi_block_reason}",
+                    metadata=metadata,
+                )
             
             # 开空仓
             pocket_management_override = self._resolve_pocket_management_override(

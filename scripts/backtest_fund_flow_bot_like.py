@@ -64,6 +64,29 @@ class BotLikeReplayEngine(BacktestEngine):
     MIN_15M_WARMUP_BARS = 50
     MIN_HIGHER_TF_INDEX = 5
 
+    @staticmethod
+    def pick_open_candidates(candidates: List[Dict[str, Any]], active_count: int) -> List[Dict[str, Any]]:
+        selected: List[Dict[str, Any]] = []
+        current_active = int(active_count)
+        group_counts: Dict[str, int] = {}
+        for item in sorted(
+            candidates,
+            key=lambda row: float(row.get("_priority_score", row.get("score", 0.0)) or 0.0),
+            reverse=True,
+        ):
+            cap = max(1, int(float(item.get("max_active_symbols", 1) or 1)))
+            if current_active >= cap:
+                continue
+            group_key = str(item.get("_capacity_group_key", "") or "")
+            group_cap = max(0, int(float(item.get("_capacity_group_cap", 0) or 0)))
+            if group_key and group_cap > 0 and group_counts.get(group_key, 0) >= group_cap:
+                continue
+            selected.append(item)
+            current_active += 1
+            if group_key and group_cap > 0:
+                group_counts[group_key] = group_counts.get(group_key, 0) + 1
+        return selected
+
     def _decision_timeframe(self) -> str:
         config = getattr(self, "config", None)
         tf = str(getattr(config, "decision_timeframe", "") or "15m").strip().lower()
@@ -204,8 +227,39 @@ class BotLikeReplayEngine(BacktestEngine):
                 "side": "LONG" if side == "long" else "SHORT",
                 "amount": float(pos.get("entry_notional", 0.0)),
                 "entry_price": float(pos.get("entry_price", 0.0)),
+                "signal_type_1h": str(pos.get("signal_type_1h", "") or ""),
+                "vwap_state": str(pos.get("vwap_state", "") or ""),
+                "entry_tier": str(pos.get("entry_tier", "") or ""),
+                "signal_score": float(pos.get("signal_score", 0.0) or 0.0),
+                "pocket_management_override": dict(pos.get("pocket_management_override", {}))
+                if isinstance(pos.get("pocket_management_override"), dict)
+                else {},
             }
         return payload
+
+    def _current_active_positions_snapshot(self, analyses: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for symbol, pos in self.positions.items():
+            if not isinstance(pos, dict):
+                continue
+            current_price = self._safe_float(
+                analyses.get(symbol, {}).get("price"),
+                self._safe_float(self._last_price_map.get(symbol), self._safe_float(pos.get("entry_price"), 0.0)),
+            )
+            entry_price = self._safe_float(pos.get("entry_price"), 0.0)
+            if current_price > 0 and entry_price > 0:
+                if str(pos.get("side", "")).lower() == "long":
+                    pnl_ratio = (current_price - entry_price) / entry_price
+                else:
+                    pnl_ratio = (entry_price - current_price) / entry_price
+            else:
+                pnl_ratio = 0.0
+            snapshot[str(symbol).upper()] = {
+                "entry_tier": str(pos.get("entry_tier", "") or ""),
+                "signal_score": self._safe_float(pos.get("signal_score"), 0.0),
+                "unrealized_pnl_ratio": float(pnl_ratio),
+            }
+        return snapshot
 
     @staticmethod
     def _upper_wick_ratio_from_row(row: pd.Series) -> float:
@@ -360,7 +414,12 @@ class BotLikeReplayEngine(BacktestEngine):
         }
 
     def _build_account_summary(self) -> Dict[str, Any]:
-        max_leverage = float(self.config.fixed_leverage or self.config.default_leverage or 1)
+        max_leverage = float(
+            self.config.fixed_leverage
+            or getattr(self.config, "max_leverage", None)
+            or self.config.default_leverage
+            or 1
+        )
         return {
             "equity": float(self._mark_to_market_equity(self._last_price_map)),
             "available_balance": float(self.capital),
@@ -727,6 +786,46 @@ class BotLikeReplayEngine(BacktestEngine):
             "signal_score": self._safe_float(metadata.get("signal_score"), 0.0),
             "vwap_score": self._safe_float(metadata.get("vwap_score"), 0.0),
             "vwap_state": str(metadata.get("vwap_state", "") or ""),
+            "entry_tier": str(metadata.get("entry_tier", "") or ""),
+            "market_quadrant": str(metadata.get("market_quadrant", "") or ""),
+            "macd_home_side": str(metadata.get("macd_home_side", "") or ""),
+            "boll_value_zone": str(metadata.get("boll_value_zone", "") or ""),
+            "boll_position_score": self._safe_float(metadata.get("boll_position_score"), 0.0),
+            "vwap_execution_state": str(metadata.get("vwap_execution_state", "") or ""),
+            "decision_target_portion": self._safe_float(
+                getattr(decision, "target_portion_of_balance", 0.0),
+                0.0,
+            ),
+            "session_position_scale": self._safe_float(
+                (metadata.get("session_risk") or {}).get("position_scale")
+                if isinstance(metadata.get("session_risk"), dict)
+                else None,
+                1.0,
+            ),
+            "effective_session_scale": self._safe_float(
+                (metadata.get("symbol_risk") or {}).get("effective_session_scale")
+                if isinstance(metadata.get("symbol_risk"), dict)
+                else None,
+                1.0,
+            ),
+            "vwap_structure_position_scale": self._safe_float(
+                (metadata.get("vwap_structure_scale") or {}).get("position_scale")
+                if isinstance(metadata.get("vwap_structure_scale"), dict)
+                else None,
+                1.0,
+            ),
+            "pocket_position_scale": self._safe_float(
+                (metadata.get("pocket_management_override") or {}).get("position_scale")
+                if isinstance(metadata.get("pocket_management_override"), dict)
+                else None,
+                1.0,
+            ),
+            "pocket_max_target_portion": self._safe_float(
+                (metadata.get("pocket_management_override") or {}).get("max_target_portion")
+                if isinstance(metadata.get("pocket_management_override"), dict)
+                else None,
+                0.0,
+            ),
             "direction_lock": str(metadata.get("direction_lock", "") or ""),
             "is_trial_entry": bool(metadata.get("is_trial_entry", False)),
             "max_active_symbols": int(item.get("max_active_symbols", 0) or 0),
@@ -756,6 +855,8 @@ class BotLikeReplayEngine(BacktestEngine):
             "ai_ds_source": "",
             "ai_ds_confidence": 0.0,
             "capacity_selected": False,
+            "capacity_replacement_candidate": False,
+            "capacity_replacement_target": "",
             "capacity_block_reason": "",
             "final_opened": False,
             "final_reject_reason": "",
@@ -956,7 +1057,7 @@ class BotLikeReplayEngine(BacktestEngine):
         if not open_candidates:
             return []
 
-        shortlisted = sorted(open_candidates, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        shortlisted = sorted(open_candidates, key=self._priority_score, reverse=True)
         skipped = shortlisted[self.ai_flat_top_n :]
         shortlisted = shortlisted[: self.ai_flat_top_n]
         if skipped:
@@ -995,7 +1096,7 @@ class BotLikeReplayEngine(BacktestEngine):
             symbol = str(item["symbol"])
             analysis = item["analysis"]
             decision = item["decision"]
-            local_score = float(item["score"])
+            local_score = self._priority_score(item)
             current_price = float(analysis["price"])
             flow_context = analysis["flow_context"]
             ai_trigger_context = {
@@ -1077,11 +1178,14 @@ class BotLikeReplayEngine(BacktestEngine):
                 )
                 continue
 
-            exec_md = ai_md if isinstance(ai_md, dict) else {}
+            original_md = self._decision_metadata(decision)
+            exec_md = dict(original_md)
+            if isinstance(ai_md, dict):
+                exec_md.update(ai_md)
             exec_md["ai_final_review"] = review_log
             ai_decision.metadata = exec_md
             item["decision"] = ai_decision
-            item["score"] = max(1.0, float(self.bot_logic._decision_signal_score(ai_decision, flow_context)))
+            item["score"] = float(self._decision_signal_score(ai_decision) or self.bot_logic._decision_signal_score(ai_decision, flow_context))
             approved.append(item)
         self._log_ai_review_funnel(shortlisted=shortlisted, approved=approved, skipped=skipped)
         return approved
@@ -1509,12 +1613,50 @@ class BotLikeReplayEngine(BacktestEngine):
             "take_profit_price": float(take_profit),
         }
 
+    def _priority_score(self, item: Dict[str, Any]) -> float:
+        if hasattr(self.bot_logic, "_candidate_priority_score"):
+            try:
+                return float(self.bot_logic._candidate_priority_score(item, self.ai_review_cfg))
+            except Exception:
+                pass
+        return float(item.get("score", 0.0) or 0.0)
+
+    def _capacity_group_cap(self, item: Dict[str, Any]) -> Tuple[str, int]:
+        if hasattr(self.bot_logic, "_capacity_group_cap"):
+            try:
+                return self.bot_logic._capacity_group_cap(item, self.ai_review_cfg)
+            except Exception:
+                pass
+        return "", 0
+
+    def _apply_min_open_floor_override(
+        self,
+        *,
+        decision: FundFlowDecision,
+        target_portion: float,
+    ) -> float:
+        md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+        override = md.get("pocket_management_override") if isinstance(md.get("pocket_management_override"), dict) else {}
+        if not override or not bool(override.get("promote_to_min_open", False)):
+            return target_portion
+        entry_tier = str(md.get("entry_tier") or "").strip().lower()
+        if entry_tier not in {"tier1", "tier2"}:
+            return target_portion
+        min_score = self._safe_float(override.get("promote_to_min_open_min_signal_score"), 0.0)
+        signal_score = self._safe_float(md.get("signal_score"), 0.0)
+        if signal_score < min_score:
+            return target_portion
+        return max(target_portion, float(self.config.min_open_portion))
+
     def _open_position_from_decision(self, symbol: str, decision: FundFlowDecision, analysis: Dict[str, Any]) -> bool:
         self._last_open_reject_reason = ""
         if symbol in self.positions or decision.operation not in (Operation.BUY, Operation.SELL):
             return self._reject_open_position("position_exists_or_invalid_operation")
 
         md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
+        entry_tier = str(md.get("entry_tier") or "").strip().lower()
+        if entry_tier == "blocked":
+            return self._reject_open_position("entry_tier_blocked")
         leverage = int(self.config.fixed_leverage or decision.leverage or self.config.default_leverage)
         leverage = max(self.config.min_leverage, min(self.config.max_leverage, leverage))
         dynamic_cap = self._dynamic_leverage_cap()
@@ -1524,6 +1666,10 @@ class BotLikeReplayEngine(BacktestEngine):
             return self._reject_open_position("dynamic_leverage_blocked")
 
         target_portion = max(0.0, float(decision.target_portion_of_balance or 0.0))
+        target_portion = self._apply_min_open_floor_override(
+            decision=decision,
+            target_portion=target_portion,
+        )
         target_portion = min(target_portion, float(self.config.max_symbol_position_portion))
         if target_portion < float(self.config.min_open_portion):
             return self._reject_open_position("target_portion_below_min_open")
@@ -1578,6 +1724,16 @@ class BotLikeReplayEngine(BacktestEngine):
             "take_profit_levels": take_profit_levels,
             "signal_score": self._safe_float(md.get("signal_score"), 0.0),
             "signal_type_1h": str(md.get("signal_type_1h", "") or ""),
+            "entry_tier": str(md.get("entry_tier", "") or ""),
+            "capacity_replacement_candidate": bool(md.get("capacity_replacement_candidate", False)),
+            "capacity_replacement_target": str(
+                (md.get("capacity_replacement_target") or {}).get("symbol", "")
+                if isinstance(md.get("capacity_replacement_target"), dict)
+                else md.get("capacity_replacement_target", "") or ""
+            ),
+            "pocket_management_override": dict(md.get("pocket_management_override", {}))
+            if isinstance(md.get("pocket_management_override"), dict)
+            else {},
             "is_trial_entry": bool(md.get("is_trial_entry", False)),
             "entry_scale": self._safe_float(md.get("entry_scale"), 1.0),
             "session_position_scale": 1.0,
@@ -1603,18 +1759,6 @@ class BotLikeReplayEngine(BacktestEngine):
         elif not opened:
             self._last_open_reject_reason = "fill_pending_order_failed"
         return opened
-
-    @staticmethod
-    def pick_open_candidates(open_candidates: List[Dict[str, Any]], active_count: int) -> List[Dict[str, Any]]:
-        selected: List[Dict[str, Any]] = []
-        current_active = int(active_count)
-        for item in sorted(open_candidates, key=lambda x: float(x.get("score", 0.0)), reverse=True):
-            cap = max(1, int(item.get("max_active_symbols", 1) or 1))
-            if current_active >= cap:
-                continue
-            selected.append(item)
-            current_active += 1
-        return selected
 
     def run_backtest(self, market_data_map: Dict[str, Dict[str, pd.DataFrame]]) -> dict:
         if not market_data_map:
@@ -1734,7 +1878,7 @@ class BotLikeReplayEngine(BacktestEngine):
                     signals_generated += 1
 
                 md = decision.metadata if isinstance(getattr(decision, "metadata", None), dict) else {}
-                score = max(1.0, float(self.bot_logic._decision_signal_score(decision, analysis["flow_context"])))
+                score = float(self._decision_signal_score(decision) or self.bot_logic._decision_signal_score(decision, analysis["flow_context"]))
                 item = {
                     "symbol": symbol,
                     "analysis": analysis,
@@ -1766,7 +1910,17 @@ class BotLikeReplayEngine(BacktestEngine):
                 open_candidates = self._apply_candidate_pre_filter(open_candidates)
                 if self.ai_review_enabled:
                     open_candidates = self._enforce_ai_final_review(open_candidates)
-                selected_candidates = self.pick_open_candidates(open_candidates, active_count=len(self.positions))
+                for item in open_candidates:
+                    item["_priority_score"] = self._priority_score(item)
+                    group_key, group_cap = self._capacity_group_cap(item)
+                    item["_capacity_group_key"] = group_key
+                    item["_capacity_group_cap"] = group_cap
+                selected_candidates = self.bot_logic.select_open_candidates_with_replacement(
+                    open_candidates,
+                    active_positions=self._current_active_positions_snapshot(analyses),
+                    active_count=len(self.positions),
+                    ai_review_cfg=self.ai_review_cfg,
+                )
                 selected_keys = {
                     (
                         str(item.get("symbol") or ""),
@@ -1785,6 +1939,8 @@ class BotLikeReplayEngine(BacktestEngine):
                     self._update_candidate_ledger(
                         item,
                         capacity_selected=bool(is_selected),
+                        capacity_replacement_candidate=bool(item.get("capacity_replacement_candidate", False)),
+                        capacity_replacement_target=str((item.get("capacity_replacement_target") or {}).get("symbol", "") or ""),
                         capacity_block_reason="" if is_selected else f"capacity_block:max_active={item.get('max_active_symbols', 0)}",
                     )
                     funnel.log(
@@ -1794,6 +1950,20 @@ class BotLikeReplayEngine(BacktestEngine):
                         score=float(item.get("score", 0.0) or 0.0),
                     )
                 for item in selected_candidates:
+                    replacement_target = item.get("capacity_replacement_target") if isinstance(item.get("capacity_replacement_target"), dict) else {}
+                    replacement_symbol = str(replacement_target.get("symbol") or "")
+                    if replacement_symbol and replacement_symbol in self.positions:
+                        replacement_price = self._safe_float(
+                            analyses.get(replacement_symbol, {}).get("price"),
+                            self._safe_float(self._last_price_map.get(replacement_symbol), self._safe_float(self.positions[replacement_symbol].get("entry_price"), 0.0)),
+                        )
+                        self._close_position_bot_like(
+                            replacement_symbol,
+                            analyses.get(replacement_symbol, {"price": replacement_price, "time": item["analysis"]["time"]}),
+                            reason=f"capacity_replacement_for:{item.get('symbol')}",
+                            exit_price=replacement_price,
+                            trade_updates={"capacity_replacement_target": replacement_symbol},
+                        )
                     opened = self._open_position_from_decision(str(item["symbol"]), item["decision"], item["analysis"])
                     self._update_candidate_ledger(
                         item,

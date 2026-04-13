@@ -227,15 +227,15 @@
     "close_threshold": 0.3,
     "entry_slippage": 0.0015,
     "stop_loss_pct": 0.02,
-    "take_profit_pct": 0.05,
+    "take_profit_pct": 0.04,
     "take_profit_pct_levels": [
-      0.015,
-      0.025,
-      0.04
+      0.008,
+      0.012,
+      0.02
     ],
     "take_profit_reduce_pct_levels": [
-      0.2,
       0.25,
+      0.3,
       0.2
     ],
     "reverse_close_confirm_bars": 2,
@@ -256,8 +256,8 @@
     "extreme_volatility_cooldown_quantile_window": 96,
     "extreme_volatility_cooldown_quantile_min_samples": 24,
     "time_exit_enabled": true,
-    "time_exit_minutes": 90,
-    "time_exit_min_profit_pct": 0.005,
+    "time_exit_minutes": 60,
+    "time_exit_min_profit_pct": 0.0035,
     "partial_tp_enabled": true,
     "partial_tp_levels": [
       {
@@ -291,10 +291,10 @@
       }
     },
     "trailing_stop_enabled": true,
-    "trailing_stop_activation_pct": 0.015,
-    "trailing_stop_atr_multiplier": 1.2,
-    "trailing_stop_min_distance": 0.008,
-    "trailing_stop_max_distance": 0.018,
+    "trailing_stop_activation_pct": 0.012,
+    "trailing_stop_atr_multiplier": 1.0,
+    "trailing_stop_min_distance": 0.007,
+    "trailing_stop_max_distance": 0.015,
     "trailing_stop_mode": "dynamic",
     "trailing_volatile": {
       "activation_pct": 0.008,
@@ -488,7 +488,7 @@
     "decision_timeframe": "15m",
     "strategy_mode": "macd_mtf_strategy_v2",
     "macd_mtf_strategy_v2": {
-      "enable_dual_suite": true,
+      "enable_dual_suite": false,
       "indicator_suite": "adaptive",
       "indicator_suite_config": {
         "trending_suite": "RSI_MRV",
@@ -497,10 +497,10 @@
         "adx_trending_threshold": 25,
         "adx_ranging_threshold": 22,
         "boll_bandwidth_trending_ratio": 1.3,
-        "atr_volatile_threshold": 0.04
+        "atr_volatile_threshold": 0.025
       },
-      "rsi_mrv_min_score": 0.55,
-      "boll_mbv_min_score": 0.45,
+      "rsi_mrv_min_score": 0.7,
+      "boll_mbv_min_score": 0.55,
       "signal_family_whitelist": {
         "flip_bullish": {
           "enabled": true,
@@ -535,32 +535,30 @@
       },
       "scoring_weights": {
         "RSI_MRV_suite": {
-          "weight_4h_direction": 0.25,
-          "weight_1h_direction": 0.10,
-          "weight_rsi_4h": 0.10,
-          "weight_rsi_1h": 0.15,
+          "weight_4h_direction": 0.3,
+          "weight_1h_direction": 0.15,
+          "weight_rsi_4h": 0.1,
+          "weight_rsi_1h": 0.2,
           "weight_rsi_divergence": 0.05,
-          "weight_boll_rsi": 0.20,
-          "weight_15m_entry": 0.00,
-          "weight_volume": 0.15
+          "weight_vwap": 0.15,
+          "weight_15m_entry": 0.0,
+          "weight_volume": 0.05
         },
         "BOLL_MBV_suite": {
-          "weight_4h_direction": 0.25,
-          "weight_1h_direction": 0.15,
-          "weight_boll_position": 0.20,
+          "weight_4h_direction": 0.3,
+          "weight_1h_direction": 0.2,
+          "weight_boll_position": 0.25,
           "weight_boll_bandwidth": 0.05,
-          "weight_rsi": 0.20,
-          "weight_15m_entry": 0.00,
-          "weight_volume": 0.15
+          "weight_vwap": 0.15,
+          "weight_15m_entry": 0.0,
+          "weight_volume": 0.05
         },
-        "weight_1h_direction": 0.40,
-        "weight_4h_direction": 0.20,
+        "weight_1h_direction": 0.25,
+        "weight_4h_direction": 0.35,
         "weight_boll_position": 0.25,
-        "weight_boll_bandwidth": 0.10,
-        "weight_rsi_momentum": 0.15,
-        "weight_vwap": 0.0,
-        "weight_15m_entry": 0.05,
-        "weight_volume": 0.15
+        "weight_vwap": 0.05,
+        "weight_15m_entry": 0.0,
+        "weight_volume": 0.1
       },
       "macd_config": {
         "macd_1h_fast": 12,
@@ -572,7 +570,7 @@
         "macd_15m_fast": 12,
         "macd_15m_slow": 26,
         "macd_15m_signal": 9,
-        "macd_threshold": 5E-05
+        "macd_threshold": 5e-05
       },
       "boll_config": {
         "period": 20,
@@ -593,19 +591,17 @@
         "vwap_deviation_hard_block": 0.05
       },
       "entry_thresholds": {
-        "default": 0.55,
+        "default": 0.68,
         "min_entry_score": 0.25,
-        "min_signal_score": 0.55,
-        "stable_bear_continuation_min_signal_score": 0.60,
-        "stable_bull_continuation_min_signal_score": 0.60,
-        "red_bar_growing": 0.55,
-        "red_bar_growing_short": 0.55,
-        "red_bar_growing_long": 0.55,
-        "red_bar_shrinking": 0.55,
-        "flip_bearish": 0.55,
-        "flip_bullish": 0.55,
-        "green_bar_growing": 0.55,
-        "green_bar_shrinking": 0.55
+        "min_signal_score": 0.7,
+        "stable_bear_continuation_min_signal_score": 0.72,
+        "stable_bull_continuation_min_signal_score": 0.72,
+        "red_bar_growing": 0.92,
+        "red_bar_shrinking": 0.84,
+        "flip_bearish": 0.8,
+        "flip_bullish": 0.8,
+        "green_bar_growing": 0.92,
+        "green_bar_shrinking": 0.84
       },
       "entry_filters": {
         "primary_direction_timeframe": "4h",
@@ -613,19 +609,9 @@
         "allow_neutral_1h_confirmation": true,
         "light_1h_confirmation_when_4h_primary": true,
         "require_macd_home_advantage": false,
-        "vwap_execution_penalty_only": false,
+        "vwap_execution_penalty_only": true,
         "enable_green_bar_growing_short_adx_1h_range_filter": false,
         "require_15m_confirmation_gate": false,
-        "require_resonance_scoring": true,
-        "resonance_min_score_default": 0.55,
-        "resonance_signal_type_overrides": {
-          "flip_bullish": 0.60,
-          "flip_bearish": 0.65,
-          "green_bar_growing": 0.70,
-          "red_bar_growing": 0.70
-        },
-        "enable_boll_position_adjustment": true,
-        "enable_rsi_hard_block": true,
         "green_bar_growing_short_min_adx_1h": 35.0,
         "green_bar_growing_short_max_adx_1h": 60.0,
         "enable_4h_preflip_trial_entries": true,
@@ -651,7 +637,6 @@
         "stable_bull_continuation_min_4h_bars": 1,
         "enable_flip_bullish_strict_filter": false,
         "disable_flip_bullish_entries": false,
-        "disable_flip_bearish_entries": false,
         "flip_bullish_min_vwap_score": 0.08,
         "flip_bullish_require_pullback_bounce": true,
         "flip_bullish_require_15m_growing": false,
@@ -667,30 +652,18 @@
         "flip_bearish_max_bb_middle_slope_4h": 0.0005,
         "bb_slope_lookback_1h": 3,
         "bb_slope_lookback_4h": 2,
-        "flip_bearish_resonance_guards": {
-          "min_boll_zone_score": 0.60,
-          "require_4h_histogram_negative": true,
-          "rsi_1h_range_max": 60
-        },
-        "disable_red_bar_growing_long_entries": false,
+        "disable_red_bar_growing_long_entries": true,
         "disable_red_bar_shrinking_entries": false,
         "disable_green_bar_growing_entries": false,
-        "disable_green_bar_growing_short_entries": false,
         "disable_green_bar_shrinking_entries": false,
         "disable_green_bar_shrinking_short_dual_pressure_entries": false,
-        "disable_red_bar_shrinking_long_dual_support_entries": false,
-        "red_bar_growing_long_guards": {
-          "min_boll_zone_score_long": 0.65,
-          "require_4h_histogram_positive": true,
-          "rsi_1h_range_min": 42,
-          "rsi_1h_range_max": 65
-        },
-        "min_signal_score": 0.50,
+        "disable_red_bar_shrinking_long_dual_support_entries": true,
+        "min_signal_score": 0.7,
         "min_vwap_score_for_entry": 0.04,
         "symbol_signal_overrides": [
           {
             "symbol": "ZECUSDT",
-            "min_signal_score_override": 0.90,
+            "min_signal_score_override": 0.9,
             "min_vwap_score_override": 0.14,
             "green_bar_growing_mode": "enabled_with_strict_threshold"
           },
@@ -724,7 +697,7 @@
           },
           {
             "symbol": "LINKUSDT",
-            "min_signal_score_override": 0.90,
+            "min_signal_score_override": 0.9,
             "min_vwap_score_override": 0.13,
             "green_bar_growing_mode": "enabled_with_strict_threshold",
             "flip_bullish_mode": "trial_only"
@@ -759,7 +732,7 @@
           },
           {
             "symbol": "LTCUSDT",
-            "min_signal_score_override": 0.90,
+            "min_signal_score_override": 0.9,
             "min_vwap_score_override": 0.13,
             "green_bar_growing_mode": "enabled_with_strict_threshold",
             "flip_bullish_mode": "trial_only"
@@ -863,184 +836,24 @@
           "divergence_min_price_diff_pct": 0.005,
           "divergence_min_rsi_diff": 3.0,
           "rsi_gate": {
-            "enabled": false,
-            "long_rsi_4h_min": 40,
-            "long_rsi_1h_min": 40,
-            "long_rsi_1h_max": 72,
-            "long_rsi_15m_min": 45,
-            "short_rsi_4h_max": 62,
-            "short_rsi_1h_max": 60,
-            "short_rsi_1h_min": 28,
-            "short_rsi_15m_max": 55
+            "enabled": true,
+            "long_rsi_4h_min": 45,
+            "long_rsi_1h_min": 45,
+            "long_rsi_1h_max": 73,
+            "long_rsi_15m_min": 48,
+            "short_rsi_4h_max": 55,
+            "short_rsi_1h_max": 55,
+            "short_rsi_1h_min": 30,
+            "short_rsi_15m_max": 52
           },
           "rsi_flip_override": {
-            "flip_bullish_rsi_1h_min": 40,
-            "flip_bullish_rsi_4h_min": 40,
-            "flip_bearish_rsi_1h_max": 60,
-            "flip_bearish_rsi_4h_max": 60
+            "flip_bullish_rsi_1h_min": 42,
+            "flip_bullish_rsi_4h_min": 42,
+            "flip_bearish_rsi_1h_max": 58,
+            "flip_bearish_rsi_4h_max": 58
           },
           "extreme_overbought": 78,
           "extreme_oversold": 22
-        },
-        "resonance_scoring": {
-          "enabled": true,
-          "description": "MACD+BOLL+RSI三共振评分系统",
-          "weights": {
-            "macd_base": 0.40,
-            "boll_structure": 0.35,
-            "rsi_momentum": 0.25
-          },
-          "market_adaptive_weights": {
-            "trending": {
-              "macd_base": 0.50,
-              "boll_structure": 0.30,
-              "rsi_momentum": 0.20
-            },
-            "ranging": {
-              "macd_base": 0.35,
-              "boll_structure": 0.40,
-              "rsi_momentum": 0.25
-            },
-            "volatile": {
-              "macd_base": 0.45,
-              "boll_structure": 0.30,
-              "rsi_momentum": 0.25
-            }
-          },
-          "min_resonance_score_for_entry": 0.55,
-          "strong_resonance_threshold": 0.75,
-          "entry_thresholds_by_signal_type": {
-            "flip_bullish": 0.60,
-            "flip_bearish": 0.65,
-            "green_bar_growing": 0.70,
-            "red_bar_growing": 0.70,
-            "green_bar_shrinking": 0.55,
-            "red_bar_shrinking": 0.55
-          }
-        },
-        "dynamic_leverage": {
-          "enabled": true,
-          "description": "基于共振分数的动态杠杆调整",
-          "leverage_tiers": [
-            {
-              "resonance_score_min": 0.85,
-              "resonance_score_max": 1.0,
-              "base_leverage": 5,
-              "max_leverage": 5
-            },
-            {
-              "resonance_score_min": 0.75,
-              "resonance_score_max": 0.85,
-              "base_leverage": 4,
-              "max_leverage": 5
-            },
-            {
-              "resonance_score_min": 0.65,
-              "resonance_score_max": 0.75,
-              "base_leverage": 3,
-              "max_leverage": 4
-            },
-            {
-              "resonance_score_min": 0.55,
-              "resonance_score_max": 0.65,
-              "base_leverage": 3,
-              "max_leverage": 3
-            }
-          ],
-          "boll_zone_leverage_adjustment": {
-            "zone_0_center": {
-              "leverage_mult": 1.0,
-              "description": "价格在BOLL中轨附近，正常杠杆"
-            },
-            "zone_1_upper": {
-              "leverage_mult": 1.1,
-              "description": "价格在上轨附近，多头信号杠杆+10%"
-            },
-            "zone_1_lower": {
-              "leverage_mult": 1.1,
-              "description": "价格在下轨附近，空头信号杠杆+10%"
-            },
-            "zone_2_upper_extreme": {
-              "leverage_mult": 0.8,
-              "description": "价格触及上轨，杠杆-20%"
-            },
-            "zone_2_lower_extreme": {
-              "leverage_mult": 0.8,
-              "description": "价格触及下轨，杠杆-20%"
-            }
-          }
-        },
-        "boll_position_adjustment": {
-          "enabled": true,
-          "description": "基于BOLL带宽的仓位调整（替代VWAP过滤）",
-          "bandwidth_states": {
-            "squeezed": {
-              "bandwidth_pct_max": 0.03,
-              "position_scale": 0.6,
-              "description": "带宽收窄，减仓40%等待突破"
-            },
-            "normal": {
-              "bandwidth_pct_min": 0.03,
-              "bandwidth_pct_max": 0.05,
-              "position_scale": 1.0,
-              "description": "正常带宽，标准仓位"
-            },
-            "expanding": {
-              "bandwidth_pct_min": 0.05,
-              "position_scale": 1.15,
-              "description": "带宽扩张，加仓15%趋势延续"
-            }
-          },
-          "position_zone_adjustments": {
-            "long_above_upper": {
-              "position_scale": 0.75,
-              "min_bandwidth_pct": 0.04,
-              "description": "做多但价格已在上轨之上，减仓"
-            },
-            "short_below_lower": {
-              "position_scale": 0.75,
-              "min_bandwidth_pct": 0.04,
-              "description": "做空但价格已在下轨之下，减仓"
-            },
-            "long_near_lower_reclaim": {
-              "position_scale": 1.1,
-              "min_bandwidth_pct": 0.025,
-              "description": "做多且价格从下轨回收，加仓10%"
-            },
-            "short_near_upper_reject": {
-              "position_scale": 1.1,
-              "min_bandwidth_pct": 0.025,
-              "description": "做空且价格从上轨回落，加仓10%"
-            }
-          }
-        },
-        "rsi_hard_block": {
-          "enabled": true,
-          "description": "RSI极端区域硬性拦截",
-          "long_entry_blocks": {
-            "rsi_4h_overbought": {
-              "threshold": 75,
-              "description": "4H RSI超买，禁止做多"
-            },
-            "rsi_1h_extreme_overbought": {
-              "threshold": 80,
-              "description": "1H RSI极端超买，禁止做多"
-            }
-          },
-          "short_entry_blocks": {
-            "rsi_4h_oversold": {
-              "threshold": 25,
-              "description": "4H RSI超卖，禁止做空"
-            },
-            "rsi_1h_extreme_oversold": {
-              "threshold": 20,
-              "description": "1H RSI极端超卖，禁止做空"
-            }
-          },
-          "exemptions": {
-            "flip_family_exempt": true,
-            "description": "flip信号族豁免硬性拦截"
-          }
         },
         "pocket_entry_overrides": {
           "red_bar_growing|long_dual_support": {
@@ -1048,9 +861,9 @@
             "allow_neutral_1h_confirmation": false,
             "require_strict_1h_confirmation": true,
             "disallow_trial_entry": true,
-            "min_signal_score": 0.50,
-            "min_vwap_score": 0.10,
-            "min_entry_score": 0.30,
+            "min_signal_score": 0.7,
+            "min_vwap_score": 0.1,
+            "min_entry_score": 0.3,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true
           },
@@ -1060,8 +873,8 @@
             "require_strict_1h_confirmation": true,
             "disallow_trial_entry": true,
             "min_signal_score": 0.84,
-            "min_vwap_score": 0.10,
-            "min_entry_score": 0.30,
+            "min_vwap_score": 0.1,
+            "min_entry_score": 0.3,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true,
             "require_rsi_ok": true
@@ -1072,7 +885,7 @@
           },
           "green_bar_growing|short_dual_pressure": {
             "label": "sdp_a_strict_gate",
-            "min_signal_score": 0.50,
+            "min_signal_score": 0.7,
             "min_vwap_score": 0.12,
             "require_cvd_ok": true,
             "require_strict_1h_confirmation": true,
@@ -1086,7 +899,7 @@
             "disallow_trial_entry": true,
             "min_signal_score": 0.84,
             "min_vwap_score": 0.14,
-            "min_entry_score": 0.30,
+            "min_entry_score": 0.3,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true
           },
@@ -1353,14 +1166,14 @@
           "enable_4h_shrink_exit": false,
           "promote_to_min_open": true,
           "promote_to_min_open_min_signal_score": 0.86,
-          "tp_pct": 0.06,
+          "tp_pct": 0.05,
           "take_profit_pct_levels": [
-            0.015,
-            0.025,
-            0.04
+            0.01,
+            0.018,
+            0.032
           ],
           "take_profit_reduce_pct_levels": [
-            0.15,
+            0.2,
             0.2,
             0.15
           ],
@@ -1377,15 +1190,15 @@
           "leverage_cap": 2,
           "position_scale": 0.75,
           "max_target_portion": 0.18,
-          "tp_pct": 0.04,
+          "tp_pct": 0.05,
           "take_profit_pct_levels": [
-            0.012,
-            0.02,
-            0.032
+            0.01,
+            0.018,
+            0.03
           ],
           "take_profit_reduce_pct_levels": [
             0.2,
-            0.25,
+            0.2,
             0.15
           ],
           "time_exit_minutes": 20,
@@ -1448,13 +1261,13 @@
       "enabled": true,
       "flip_bullish": {
         "take_profit_pct_levels": [
-          0.018,
-          0.03,
-          0.05
+          0.012,
+          0.02,
+          0.035
         ],
         "take_profit_reduce_pct_levels": [
-          0.15,
-          0.25,
+          0.2,
+          0.3,
           0.2
         ],
         "trailing_stop_enabled": true,
@@ -1464,48 +1277,48 @@
       },
       "flip_bearish": {
         "take_profit_pct_levels": [
+          0.008,
+          0.014,
+          0.022
+        ],
+        "take_profit_reduce_pct_levels": [
+          0.3,
+          0.35,
+          0.25
+        ],
+        "trailing_stop_enabled": false
+      },
+      "red_bar_growing": {
+        "take_profit_pct_levels": [
+          0.008,
           0.012,
-          0.02,
-          0.032
+          0.02
         ],
         "take_profit_reduce_pct_levels": [
           0.25,
           0.3,
           0.2
         ],
-        "trailing_stop_enabled": false
-      },
-      "red_bar_growing": {
-        "take_profit_pct_levels": [
-          0.015,
-          0.025,
-          0.04
-        ],
-        "take_profit_reduce_pct_levels": [
-          0.2,
-          0.25,
-          0.2
-        ],
         "trailing_stop_enabled": true,
-        "trailing_stop_activation_pct": 0.02,
-        "trailing_stop_min_distance_pct": 0.007,
-        "trailing_stop_max_distance_pct": 0.018
+        "trailing_stop_activation_pct": 0.018,
+        "trailing_stop_min_distance_pct": 0.006,
+        "trailing_stop_max_distance_pct": 0.015
       },
       "green_bar_growing": {
         "take_profit_pct_levels": [
-          0.015,
-          0.025,
-          0.04
+          0.008,
+          0.012,
+          0.02
         ],
         "take_profit_reduce_pct_levels": [
-          0.2,
           0.25,
+          0.3,
           0.2
         ],
         "trailing_stop_enabled": true,
-        "trailing_stop_activation_pct": 0.02,
-        "trailing_stop_min_distance_pct": 0.007,
-        "trailing_stop_max_distance_pct": 0.018
+        "trailing_stop_activation_pct": 0.018,
+        "trailing_stop_min_distance_pct": 0.006,
+        "trailing_stop_max_distance_pct": 0.015
       }
     },
     "dynamic_position_config": {

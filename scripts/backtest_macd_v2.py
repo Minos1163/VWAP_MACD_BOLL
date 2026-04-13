@@ -739,7 +739,31 @@ def prepare_timeframe_data(
     df['atr'] = calculate_atr(df, 14)
     df['adx'] = calculate_adx_series(df, 14)
     df['adx_prev'] = df['adx'].shift(1).fillna(df['adx'])
-    
+
+    # RSI（向量化计算）
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0.0).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=14).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    df['rsi'] = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+
+    # RSI 7 (15m用)
+    gain_7 = delta.where(delta > 0, 0.0).rolling(window=7).mean()
+    loss_7 = (-delta.where(delta < 0, 0.0)).rolling(window=7).mean()
+    rs_7 = gain_7 / loss_7.replace(0, pd.NA)
+    df['rsi_7'] = (100.0 - (100.0 / (1.0 + rs_7))).fillna(50.0)
+
+    # RSI 21 (4h用)
+    gain_21 = delta.where(delta > 0, 0.0).rolling(window=21).mean()
+    loss_21 = (-delta.where(delta < 0, 0.0)).rolling(window=21).mean()
+    rs_21 = gain_21 / loss_21.replace(0, pd.NA)
+    df['rsi_21'] = (100.0 - (100.0 / (1.0 + rs_21))).fillna(50.0)
+
+    # BOLL bandwidth (用于市场状态分类)
+    boll_width = (df['bb_upper'] - df['bb_lower']) / df['bb_middle'].replace(0, pd.NA)
+    df['boll_bandwidth'] = boll_width.fillna(0.05)
+    df['boll_bandwidth_mean'] = df['boll_bandwidth'].rolling(window=20).mean().fillna(0.05)
+
     # 成交量均线
     df['avg_volume'] = df['volume'].rolling(window=20).mean()
 
@@ -1360,6 +1384,8 @@ class BacktestEngine:
         updates: Dict[str, object] = {}
         if override.disable_flip_bullish is not None:
             updates["disable_flip_bullish_entries"] = bool(override.disable_flip_bullish)
+            if bool(override.disable_flip_bullish):
+                updates["force_disable_flip_bullish_entries"] = True
         if override.disable_green_bar_growing is not None:
             updates["disable_green_bar_growing_entries"] = bool(override.disable_green_bar_growing)
         if override.min_signal_score_override is not None:
@@ -1830,6 +1856,9 @@ class BacktestEngine:
             atr_1h=row_1h['atr'],
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
+            rsi_val=float(row_1h['rsi']) if 'rsi' in row_1h.index else 50.0,
+            rsi_4h=float(row_4h['rsi_21'] if 'rsi_21' in row_4h.index else row_4h.get('rsi', 50.0)),
+            rsi_15m=float(row_15m['rsi_7'] if 'rsi_7' in row_15m.index else row_15m.get('rsi', 50.0)),
         )
         if self.disable_cvd_decision_logic:
             cvd_veto_context = self._inactive_cvd_veto_context()
@@ -1900,8 +1929,11 @@ class BacktestEngine:
         is_trial_entry: bool = False,
         entry_scale: float = 1.0,
         session_scale: float = 1.0,
+        signal_details: Optional[dict] = None,
     ) -> Tuple[float, int]:
         """计算仓位大小和杠杆"""
+        signal_details = signal_details if isinstance(signal_details, dict) else {}
+        entry_tier = str(signal_details.get("entry_tier", "") or "")
         if self.config.fixed_leverage is not None:
             leverage = int(self.config.fixed_leverage)
         else:
@@ -1911,6 +1943,7 @@ class BacktestEngine:
                 signal_type_1h,
                 symbol=symbol,
                 is_trial_entry=is_trial_entry,
+                entry_tier=entry_tier,
             )
             leverage = max(self.config.min_leverage, min(self.config.max_leverage, leverage or self.config.default_leverage))
         position_pct = self.strategy_engine.calculate_position_portion(
@@ -1925,6 +1958,7 @@ class BacktestEngine:
             is_trial_entry=is_trial_entry,
             entry_scale=entry_scale,
             session_scale=session_scale,
+            entry_tier=entry_tier,
         )
         if position_pct < self.config.min_open_portion:
             return 0.0, leverage
@@ -2020,6 +2054,7 @@ class BacktestEngine:
             is_trial_entry=bool(signal.is_trial_entry),
             entry_scale=float(signal.entry_scale or 1.0),
             session_scale=session_position_scale,
+            signal_details=signal.details if isinstance(signal.details, dict) else {},
         )
         # VWAP结构覆盖：杠杆上限
         max_lev_override = vwap_structure_override.get("max_leverage_override")
@@ -2259,6 +2294,9 @@ class BacktestEngine:
             'reason': reason,
             'signal_score': pos['signal_score'],
             'signal_type_1h': pos['signal_type_1h'],
+            'entry_tier': str(pos.get('entry_tier', '')),
+            'capacity_replacement_candidate': bool(pos.get('capacity_replacement_candidate', False)),
+            'capacity_replacement_target': str(pos.get('capacity_replacement_target', '') or ''),
             'is_trial_entry': bool(pos.get('is_trial_entry', False)),
             'entry_scale': float(pos.get('entry_scale', 1.0)),
             'session_position_scale': float(pos.get('session_position_scale', 1.0)),
@@ -2349,6 +2387,12 @@ class BacktestEngine:
             'entry_degradation_path': list(order.get('entry_degradation_path') or []),
             'signal_score': float(order['signal_score']),
             'signal_type_1h': order['signal_type_1h'],
+            'entry_tier': str(order.get('entry_tier', '')),
+            'capacity_replacement_candidate': bool(order.get('capacity_replacement_candidate', False)),
+            'capacity_replacement_target': str(order.get('capacity_replacement_target', '') or ''),
+            'pocket_management_override': dict(order.get('pocket_management_override', {}))
+            if isinstance(order.get('pocket_management_override'), dict)
+            else {},
             'is_trial_entry': bool(order.get('is_trial_entry', False)),
             'entry_scale': float(order.get('entry_scale', 1.0)),
             'session_position_scale': float(order.get('session_position_scale', 1.0)),

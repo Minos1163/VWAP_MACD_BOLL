@@ -99,6 +99,44 @@ def test_bot_like_replay_applies_position_management_overrides_for_existing_posi
     assert result.reason == "partial_tp_level_1"
 
 
+def test_bot_like_replay_inherits_position_pocket_override_into_time_exit():
+    engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
+    engine.bot_logic = _make_bot()
+    pos_key = engine.bot_logic._position_track_key("BTCUSDT", "LONG")
+    engine.bot_logic._position_first_seen_ts[pos_key] = 1000.0
+    engine.bot_logic._backtest_now_ts = 1000.0 + (61 * 60)
+    engine.positions = {
+        "BTCUSDT": {
+            "side": "LONG",
+            "entry_price": 100.0,
+            "amount": 1.0,
+            "signal_type_1h": "flip_bullish",
+            "vwap_state": "long_reclaim_confirmed",
+            "pocket_management_override": {"time_exit_enabled": False},
+        }
+    }
+
+    base_decision = FundFlowDecision(
+        operation=FundFlowOperation.HOLD,
+        symbol="BTCUSDT",
+        target_portion_of_balance=0.0,
+        leverage=2,
+        reason="hold",
+        metadata={},
+    )
+
+    result = engine._apply_position_management_override(
+        symbol="BTCUSDT",
+        decision=base_decision,
+        analysis={
+            "price": 99.9,
+            "flow_context": {"cvd_momentum": 0.0},
+        },
+    )
+
+    assert result.operation == FundFlowOperation.HOLD
+
+
 def test_bot_like_replay_clears_position_tracking_after_full_close(monkeypatch):
     engine = BotLikeReplayEngine.__new__(BotLikeReplayEngine)
     engine.bot_logic = _make_bot()

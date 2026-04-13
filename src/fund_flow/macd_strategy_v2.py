@@ -39,6 +39,8 @@ def check_pocket_entry_override(
     flow_cvd_ok: bool,
     micro_cvd_momentum_ok: bool,
     pocket_entry_overrides: dict,
+    rsi_val: float = 50.0,
+    trade_direction: str = "",
 ) -> tuple[bool, str]:
     """
     在 entry_hard_gates 通过后执行 pocket 级独立准入检查。
@@ -114,6 +116,20 @@ def check_pocket_entry_override(
             f"micro_cvd_momentum_ok={micro_cvd_momentum_ok}"
         )
 
+    # RSI确认检查
+    if pocket_cfg.get("require_rsi_ok", False):
+        trade_dir = str(trade_direction or "").strip().lower()
+        if trade_dir == "long" and rsi_val < 50:
+            return False, (
+                f"POCKET_GATE[{pocket_key}]:RSI_LOW "
+                f"rsi={rsi_val:.1f}<50 (long)"
+            )
+        elif trade_dir == "short" and rsi_val > 50:
+            return False, (
+                f"POCKET_GATE[{pocket_key}]:RSI_HIGH "
+                f"rsi={rsi_val:.1f}>50 (short)"
+            )
+
     return True, f"POCKET_GATE[{pocket_key}]:PASS"
 
 
@@ -154,6 +170,15 @@ class MACDStrategyV2Config:
     ema_multiplier_weak: float = 0.6
     ema_55_1h_hard_block: bool = True  # 兼容旧配置：等价于1H跌破/突破BOLL中轨硬性否决
     
+    # RSI配置
+    rsi_period: int = 14
+    rsi_oversold_threshold: float = 30.0
+    rsi_overbought_threshold: float = 70.0
+    rsi_require_ok_for_growing: bool = True   # 对growing家族要求RSI确认
+    rsi_require_ok_for_flip: bool = False     # 对flip家族可选确认
+    rsi_adx_threshold_strong: float = 25.0    # ADX >= 此值使用BOLL体系
+    rsi_adx_threshold_weak: float = 15.0      # ADX < 此值禁止交易
+
     # VWAP参数
     vwap_deviation_optimal: float = 0.005  # 最优偏离区间 ±0.5%
     vwap_deviation_warning: float = 0.015  # 警告偏离 ±1.5%
@@ -173,16 +198,17 @@ class MACDStrategyV2Config:
     
     # 入场阈值
     min_entry_score: float = 0.25
-    min_signal_score: float = 0.830
-    red_bar_growing_min_signal_score: float = 0.845
-    red_bar_shrinking_min_signal_score: float = 0.845
-    flip_bearish_min_signal_score: float = 0.825
-    flip_bullish_min_signal_score: float = 0.825
+    min_signal_score: float = 0.80
+    red_bar_growing_min_signal_score: float = 0.92
+    red_bar_shrinking_min_signal_score: float = 0.84
+    flip_bearish_min_signal_score: float = 0.80
+    flip_bullish_min_signal_score: float = 0.80
 
     # 1H flip_bullish 严格过滤
     enable_flip_bullish_strict_filter: bool = True
     disable_flip_bullish_entries: bool = False
     force_disable_flip_bullish_entries: bool = False
+    disable_flip_bearish_entries: bool = False
     disable_flip_bullish_trial_entries: bool = False
     flip_bullish_min_vwap_score: float = 0.12
     flip_bullish_require_pullback_bounce: bool = True
@@ -207,11 +233,25 @@ class MACDStrategyV2Config:
     ema_slope_lookback_4h: int = 2  # 兼容旧配置：等价于BOLL中轨斜率lookback
     disable_red_bar_growing_long_entries: bool = False
     disable_red_bar_shrinking_entries: bool = False
+    # flip_bearish 专属共振门控（解锁后替代硬性禁用的保护措施）
+    flip_bearish_resonance_guards: Dict[str, Any] = field(default_factory=lambda: {
+        "min_boll_zone_score": 0.60,
+        "require_4h_histogram_negative": True,
+        "rsi_1h_range_max": 60,
+    })
+    # red_bar_growing 做多专属门控
+    red_bar_growing_long_guards: Dict[str, Any] = field(default_factory=lambda: {
+        "min_boll_zone_score_long": 0.65,
+        "require_4h_histogram_positive": True,
+        "rsi_1h_range_min": 42,
+        "rsi_1h_range_max": 65,
+    })
     long_entry_mode: str = "all"
     long_whitelist_signal_types: List[str] = field(default_factory=list)
     long_whitelist_vwap_states: List[str] = field(default_factory=list)
     long_whitelist_pockets: List[str] = field(default_factory=list)
     disable_green_bar_growing_entries: bool = True
+    disable_green_bar_growing_short_entries: bool = False
     disable_green_bar_shrinking_entries: bool = False
     disable_green_bar_shrinking_short_dual_pressure_entries: bool = True
     disable_red_bar_shrinking_long_dual_support_entries: bool = True
@@ -326,6 +366,44 @@ class MACDStrategyV2Config:
     short_filter_min_funding_rate: float = 0.0005  # funding_rate > 0.05%
     short_filter_max_oi_delta_ratio: float = 0.0  # oi_delta_ratio < 0 (多头减仓)
     short_filter_min_vwap_deviation: float = 0.005  # price > vwap * 1.005
+
+    # ── 双套件配置 ──
+    enable_dual_suite: bool = False  # 启用双套件自适应模式
+    indicator_suite: str = "adaptive"  # adaptive / RSI_MRV / BOLL_MBV
+    # 市场状态分类器参数
+    suite_adx_trending_threshold: float = 25.0
+    suite_adx_ranging_threshold: float = 22.0
+    suite_boll_bandwidth_trending_ratio: float = 1.3
+    suite_switch_cooldown_bars_1h: int = 4
+    suite_atr_volatile_threshold: float = 0.025
+    # RSI_MRV 套件评分门槛
+    rsi_mrv_min_score: float = 0.55
+    # BOLL_MBV 套件评分门槛
+    boll_mbv_min_score: float = 0.45
+    # 信号族白名单（启用双套件后生效）
+    signal_family_whitelist: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # RSI 门控配置（三时间框架联合门控）
+    rsi_gate_enabled: bool = False
+    rsi_gate_long_rsi_4h_min: float = 45.0
+    rsi_gate_long_rsi_1h_min: float = 45.0
+    rsi_gate_long_rsi_1h_max: float = 70.0
+    rsi_gate_long_rsi_15m_min: float = 48.0
+    rsi_gate_short_rsi_4h_max: float = 55.0
+    rsi_gate_short_rsi_1h_max: float = 55.0
+    rsi_gate_short_rsi_1h_min: float = 30.0
+    rsi_gate_short_rsi_15m_max: float = 52.0
+    # RSI flip 豁免
+    rsi_flip_bullish_rsi_4h_min: float = 42.0
+    rsi_flip_bullish_rsi_1h_min: float = 42.0
+    rsi_flip_bearish_rsi_4h_max: float = 58.0
+    rsi_flip_bearish_rsi_1h_max: float = 58.0
+    # RSI 极值否决
+    rsi_extreme_overbought: float = 78.0
+    rsi_extreme_oversold: float = 22.0
+    # RSI 多时间框架数据（传入参数）
+    rsi_4h: float = 50.0
+    rsi_15m: float = 50.0
+    rsi_slope_1h: float = 0.0
 
     def resolve_signal_score_threshold(
         self,
@@ -487,6 +565,16 @@ class MACDSignalV2:
     is_trial_entry: bool = False
     entry_scale: float = 1.0
 
+    # 双套件信息
+    selected_suite: str = ""  # "RSI_MRV" / "BOLL_MBV" / ""
+    regime: str = ""  # "TRENDING_BULL" / "TRENDING_BEAR" / "RANGING" / "BREAKOUT_WATCH" / "VOLATILE"
+    suite_score: float = 0.0
+    rsi_gate_pass: bool = True
+    rsi_4h: float = 50.0
+    rsi_15m: float = 50.0
+    rsi_slope_1h: float = 0.0
+    divergence: Dict = field(default_factory=dict)
+
     details: Dict = field(default_factory=dict)
 
 
@@ -516,7 +604,7 @@ def build_macd_v2_config_from_runtime(
     penalty_cfg = v2_cfg.get("penalty_config", {}) if isinstance(v2_cfg.get("penalty_config"), dict) else {}
     default_signal_threshold = float(thresholds_cfg.get("default", thresholds_cfg.get("min_signal_score", 0.850)))
 
-    return MACDStrategyV2Config(
+    config_obj = MACDStrategyV2Config(
         macd_1h_fast=int(macd_cfg.get("macd_1h_fast", 12)),
         macd_1h_slow=int(macd_cfg.get("macd_1h_slow", 26)),
         macd_1h_signal=int(macd_cfg.get("macd_1h_signal", 9)),
@@ -557,6 +645,7 @@ def build_macd_v2_config_from_runtime(
         flip_bullish_min_signal_score=float(thresholds_cfg.get("flip_bullish", default_signal_threshold)),
         enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
         disable_flip_bullish_entries=bool(filter_cfg.get("disable_flip_bullish_entries", False)),
+        disable_flip_bearish_entries=bool(filter_cfg.get("disable_flip_bearish_entries", False)),
         disable_flip_bullish_trial_entries=bool(filter_cfg.get("disable_flip_bullish_trial_entries", False)),
         flip_bullish_min_vwap_score=float(filter_cfg.get("flip_bullish_min_vwap_score", 0.12)),
         flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
@@ -597,6 +686,17 @@ def build_macd_v2_config_from_runtime(
         ema_slope_lookback_4h=int(float(filter_cfg.get("bb_slope_lookback_4h", filter_cfg.get("ema_slope_lookback_4h", 2)))),
         disable_red_bar_growing_long_entries=bool(filter_cfg.get("disable_red_bar_growing_long_entries", False)),
         disable_red_bar_shrinking_entries=bool(filter_cfg.get("disable_red_bar_shrinking_entries", False)),
+        flip_bearish_resonance_guards=dict(filter_cfg.get("flip_bearish_resonance_guards", {
+            "min_boll_zone_score": 0.60,
+            "require_4h_histogram_negative": True,
+            "rsi_1h_range_max": 60,
+        })),
+        red_bar_growing_long_guards=dict(filter_cfg.get("red_bar_growing_long_guards", {
+            "min_boll_zone_score_long": 0.65,
+            "require_4h_histogram_positive": True,
+            "rsi_1h_range_min": 42,
+            "rsi_1h_range_max": 65,
+        })),
         long_entry_mode=str(filter_cfg.get("long_entry_mode", "all") or "all").strip().lower(),
         long_whitelist_signal_types=[
             str(x).strip().lower()
@@ -614,7 +714,10 @@ def build_macd_v2_config_from_runtime(
             if str(x).strip() and "|" in str(x)
         ] if isinstance(filter_cfg.get("long_whitelist_pockets"), list) else [],
         disable_green_bar_growing_entries=bool(filter_cfg.get("disable_green_bar_growing_entries", True)),
+        disable_green_bar_growing_short_entries=bool(filter_cfg.get("disable_green_bar_growing_short_entries", False)),
         disable_green_bar_shrinking_entries=bool(filter_cfg.get("disable_green_bar_shrinking_entries", False)),
+        disable_green_bar_shrinking_short_dual_pressure_entries=bool(filter_cfg.get("disable_green_bar_shrinking_short_dual_pressure_entries", True)),
+        disable_red_bar_shrinking_long_dual_support_entries=bool(filter_cfg.get("disable_red_bar_shrinking_long_dual_support_entries", True)),
         require_macd_home_advantage=bool(filter_cfg.get("require_macd_home_advantage", False)),
         vwap_execution_penalty_only=bool(filter_cfg.get("vwap_execution_penalty_only", False)),
         primary_direction_timeframe=str(filter_cfg.get("primary_direction_timeframe", "4h")),
@@ -670,6 +773,13 @@ def build_macd_v2_config_from_runtime(
         stable_bull_continuation_min_4h_bars=int(float(filter_cfg.get("stable_bull_continuation_min_4h_bars", 2))),
         pocket_entry_overrides=copy.deepcopy(filter_cfg.get("pocket_entry_overrides", {}))
         if isinstance(filter_cfg.get("pocket_entry_overrides"), dict) else {},
+        rsi_period=int((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("period", 14)),
+        rsi_oversold_threshold=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("oversold", 30.0)),
+        rsi_overbought_threshold=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("overbought", 70.0)),
+        rsi_require_ok_for_growing=bool((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("require_ok_for_growing", True)),
+        rsi_require_ok_for_flip=bool((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("require_ok_for_flip", False)),
+        rsi_adx_threshold_strong=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("adx_threshold_strong", 25.0)),
+        rsi_adx_threshold_weak=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("adx_threshold_weak", 15.0)),
         pocket_scoring_overrides=copy.deepcopy(v2_cfg.get("pocket_scoring_overrides", {}))
         if isinstance(v2_cfg.get("pocket_scoring_overrides"), dict) else {},
         pocket_management_overrides=copy.deepcopy(v2_cfg.get("pocket_management_overrides", {}))
@@ -745,7 +855,39 @@ def build_macd_v2_config_from_runtime(
         short_filter_min_funding_rate=float(v2_cfg.get("short_quality_filter", {}).get("min_funding_rate", 0.0005)),
         short_filter_max_oi_delta_ratio=float(v2_cfg.get("short_quality_filter", {}).get("max_oi_delta_ratio", 0.0)),
         short_filter_min_vwap_deviation=float(v2_cfg.get("short_quality_filter", {}).get("min_vwap_deviation", 0.005)),
+        # 双套件配置
+        enable_dual_suite=bool(v2_cfg.get("enable_dual_suite", False)),
+        indicator_suite=str(v2_cfg.get("indicator_suite", "adaptive")),
+        suite_adx_trending_threshold=float(v2_cfg.get("indicator_suite_config", {}).get("adx_trending_threshold", 25.0)),
+        suite_adx_ranging_threshold=float(v2_cfg.get("indicator_suite_config", {}).get("adx_ranging_threshold", 22.0)),
+        suite_boll_bandwidth_trending_ratio=float(v2_cfg.get("indicator_suite_config", {}).get("boll_bandwidth_trending_ratio", 1.3)),
+        suite_switch_cooldown_bars_1h=int(float(v2_cfg.get("indicator_suite_config", {}).get("suite_switch_cooldown_bars_1h", 4))),
+        suite_atr_volatile_threshold=float(v2_cfg.get("indicator_suite_config", {}).get("atr_volatile_threshold", 0.025)),
+        rsi_mrv_min_score=float(v2_cfg.get("rsi_mrv_min_score", 0.70)),
+        boll_mbv_min_score=float(v2_cfg.get("boll_mbv_min_score", 0.65)),
+        signal_family_whitelist=copy.deepcopy(v2_cfg.get("signal_family_whitelist", {}))
+        if isinstance(v2_cfg.get("signal_family_whitelist"), dict) else {},
+        rsi_gate_enabled=bool((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("enabled", False)),
+        rsi_gate_long_rsi_4h_min=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("long_rsi_4h_min", 45.0)),
+        rsi_gate_long_rsi_1h_min=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("long_rsi_1h_min", 45.0)),
+        rsi_gate_long_rsi_1h_max=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("long_rsi_1h_max", 70.0)),
+        rsi_gate_long_rsi_15m_min=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("long_rsi_15m_min", 48.0)),
+        rsi_gate_short_rsi_4h_max=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("short_rsi_4h_max", 55.0)),
+        rsi_gate_short_rsi_1h_max=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("short_rsi_1h_max", 55.0)),
+        rsi_gate_short_rsi_1h_min=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("short_rsi_1h_min", 30.0)),
+        rsi_gate_short_rsi_15m_max=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_gate", {}).get("short_rsi_15m_max", 52.0)),
+        rsi_flip_bullish_rsi_4h_min=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_flip_override", {}).get("flip_bullish_rsi_4h_min", 42.0)),
+        rsi_flip_bullish_rsi_1h_min=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_flip_override", {}).get("flip_bullish_rsi_1h_min", 42.0)),
+        rsi_flip_bearish_rsi_4h_max=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_flip_override", {}).get("flip_bearish_rsi_4h_max", 58.0)),
+        rsi_flip_bearish_rsi_1h_max=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("rsi_flip_override", {}).get("flip_bearish_rsi_1h_max", 58.0)),
+        rsi_extreme_overbought=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("extreme_overbought", 78.0)),
+        rsi_extreme_oversold=float((filter_cfg.get("rsi_config", {}) or v2_cfg.get("rsi_config", {})).get("extreme_oversold", 22.0)),
     )
+
+    # 保存原始配置以便三共振系统使用
+    config_obj._raw_config = runtime_cfg
+
+    return config_obj
 
 
 class MACDStrategyV2Engine:
@@ -754,6 +896,146 @@ class MACDStrategyV2Engine:
     def __init__(self, config: MACDStrategyV2Config = None):
         self.config = config or MACDStrategyV2Config()
         self._last_analysis: Dict = {}
+        self._suite_selector = None  # 延迟初始化
+        # 三共振组件 (延迟初始化, 替代 VWAP)
+        self._boll_structure_analyzer = None
+        self._rsi_analyzer = None
+        self._resonance_scorer = None
+
+        # 如果enable_dual_suite,立即初始化三共振组件
+        if self.config.enable_dual_suite:
+            try:
+                from src.indicators.boll_structure_analyzer import BOLLStructureAnalyzer
+                from src.indicators.rsi_analyzer import RSIAnalyzer
+                from src.fund_flow.resonance_scorer import ResonanceScorer
+
+                # BOLL配置
+                boll_cfg = {
+                    'period': self.config.boll_period,
+                    'std_dev': self.config.boll_std_dev,
+                }
+
+                # RSI配置
+                rsi_cfg = {
+                    'period_15m': 7,
+                    'period_1h': self.config.rsi_period,
+                    'period_4h': 21,
+                }
+
+                # 共振配置
+                if hasattr(self.config, '_raw_config') and self.config._raw_config:
+                    resonance_cfg = self.config._raw_config
+                else:
+                    resonance_cfg = {
+                        'fund_flow': {
+                            'macd_mtf_strategy_v2': {
+                                'entry_filters': {
+                                    'resonance_scoring': {
+                                        'enabled': True,
+                                        'weights': {
+                                            'macd_base': 0.4,
+                                            'boll_structure': 0.35,
+                                            'rsi_momentum': 0.25,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    }
+
+                self._boll_structure_analyzer = BOLLStructureAnalyzer(boll_cfg)
+                self._rsi_analyzer = RSIAnalyzer({'rsi_config': rsi_cfg})
+                self._resonance_scorer = ResonanceScorer(resonance_cfg)
+            except Exception as e:
+                logger.warning(f"三共振组件初始化失败: {e}")
+                self._resonance_scorer = None
+
+    def _init_suite_selector(self):
+        """延迟初始化双套件选择器（仅在 enable_dual_suite=True 时）"""
+        if not self.config.enable_dual_suite:
+            self._suite_selector = None
+            return
+
+        from src.indicators.rsi_indicator import RSIIndicator
+        from src.indicators.market_regime_classifier import MarketRegimeClassifier
+        from src.indicators.rsi_mrv_analyzer import RSIMRVAnalyzer
+        from src.indicators.boll_mbv_analyzer import BOLLMBVAnalyzer
+        from src.fund_flow.adaptive_suite_selector import AdaptiveSuiteSelector
+
+        rsi_cfg = {
+            "period_15m": 7,
+            "period_1h": self.config.rsi_period,
+            "period_4h": 21,
+            "divergence_lookback_bars": 10,
+            "divergence_min_price_diff_pct": 0.005,
+            "divergence_min_rsi_diff": 3.0,
+        }
+        suite_cfg = {
+            "adx_trending_threshold": self.config.suite_adx_trending_threshold,
+            "adx_ranging_threshold": self.config.suite_adx_ranging_threshold,
+            "boll_bandwidth_trending_ratio": self.config.suite_boll_bandwidth_trending_ratio,
+            "suite_switch_cooldown_bars_1h": self.config.suite_switch_cooldown_bars_1h,
+            "atr_volatile_threshold": self.config.suite_atr_volatile_threshold,
+        }
+        # 构建 scoring_weights 配置
+        scoring_cfg = {}
+        if hasattr(self.config, 'weight_4h_direction'):
+            scoring_cfg["RSI_MRV_suite"] = {
+                "weight_4h_direction": self.config.weight_4h_direction,
+                "weight_1h_direction": self.config.weight_1h_direction,
+                "weight_rsi_4h": 0.10,
+                "weight_rsi_1h": 0.20,
+                "weight_rsi_divergence": 0.05,
+                "weight_vwap": self.config.weight_vwap,
+                "weight_volume": self.config.weight_volume,
+            }
+            scoring_cfg["BOLL_MBV_suite"] = {
+                "weight_4h_direction": self.config.weight_4h_direction,
+                "weight_1h_direction": self.config.weight_1h_direction,
+                "weight_boll_position": self.config.weight_boll_position if self.config.weight_boll_position > 0 else 0.25,
+                "weight_boll_bandwidth": 0.05,
+                "weight_vwap": self.config.weight_vwap,
+                "weight_volume": self.config.weight_volume,
+            }
+        # RSI gate 配置
+        rsi_gate_cfg = {
+            "enabled": self.config.rsi_gate_enabled,
+            "long_rsi_4h_min": self.config.rsi_gate_long_rsi_4h_min,
+            "long_rsi_1h_min": self.config.rsi_gate_long_rsi_1h_min,
+            "long_rsi_1h_max": self.config.rsi_gate_long_rsi_1h_max,
+            "long_rsi_15m_min": self.config.rsi_gate_long_rsi_15m_min,
+            "short_rsi_4h_max": self.config.rsi_gate_short_rsi_4h_max,
+            "short_rsi_1h_max": self.config.rsi_gate_short_rsi_1h_max,
+            "short_rsi_1h_min": self.config.rsi_gate_short_rsi_1h_min,
+            "short_rsi_15m_max": self.config.rsi_gate_short_rsi_15m_max,
+        }
+        rsi_flip_cfg = {
+            "flip_bullish_rsi_4h_min": self.config.rsi_flip_bullish_rsi_4h_min,
+            "flip_bullish_rsi_1h_min": self.config.rsi_flip_bullish_rsi_1h_min,
+            "flip_bearish_rsi_4h_max": self.config.rsi_flip_bearish_rsi_4h_max,
+            "flip_bearish_rsi_1h_max": self.config.rsi_flip_bearish_rsi_1h_max,
+        }
+        full_config = {
+            "scoring_weights": scoring_cfg,
+            "rsi_config": {
+                **rsi_cfg,
+                "rsi_gate": rsi_gate_cfg,
+                "rsi_flip_override": rsi_flip_cfg,
+            },
+        }
+
+        rsi_indicator = RSIIndicator(rsi_cfg)
+        regime_classifier = MarketRegimeClassifier(suite_cfg)
+        rsi_mrv_analyzer = RSIMRVAnalyzer(full_config, rsi_indicator)
+        boll_mbv_analyzer = BOLLMBVAnalyzer(full_config)
+
+        self._suite_selector = AdaptiveSuiteSelector(
+            config=full_config,
+            rsi_indicator=rsi_indicator,
+            regime_classifier=regime_classifier,
+            rsi_mrv_analyzer=rsi_mrv_analyzer,
+            boll_mbv_analyzer=boll_mbv_analyzer,
+        )
 
     def _build_debug_details(self, **kwargs: Any) -> Dict[str, Any]:
         details = dict(kwargs)
@@ -843,6 +1125,351 @@ class MACDStrategyV2Engine:
             return float(self.config.weight_boll_position) * 0.40
         return 0.0
 
+    def _init_resonance_components(self):
+        """
+        延迟初始化三共振组件 (BOLLStructureAnalyzer + RSIAnalyzer + ResonanceScorer)
+        替代 VWAP 过滤器，在首次使用时初始化
+        """
+        if self._boll_structure_analyzer is not None:
+            return  # 已初始化
+
+        from src.indicators.boll_structure_analyzer import BOLLStructureAnalyzer
+        from src.indicators.rsi_analyzer import RSIAnalyzer
+        from src.fund_flow.resonance_scorer import ResonanceScorer
+
+        # BOLL 结构分析器配置
+        boll_cfg = {
+            "period": 20,
+            "std_dev": 2.0,
+            "min_structure_score_for_entry": 0.55,
+            "hard_block_threshold": 0.20,
+            "bandwidth": {
+                "squeeze_threshold": 0.025,
+                "tight_threshold": 0.045,
+                "normal_threshold": 0.080,
+                "wide_threshold": 0.120,
+                "position_mult_by_state": {
+                    "squeeze": 0.00,
+                    "tight": 0.70,
+                    "normal": 1.00,
+                    "wide": 0.90,
+                    "expanding": 0.70,
+                },
+            },
+            "mid_slope_bonus": {
+                "strong_aligned": 0.05,
+                "weak_aligned": 0.02,
+                "neutral": 0.00,
+                "opposed": -0.10,
+            },
+        }
+
+        # RSI 分析器配置
+        rsi_cfg = {
+            "period_15m": 7,
+            "period_1h": self.config.rsi_period,
+            "period_4h": 21,
+            "overbought": 70,
+            "oversold": 30,
+            "extreme_overbought": 78,
+            "extreme_oversold": 22,
+            "gate": {
+                "long_rsi_4h_min": 43,
+                "long_rsi_1h_min": 43,
+                "long_rsi_1h_max": 70,
+                "long_rsi_15m_min": 47,
+                "long_rsi_15m_slope_positive": True,
+                "short_rsi_4h_max": 57,
+                "short_rsi_1h_max": 57,
+                "short_rsi_1h_min": 30,
+                "short_rsi_15m_max": 53,
+                "short_rsi_15m_slope_negative": True,
+            },
+            "flip_override": {
+                "flip_bullish_rsi_1h_min": 40,
+                "flip_bullish_rsi_4h_min": 40,
+                "flip_bearish_rsi_1h_max": 60,
+                "flip_bearish_rsi_4h_max": 60,
+            },
+            "hard_block": {
+                "long_rsi_1h_max": 70,
+                "short_rsi_1h_min": 30,
+            },
+            "divergence": {
+                "enabled": True,
+                "lookback_bars": 10,
+                "min_price_diff_pct": 0.004,
+                "min_rsi_diff": 3.0,
+                "regular_bullish_bonus": 0.12,
+                "regular_bearish_bonus": 0.12,
+                "hidden_bullish_bonus": 0.08,
+                "hidden_bearish_bonus": 0.08,
+            },
+        }
+
+        # 三共振评分配置 (从实际配置读取)
+        # 尝试从 multiple sources 读取配置
+        resonance_scoring_cfg = None
+
+        # 方法1: 从 filter_cfg 读取 (如果是从 build_macd_v2_config_from_runtime 传入)
+        if hasattr(self.config, '_raw_config') and isinstance(self.config._raw_config, dict):
+            resonance_scoring_cfg = (
+                self.config._raw_config
+                .get('fund_flow', {})
+                .get('macd_mtf_strategy_v2', {})
+                .get('entry_filters', {})
+                .get('resonance_scoring', {})
+            )
+
+        # 方法2: 使用硬编码的默认配置作为后备
+        if not resonance_scoring_cfg:
+            resonance_scoring_cfg = {
+                "enabled": True,
+                "weights": {
+                    "macd_base": 0.40,
+                    "boll_structure": 0.35,
+                    "rsi_momentum": 0.25,
+                },
+                "market_adaptive_weights": {
+                    "trending": {
+                        "macd_base": 0.50,
+                        "boll_structure": 0.30,
+                        "rsi_momentum": 0.20,
+                    },
+                    "ranging": {
+                        "macd_base": 0.35,
+                        "boll_structure": 0.40,
+                        "rsi_momentum": 0.25,
+                    },
+                    "volatile": {
+                        "macd_base": 0.45,
+                        "boll_structure": 0.30,
+                        "rsi_momentum": 0.25,
+                    },
+                },
+                "min_resonance_score_for_entry": 0.55,
+                "strong_resonance_threshold": 0.75,
+                "entry_thresholds_by_signal_type": {
+                    "flip_bullish": 0.60,
+                    "flip_bearish": 0.65,
+                    "green_bar_growing": 0.70,
+                    "red_bar_growing": 0.70,
+                    "green_bar_shrinking": 0.55,
+                    "red_bar_shrinking": 0.55,
+                },
+            }
+
+        # 包装成完整配置结构
+        resonance_cfg = {
+            "fund_flow": {
+                "macd_mtf_strategy_v2": {
+                    "entry_filters": {
+                        "resonance_scoring": resonance_scoring_cfg,
+                    },
+                },
+            },
+        }
+
+        try:
+            logger.info("初始化三共振组件...")
+            self._boll_structure_analyzer = BOLLStructureAnalyzer(boll_cfg)
+            logger.info(f"BOLLStructureAnalyzer initialized: {self._boll_structure_analyzer is not None}")
+            self._rsi_analyzer = RSIAnalyzer({"rsi_config": rsi_cfg})
+            logger.info(f"RSIAnalyzer initialized: {self._rsi_analyzer is not None}")
+            self._resonance_scorer = ResonanceScorer(resonance_cfg)
+            logger.info(f"ResonanceScorer initialized: {self._resonance_scorer is not None}")
+            logger.info("三共振组件初始化成功!")
+        except Exception as e:
+            logger.warning(f"三共振组件初始化失败，将使用降级模式: {e}")
+            import traceback
+            logger.warning(traceback.format_exc())
+            self._boll_structure_analyzer = None
+            self._rsi_analyzer = None
+            self._resonance_scorer = None
+
+    def _calc_boll_rsi_resonance_score(
+        self,
+        *,
+        close_price: float,
+        bb_upper_1h: float,
+        bb_lower_1h: float,
+        bb_middle_1h: float,
+        bb_upper_4h: float = 0.0,
+        bb_lower_4h: float = 0.0,
+        bb_middle_4h: float = 0.0,
+        rsi_1h: float = 50.0,
+        rsi_4h: float = 50.0,
+        bb_middle_slope_1h: float = 0.0,
+        weight: float = 0.20,
+        direction: str = "",
+        signal_type_1h: str = "",
+    ) -> tuple:
+        """
+        BOLL+RSI 共振评分（替换原VWAP评分位）
+
+        基于 RSI＋布林带期市共振战法：
+        - 多头共振: 价格站上中轨(中轨走平/向上) + RSI从30以下回升至30以上 → 1.0
+        - 空头共振: 价格跌破中轨(中轨走平/向下) + RSI从70以上回落至70以下 → 1.0
+        - 超卖反弹: 价格触及下轨 + RSI<30 → 0.85
+        - 超买回调: 价格触及上轨 + RSI>70 → 0.85
+        - 趋势加速: 价格沿上/下轨运行 + RSI在50以上(多)/以下(空)持续 → 1.0
+        - 无效信号: BOLL严重缩口 + RSI在40-60 → 0.0 (直接否决)
+        - 部分共振: 仅满足BOLL或RSI之一 → 0.5
+
+        返回: (score: float, resonance_type: str, detail: dict)
+        """
+        if bb_upper_1h <= bb_lower_1h or bb_middle_1h <= 0 or close_price <= 0:
+            return 0.0, "no_data", {"boll_rsi_resonance": "no_boll_data"}
+
+        band_width_1h = bb_upper_1h - bb_lower_1h
+        relative_pos_1h = (close_price - bb_lower_1h) / max(band_width_1h, 1e-12)
+        relative_pos_1h = self._clamp(relative_pos_1h, -0.2, 1.2)  # 允许带外一点
+
+        # BOLL带宽状态
+        bandwidth_pct = band_width_1h / bb_middle_1h if bb_middle_1h > 0 else 0.05
+        is_squeeze = bandwidth_pct < 0.02  # 严重缩口
+
+        # 中轨方向判断
+        mid_slope_bullish = bb_middle_slope_1h >= 0  # 中轨走平或向上
+        mid_slope_bearish = bb_middle_slope_1h <= 0  # 中轨走平或向下
+
+        # 4H BOLL位置
+        above_mid_4h = bb_middle_4h > 0 and close_price >= bb_middle_4h
+        below_mid_4h = bb_middle_4h > 0 and close_price < bb_middle_4h
+
+        detail = {
+            "relative_pos_1h": round(relative_pos_1h, 3),
+            "bandwidth_pct": round(bandwidth_pct, 4),
+            "is_squeeze": is_squeeze,
+            "rsi_1h": round(rsi_1h, 1),
+            "rsi_4h": round(rsi_4h, 1),
+            "mid_slope_bullish": mid_slope_bullish,
+            "mid_slope_bearish": mid_slope_bearish,
+        }
+
+        # 无效信号：BOLL严重缩口 + RSI在40-60波动 → 直接否决
+        if is_squeeze and 40 <= rsi_1h <= 60:
+            detail["resonance"] = "invalid_squeeze_neutral_rsi"
+            return 0.0, "invalid", detail
+
+        direction_lower = str(direction).lower()
+        raw_score = 0.0
+        resonance_type = "none"
+
+        if direction_lower == "long":
+            # 多头共振：价格站上中轨 + 中轨走平/向上 + RSI从低位回升至30以上
+            above_mid_1h = close_price >= bb_middle_1h
+            rsi_recovering = rsi_1h >= 30  # RSI从30以下回升
+
+            # 触及下轨（超卖区）
+            near_lower = relative_pos_1h < 0.15
+            # 沿上轨运行（趋势加速）
+            along_upper = relative_pos_1h > 0.75
+
+            if above_mid_1h and mid_slope_bullish and rsi_recovering and rsi_1h <= 70:
+                # 完美多头共振
+                raw_score = 1.0
+                resonance_type = "bullish_resonance"
+            elif near_lower and rsi_1h < 30:
+                # 超卖反弹
+                raw_score = 0.85
+                resonance_type = "oversold_bounce"
+            elif along_upper and rsi_1h > 50 and mid_slope_bullish:
+                # 趋势加速
+                raw_score = 1.0
+                resonance_type = "trend_acceleration_long"
+            elif above_mid_1h and rsi_recovering:
+                # 部分共振（价格站上中轨但中轨未走平/向上）
+                raw_score = 0.45
+                resonance_type = "partial_bullish_resonance"
+            elif near_lower and rsi_1h <= 40:
+                # 接近下轨+RSI偏低，轻仓关注
+                raw_score = 0.3
+                resonance_type = "near_lower_low_rsi"
+            elif above_mid_1h and rsi_1h > 50:
+                # 价格在中轨上方+RSI偏多
+                raw_score = 0.35
+                resonance_type = "above_mid_rsi_ok"
+            elif rsi_1h > 70:
+                # RSI超买，减分
+                raw_score = 0.05
+                resonance_type = "overbought_caution"
+            elif above_mid_1h:
+                # 仅价格站上中轨
+                raw_score = 0.15
+                resonance_type = "above_mid_only"
+            else:
+                raw_score = 0.0
+                resonance_type = "weak_long_signal"
+
+        elif direction_lower == "short":
+            # 空头共振：价格跌破中轨 + 中轨走平/向下 + RSI从高位回落至70以下
+            below_mid_1h = close_price < bb_middle_1h
+            rsi_declining = rsi_1h <= 70  # RSI从70以上回落
+
+            # 触及上轨（超买区）
+            near_upper = relative_pos_1h > 0.85
+            # 沿下轨运行（趋势加速）
+            along_lower = relative_pos_1h < 0.25
+
+            if below_mid_1h and mid_slope_bearish and rsi_declining and rsi_1h >= 30:
+                # 完美空头共振
+                raw_score = 1.0
+                resonance_type = "bearish_resonance"
+            elif near_upper and rsi_1h > 70:
+                # 超买回调
+                raw_score = 0.85
+                resonance_type = "overbought_pullback"
+            elif along_lower and rsi_1h < 50 and mid_slope_bearish:
+                # 趋势加速
+                raw_score = 1.0
+                resonance_type = "trend_acceleration_short"
+            elif below_mid_1h and rsi_declining:
+                # 部分共振
+                raw_score = 0.45
+                resonance_type = "partial_bearish_resonance"
+            elif near_upper and rsi_1h >= 60:
+                # 接近上轨+RSI偏高
+                raw_score = 0.3
+                resonance_type = "near_upper_high_rsi"
+            elif below_mid_1h and rsi_1h < 50:
+                # 价格在中轨下方+RSI偏空
+                raw_score = 0.35
+                resonance_type = "below_mid_rsi_ok"
+            elif rsi_1h < 30:
+                # RSI超卖，减分（做空风险）
+                raw_score = 0.05
+                resonance_type = "oversold_caution"
+            elif below_mid_1h:
+                raw_score = 0.15
+                resonance_type = "below_mid_only"
+            else:
+                raw_score = 0.0
+                resonance_type = "weak_short_signal"
+
+        # 4H BOLL位置加成/减分
+        if direction_lower == "long" and above_mid_4h:
+            raw_score = min(1.0, raw_score * 1.1)  # 4H也在中轨上方加分
+        elif direction_lower == "long" and below_mid_4h:
+            raw_score *= 0.85  # 4H在中轨下方减分
+        elif direction_lower == "short" and below_mid_4h:
+            raw_score = min(1.0, raw_score * 1.1)  # 4H也在中轨下方加分
+        elif direction_lower == "short" and above_mid_4h:
+            raw_score *= 0.85  # 4H在中轨上方减分
+
+        # 4H RSI方向加成
+        if direction_lower == "long" and rsi_4h > 50:
+            raw_score = min(1.0, raw_score * 1.05)
+        elif direction_lower == "short" and rsi_4h < 50:
+            raw_score = min(1.0, raw_score * 1.05)
+
+        final_score = self._clamp(raw_score, 0.0, 1.0)
+        detail["resonance"] = resonance_type
+        detail["raw_score"] = round(raw_score, 3)
+        detail["final_score"] = round(final_score, 3)
+
+        return min(weight * final_score, weight), resonance_type, detail
+
     @staticmethod
     def _check_flip_bullish_bottom_structure(
         *,
@@ -900,13 +1527,28 @@ class MACDStrategyV2Engine:
         quadrant = str(market_quadrant or "").strip().upper()
         signal_type = str(signal_type_1h or "").strip().lower()
         vwap_state = str(vwap_execution_state or "").strip().lower()
+        # 顺象限（MACD方向+价格位置一致）+ flip信号 = 最优入场
         if quadrant in {"I", "III"} and signal_type in {"flip_bullish", "flip_bearish"} and vwap_state == "favorable":
             return "tier1"
+        # 逆象限 + flip信号 + VWAP可接受 = 次优入场
         if quadrant in {"II", "IV"} and signal_type in {"flip_bullish", "flip_bearish"} and vwap_state in {
             "discount_reclaim_ok",
             "premium_reject_ok",
         }:
             return "tier2"
+        # 顺象限 + growing信号 = 允许入场
+        if quadrant in {"I", "III"} and signal_type in {"red_bar_growing", "green_bar_growing"}:
+            return "tier2"
+        # 顺象限 + shrinking信号 = 允许入场（需要高信号分）
+        if quadrant in {"I", "III"} and signal_type in {"red_bar_shrinking", "green_bar_shrinking"}:
+            return "tier2"
+        # 逆象限 + growing + VWAP有利 = 允许
+        if quadrant in {"II", "IV"} and signal_type in {"red_bar_growing", "green_bar_growing"} and vwap_state == "favorable":
+            return "tier2"
+        # 逆象限 + flip + 非极端VWAP偏离 = 允许
+        if signal_type in {"flip_bullish", "flip_bearish"} and vwap_state not in {"discount_reclaim_too_far", "premium_reject_too_far"}:
+            return "tier2"
+        # 其余逆象限+非flip = blocked
         return "blocked"
 
     @staticmethod
@@ -2720,6 +3362,348 @@ class MACDStrategyV2Engine:
     
     # ==================== 综合分析 ====================
     
+    def analyze_with_resonance(
+        self,
+        signal: MACDSignalV2,
+        market_regime: str = "TRENDING_BEAR",
+    ) -> MACDSignalV2:
+        """
+        三共振增强分析 (MACD + BOLL + RSI)
+        
+        在原有 analyze() 结果基础上，叠加三共振评分:
+          1. BOLL 结构评分 (替代 VWAP)
+          2. RSI 三时间框架门控
+          3. 信号族白名单细化检查
+          4. 三共振评分聚合
+        
+        如果三共振组件未初始化或评分失败，返回原始 signal (降级模式)
+        """
+        # 初始化三共振组件
+        self._init_resonance_components()
+        
+        if self._resonance_scorer is None:
+            return signal  # 降级: 三共振不可用
+
+        direction = signal.direction
+        if direction not in ("long", "short"):
+            return signal  # neutral 信号不增强
+
+        # 从 signal.details 中提取 BOLL 数据
+        details = signal.details if isinstance(signal.details, dict) else {}
+        boll_upper_4h = float(details.get('bb_upper_4h', 0) or 0)
+        boll_lower_4h = float(details.get('bb_lower_4h', 0) or 0)
+        boll_mid_4h = float(details.get('bb_middle_4h', 0) or 0)
+        close_price = float(details.get('close_price', 0) or 0)
+        bb_bandwidth_4h = float(details.get('bb_bandwidth_4h', 0.05) or 0.05)
+
+        # 检查 BOLL 数据是否完整
+        if boll_upper_4h <= 0 or boll_lower_4h <= 0 or boll_mid_4h <= 0:
+            # BOLL 数据不完整，跳过三共振增强
+            return signal
+
+        # BOLL 结构分析（使用已有数据计算真实评分）
+        from src.indicators.boll_structure_analyzer import BOLLResult
+        bandwidth = (boll_upper_4h - boll_lower_4h) / max(boll_mid_4h, 1e-12)
+        relative_position = (close_price - boll_lower_4h) / max(boll_upper_4h - boll_lower_4h, 1e-12)
+        relative_position = max(0.0, min(1.0, relative_position))
+
+        # 区域定位（与 BOLLStructureAnalyzer.locate_zone 对齐）
+        if close_price > boll_upper_4h:
+            zone = 0  # 上轨外
+        elif close_price >= boll_upper_4h:
+            zone = 1  # 上轨区
+        elif close_price >= boll_mid_4h:
+            zone = 2  # 中上区
+        elif close_price >= boll_lower_4h:
+            zone = 4 if close_price < (boll_mid_4h + boll_lower_4h) / 2 else 3  # 中下区/中性区
+        else:
+            zone = 6  # 下轨外
+
+        # 带宽状态分类（与 BOLLStructureAnalyzer.classify_bandwidth 对齐）
+        if bandwidth < 0.025:
+            bw_state = "squeeze"
+        elif bandwidth < 0.045:
+            bw_state = "tight"
+        elif bandwidth < 0.080:
+            bw_state = "normal"
+        elif bandwidth < 0.120:
+            bw_state = "wide"
+        else:
+            bw_state = "expanding"
+
+        # 使用 BOLLStructureAnalyzer 计算真实 structure_score（如果可用）
+        boll_structure_score = 0.5  # 后备默认值
+        boll_gate_pass = True
+        boll_gate_fail_reason = ""
+        mid_slope_bonus = 0.0
+        if self._boll_structure_analyzer is not None:
+            try:
+                # 使用 analyzer 的评分矩阵计算 structure_score
+                if direction == "long":
+                    zone_score = self._boll_structure_analyzer.long_zone_scores.get(zone, 0.0)
+                elif direction == "short":
+                    zone_score = self._boll_structure_analyzer.short_zone_scores.get(zone, 0.0)
+                else:
+                    zone_score = 0.0
+
+                # 硬性反向禁止
+                if zone_score < 0:
+                    boll_structure_score = 0.0
+                    boll_gate_pass = False
+                    boll_gate_fail_reason = f"BOLL_ZONE_HARD_BLOCK: zone={zone}, dir={direction}"
+                else:
+                    # squeeze 禁止
+                    if bw_state == "squeeze":
+                        boll_structure_score = 0.0
+                        boll_gate_pass = False
+                        boll_gate_fail_reason = "BOLL_SQUEEZE"
+                    else:
+                        boll_structure_score = max(0.0, min(1.0, zone_score + mid_slope_bonus))
+                        boll_gate_pass = boll_structure_score >= self._boll_structure_analyzer.min_score
+                        if not boll_gate_pass:
+                            boll_gate_fail_reason = f"BOLL_GATE_FAIL: {boll_structure_score:.3f} < {self._boll_structure_analyzer.min_score}"
+            except Exception:
+                pass  # 降级使用默认 0.5
+
+        # 构建真实的 BOLLResult
+        boll_result = BOLLResult(
+            upper=boll_upper_4h,
+            mid=boll_mid_4h,
+            lower=boll_lower_4h,
+            bandwidth=bandwidth,
+            bandwidth_state=bw_state,
+            relative_position=relative_position,
+            zone=zone,
+            structure_score=boll_structure_score,
+            gate_pass=boll_gate_pass,
+            gate_fail_reason=boll_gate_fail_reason,
+            mid_slope=0,
+            mid_slope_bonus=mid_slope_bonus,
+        )
+
+        # RSI 分析（使用已有数据计算真实评分）
+        rsi_4h = signal.rsi_4h if hasattr(signal, 'rsi_4h') else 50.0
+        rsi_1h = signal.rsi_val if hasattr(signal, 'rsi_val') else 50.0
+        rsi_15m = signal.rsi_15m if hasattr(signal, 'rsi_15m') else 50.0
+
+        # 构建真实的 RSIResult
+        from src.indicators.rsi_analyzer import RSIResult
+        rsi_gate_pass = True
+        rsi_fail_reason = ""
+
+        # 简化的 RSI 门控检查
+        if direction == "long" and rsi_4h > 75:
+            rsi_gate_pass = False
+            rsi_fail_reason = "rsi_4h_overbought"
+        elif direction == "short" and rsi_4h < 25:
+            rsi_gate_pass = False
+            rsi_fail_reason = "rsi_4h_oversold"
+
+        # 使用 RSIAnalyzer 计算真实 momentum_score（如果可用）
+        rsi_momentum_score = 0.5  # 后备默认值
+        if self._rsi_analyzer is not None:
+            try:
+                score_1h = self._rsi_analyzer.score_rsi(rsi_1h, direction)
+                score_4h = self._rsi_analyzer.score_rsi(rsi_4h, direction)
+                rsi_momentum_score = score_1h * 0.70 + score_4h * 0.30
+            except Exception:
+                pass  # 降级使用默认 0.5
+
+        rsi_result = RSIResult(
+            rsi_4h=rsi_4h,
+            rsi_1h=rsi_1h,
+            rsi_15m=rsi_15m,
+            rsi_slope_1h=signal.rsi_slope_1h if hasattr(signal, 'rsi_slope_1h') else 0.0,
+            rsi_slope_15m=0.0,
+            momentum_score=rsi_momentum_score,
+            gate_pass=rsi_gate_pass,
+            fail_reason=rsi_fail_reason,
+            divergence_type="",
+            divergence_bonus=0.0,
+            rsi_recently_crossed_above_50=False,
+            rsi_recently_crossed_below_50=False,
+            extreme_status=None,
+        )
+
+        if not rsi_gate_pass:
+            return self._neutral_signal(
+                reason=f"rsi_gate_fail:{rsi_fail_reason}",
+                veto_type=VetoType.VWAP_HARD_BLOCK,
+            )
+
+        # 信号族白名单检查
+        from src.fund_flow.signal_whitelist import check_signal_family_whitelist
+        # 将 BOLLResult 和 RSIResult 转换为字典
+        boll_dict = {
+            'upper': boll_result.upper,
+            'mid': boll_result.mid,
+            'lower': boll_result.lower,
+            'bandwidth': boll_result.bandwidth,
+            'bandwidth_state': boll_result.bandwidth_state,
+            'relative_position': boll_result.relative_position,
+            'zone': boll_result.zone,
+            'structure_score': boll_result.structure_score,
+            'gate_pass': boll_result.gate_pass,
+        }
+        rsi_dict = {
+            'rsi_4h': rsi_result.rsi_4h,
+            'rsi_1h': rsi_result.rsi_1h,
+            'rsi_15m': rsi_result.rsi_15m,
+            'rsi_slope_1h': rsi_result.rsi_slope_1h,
+            'gate_pass': rsi_result.gate_pass,
+        }
+        whitelist_result = check_signal_family_whitelist(
+            signal_type=signal.signal_type_1h or "",
+            direction=direction,
+            boll_result=boll_dict,
+            rsi_result=rsi_dict,
+            market_regime=market_regime,
+        )
+        if not whitelist_result["allowed"]:
+            return self._neutral_signal(
+                reason=f"whitelist_fail:{whitelist_result['reason']}",
+            )
+
+        # 专属共振门控（P0: 解锁信号族的精确保护，此处有完整 BOLL/RSI 数据）
+        macd_hist_4h_val = float(details.get('macd_4h_hist_current', 0) or 0)
+        signal_type = signal.signal_type_1h or ""
+
+        if signal_type == "flip_bearish":
+            guard_ok, guard_reason = self._check_flip_bearish_resonance_guards(
+                boll_result=boll_result,
+                rsi_result=rsi_result,
+                macd_hist_4h_current=macd_hist_4h_val,
+            )
+            if not guard_ok:
+                return self._neutral_signal(
+                    reason=guard_reason,
+                )
+
+        if signal_type == "red_bar_growing" and direction == "long":
+            guard_ok, guard_reason = self._check_red_bar_growing_long_guards(
+                boll_result=boll_result,
+                rsi_result=rsi_result,
+                macd_hist_4h_current=macd_hist_4h_val,
+            )
+            if not guard_ok:
+                return self._neutral_signal(
+                    reason=guard_reason,
+                )
+
+        # 三共振评分
+        resonance_result = self._resonance_scorer.compute(
+            direction=direction,
+            macd_base_score=signal.signal_score,
+            boll_result=boll_result,
+            rsi_result=rsi_result,
+            market_regime=market_regime,
+        )
+
+        if not resonance_result["gate_pass"]:
+            return self._neutral_signal(
+                reason=f"resonance_fail:{resonance_result['reason']}",
+            )
+
+        # 更新 signal 的评分和元数据
+        resonance_score = resonance_result["resonance_score"]
+        
+        # 创建增强后的 signal (保留原始字段，更新评分)
+        enhanced = copy.deepcopy(signal)
+        enhanced.signal_score = resonance_score
+        
+        # 更新 details
+        if enhanced.details is None:
+            enhanced.details = {}
+        enhanced.details.update({
+            "resonance_score": resonance_score,
+            "resonance_position_mult": resonance_result.get("position_mult", 1.0),
+            "resonance_leverage": resonance_result.get("leverage", 4),
+            "boll_zone": boll_result.zone,
+            "boll_bw_state": boll_result.bandwidth_state,
+            "boll_structure_score": boll_result.structure_score,
+            "boll_bandwidth_position_mult": getattr(boll_result, 'boll_bandwidth_position_mult', 1.0),
+            "rsi_momentum_score": rsi_result.momentum_score,
+            "rsi_divergence_type": rsi_result.divergence_type,
+            "rsi_extreme_status": getattr(rsi_result, 'extreme_status', None),
+            "rsi_position_adjustment": getattr(rsi_result, 'rsi_position_adjustment', 0.0),
+        })
+        
+        return enhanced
+
+    def _check_flip_bearish_resonance_guards(
+        self,
+        boll_result: Optional[Any],
+        rsi_result: Optional[Any],
+        macd_hist_4h_current: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        flip_bearish 解锁后的专属保护门控
+        替代旧的 disable_flip_bearish_entries = True 的过度限制
+        """
+        guards = self.config.flip_bearish_resonance_guards or {}
+
+        # BOLL 区域评分检查: 必须在中上区或上轨区（做空有利位置）
+        min_boll_score = float(guards.get("min_boll_zone_score", 0.60))
+        if boll_result is not None:
+            boll_score = getattr(boll_result, "structure_score", None)
+            if boll_score is None and isinstance(boll_result, dict):
+                boll_score = boll_result.get("structure_score", 0)
+            if boll_score is not None and float(boll_score) < min_boll_score:
+                return False, f"FLIP_BEARISH_GUARD_BOLL: score={float(boll_score):.3f} < {min_boll_score}"
+
+        # 4H MACD 柱方向检查
+        if guards.get("require_4h_histogram_negative", True):
+            if macd_hist_4h_current >= 0:
+                return False, f"FLIP_BEARISH_GUARD_4H_HIST: histogram={macd_hist_4h_current:.6f} >= 0"
+
+        # RSI 上限检查（不在超买区做空）
+        rsi_1h_max = float(guards.get("rsi_1h_range_max", 60))
+        if rsi_result is not None:
+            rsi_1h = getattr(rsi_result, "rsi_1h", None)
+            if rsi_1h is None and isinstance(rsi_result, dict):
+                rsi_1h = rsi_result.get("rsi_1h", 50)
+            if rsi_1h is not None and float(rsi_1h) > rsi_1h_max:
+                return False, f"FLIP_BEARISH_GUARD_RSI: RSI_1h={float(rsi_1h):.1f} > {rsi_1h_max}"
+
+        return True, None
+
+    def _check_red_bar_growing_long_guards(
+        self,
+        boll_result: Optional[Any],
+        rsi_result: Optional[Any],
+        macd_hist_4h_current: float,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        red_bar_growing 做多解锁后的专属保护门控
+        """
+        guards = self.config.red_bar_growing_long_guards or {}
+
+        # BOLL 区域检查: 必须在中下区或下轨区（做多有利位置）
+        min_boll_score = float(guards.get("min_boll_zone_score_long", 0.65))
+        if boll_result is not None:
+            boll_score = getattr(boll_result, "structure_score", None)
+            if boll_score is None and isinstance(boll_result, dict):
+                boll_score = boll_result.get("structure_score", 0)
+            if boll_score is not None and float(boll_score) < min_boll_score:
+                return False, f"RBG_LONG_GUARD_BOLL: score={float(boll_score):.3f} < {min_boll_score}"
+
+        # 4H MACD 柱方向检查（做多需要 4H 柱为正）
+        if guards.get("require_4h_histogram_positive", True):
+            if macd_hist_4h_current <= 0:
+                return False, f"RBG_LONG_GUARD_4H_HIST: histogram={macd_hist_4h_current:.6f} <= 0"
+
+        # RSI 范围检查
+        rsi_1h_min = float(guards.get("rsi_1h_range_min", 42))
+        rsi_1h_max = float(guards.get("rsi_1h_range_max", 65))
+        if rsi_result is not None:
+            rsi_1h = getattr(rsi_result, "rsi_1h", None)
+            if rsi_1h is None and isinstance(rsi_result, dict):
+                rsi_1h = rsi_result.get("rsi_1h", 50)
+            if rsi_1h is not None and not (rsi_1h_min <= float(rsi_1h) <= rsi_1h_max):
+                return False, f"RBG_LONG_GUARD_RSI: RSI_1h={float(rsi_1h):.1f} not in [{rsi_1h_min},{rsi_1h_max}]"
+
+        return True, None
+
     def analyze(
         self,
         macd_hist_15m: np.ndarray,
@@ -2761,7 +3745,13 @@ class MACDStrategyV2Engine:
         atr_1h: float = 0.0,
         # 空头质量过滤参数（V3专家组建议）
         funding_rate: float = 0.0,
-        oi_delta_ratio: float = 0.0
+        oi_delta_ratio: float = 0.0,
+        # RSI数据
+        rsi_val: float = 50.0,
+        # RSI 多时间框架数据（双套件模式）
+        rsi_4h: float = 50.0,
+        rsi_15m: float = 50.0,
+        rsi_slope_1h: float = 0.0,
     ) -> MACDSignalV2:
         """
         V2.0综合分析
@@ -2985,7 +3975,11 @@ class MACDStrategyV2Engine:
             )
         state_machine_reason = ""
         vwap_execution_state = "legacy"
-        if state_machine_enabled:
+        # 仅当显式启用 quadrant 严格门控时才重置 trade_direction
+        # 原逻辑会将 weight_boll_position > 0 触发严格门控，导致所有非 flip 信号被阻止
+        # 修复：quadrant 门控只在 require_macd_home_advantage=True 时启用
+        use_quadrant_gating = bool(self.config.require_macd_home_advantage)
+        if use_quadrant_gating:
             trade_direction = None
             if bool(self.config.require_macd_home_advantage) and macd_home_side == "neutral":
                 state_machine_reason = "macd_home_advantage_block"
@@ -3278,6 +4272,68 @@ class MACDStrategyV2Engine:
                 ),
             )
 
+        # ========== Step 3.5: RSI动态确认 ==========
+        rsi_used = False
+        boll_used = False
+        rsi_veto = False
+        rsi_score_penalty = 0.0
+
+        # 当双套件模式启用时，RSI门控由套件选择器处理，此处跳过
+        if not self.config.enable_dual_suite and trade_direction and rsi_val is not None:
+            adx_strong = self.config.rsi_adx_threshold_strong
+            adx_weak = self.config.rsi_adx_threshold_weak
+            use_rsi_mode = adx_weak <= adx_1h < adx_strong  # 趋势回调区间
+            use_boll_mode = adx_1h >= adx_strong             # 强趋势区间
+            rsi_used = use_rsi_mode
+            boll_used = use_boll_mode
+
+            if use_rsi_mode:
+                # RSI否决：多头时RSI超买、空头时RSI超卖
+                if trade_direction == 'long' and rsi_val > self.config.rsi_overbought_threshold:
+                    rsi_veto = True
+                elif trade_direction == 'short' and rsi_val < self.config.rsi_oversold_threshold:
+                    rsi_veto = True
+
+                # RSI评分惩罚：对growing家族，RSI不配合时降分
+                signal_type_name = details_1h.get('signal_type', '')
+                if self.config.rsi_require_ok_for_growing and 'growing' in signal_type_name:
+                    if trade_direction == 'long' and rsi_val < 50:
+                        rsi_score_penalty = 0.15
+                    elif trade_direction == 'short' and rsi_val > 50:
+                        rsi_score_penalty = 0.15
+
+                # 对flip家族的可选确认
+                if self.config.rsi_require_ok_for_flip and 'flip' in signal_type_name:
+                    if trade_direction == 'long' and rsi_val < 40:
+                        rsi_score_penalty = 0.10
+                    elif trade_direction == 'short' and rsi_val > 60:
+                        rsi_score_penalty = 0.10
+
+        if rsi_veto:
+            return self._neutral_signal(
+                reason='rsi_veto',
+                signal_type_1h=details_1h.get('signal_type'),
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                vwap_state=vwap_state,
+                vwap_location_score=vwap_location_score,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                details=self._build_debug_details(
+                    rsi_val=rsi_val,
+                    rsi_used=rsi_used,
+                    boll_used=boll_used,
+                    **debug_details,
+                ),
+            )
+
+        debug_details.update(
+            rsi_val=rsi_val,
+            rsi_used=rsi_used,
+            boll_used=boll_used,
+            rsi_score_penalty=rsi_score_penalty,
+        )
+
         # ========== Step 4: MACD_4H 确认增强 ==========
         is_4h_enhanced, enhancement_score = self.check_4h_macd_enhancement(
             macd_hist_4h, idx_4h, trade_direction
@@ -3359,6 +4415,32 @@ class MACDStrategyV2Engine:
                     **debug_details,
                 ),
             )
+        # 禁止green_bar_growing做空（MACD看涨信号做空风险高）
+        if (
+            self.config.disable_green_bar_growing_short_entries
+            and signal_type_1h == 'green_bar_growing'
+            and trade_direction == 'short'
+        ):
+            debug_details = self._set_stage(
+                debug_details,
+                "green_bar_growing_short_disabled",
+                green_bar_growing_short_disabled=True,
+            )
+            return self._neutral_signal(
+                reason='green_bar_growing_short_disabled',
+                signal_type_1h=signal_type_1h,
+                entry_type_15m=entry_type_15m,
+                entry_score_15m=entry_score_15m,
+                vwap_score=vwap_score,
+                vwap_deviation=vwap_deviation,
+                ema_multiplier=ema_multiplier,
+                ema_structure_status=ema_status,
+                enhancement_score=enhancement_score,
+                is_4h_enhanced=is_4h_enhanced,
+                details=self._build_debug_details(
+                    **debug_details,
+                ),
+            )
         if (
             self.config.disable_red_bar_growing_long_entries
             and signal_type_1h == 'red_bar_growing'
@@ -3384,6 +4466,39 @@ class MACDStrategyV2Engine:
                     **debug_details,
                 ),
             )
+        # P0: red_bar_growing_long 已解锁，应用专属门控保护
+        if (
+            not self.config.disable_red_bar_growing_long_entries
+            and signal_type_1h == 'red_bar_growing'
+            and trade_direction == 'long'
+        ):
+            macd_hist_4h_val = float(details_4h.get("hist_current", macd_hist_4h[idx_4h] if idx_4h < len(macd_hist_4h) else 0))
+            guard_ok, guard_reason = self._check_red_bar_growing_long_guards(
+                boll_result=None,
+                rsi_result=None,
+                macd_hist_4h_current=macd_hist_4h_val,
+            )
+            if not guard_ok:
+                debug_details = self._set_stage(
+                    debug_details,
+                    "red_bar_growing_long_guard",
+                    rbg_long_guard_reason=guard_reason,
+                )
+                return self._neutral_signal(
+                    reason=guard_reason,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                    ),
+                )
         if signal_type_1h == 'flip_bullish':
             bullish_vwap_ok, bullish_vwap_reasons, bullish_vwap_details = self.check_flip_bullish_vwap_context(
                 signal_type_1h=signal_type_1h,
@@ -3521,6 +4636,58 @@ class MACDStrategyV2Engine:
                     **debug_details,
                 ),
             )
+
+        # flip_bearish 入场检查（P0: 已解锁，应用专属共振门控保护）
+        if signal_type_1h == 'flip_bearish':
+            if self.config.disable_flip_bearish_entries:
+                debug_details = self._set_stage(
+                    debug_details,
+                    "flip_bearish_disabled",
+                    flip_bearish_disabled=True,
+                )
+                return self._neutral_signal(
+                    reason='flip_bearish_disabled',
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                    ),
+                )
+            # flip_bearish 已解锁，执行专属共振门控
+            macd_hist_4h_val = float(details_4h.get("hist_current", macd_hist_4h[idx_4h] if idx_4h < len(macd_hist_4h) else 0))
+            guard_ok, guard_reason = self._check_flip_bearish_resonance_guards(
+                boll_result=None,  # BOLL 在 analyze_with_resonance 层处理
+                rsi_result=None,   # RSI 在 analyze_with_resonance 层处理
+                macd_hist_4h_current=macd_hist_4h_val,
+            )
+            if not guard_ok:
+                debug_details = self._set_stage(
+                    debug_details,
+                    "flip_bearish_guard",
+                    flip_bearish_guard_reason=guard_reason,
+                )
+                return self._neutral_signal(
+                    reason=guard_reason,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                    ),
+                )
 
         if (
             trade_direction == "long"
@@ -3760,6 +4927,41 @@ class MACDStrategyV2Engine:
                     **debug_details,
                 ),
             )
+        # P0: strict 模式下 rbg_long 也应用专属门控
+        if (
+            strict_1h_filters_enabled
+            and not stable_continuation_active
+            and not self.config.disable_red_bar_growing_long_entries
+            and signal_type_1h == 'red_bar_growing'
+            and trade_direction == 'long'
+        ):
+            macd_hist_4h_val = float(details_4h.get("hist_current", macd_hist_4h[idx_4h] if idx_4h < len(macd_hist_4h) else 0))
+            guard_ok, guard_reason = self._check_red_bar_growing_long_guards(
+                boll_result=None,
+                rsi_result=None,
+                macd_hist_4h_current=macd_hist_4h_val,
+            )
+            if not guard_ok:
+                debug_details = self._set_stage(
+                    debug_details,
+                    "red_bar_growing_long_guard",
+                    rbg_long_guard_reason=guard_reason,
+                )
+                return self._neutral_signal(
+                    reason=guard_reason,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                    ),
+                )
 
         if (
             strict_1h_filters_enabled
@@ -3919,6 +5121,10 @@ class MACDStrategyV2Engine:
         score_1h = 0.0
         score_1h_source = "no_direction_credit"
         score_boll_position = 0.0
+        boll_rsi_resonance_type = "none"
+        boll_rsi_resonance_type_sm = "none"
+        boll_rsi_detail = {}
+        boll_rsi_detail_sm = {}
         entry_tier = "blocked"
 
         neutral_1h_light_credit = (
@@ -3989,7 +5195,24 @@ class MACDStrategyV2Engine:
             )
             score += score_4h_enhancement
 
-            score_vwap = min(weight_vwap * max(0.0, min(1.0, vwap_location_score)), weight_vwap)
+            # BOLL+RSI 共振评分（替换原VWAP评分）
+            score_boll_rsi, boll_rsi_resonance_type, boll_rsi_detail = self._calc_boll_rsi_resonance_score(
+                close_price=float(close_price or 0.0),
+                bb_upper_1h=float(bb_upper_1h or 0.0),
+                bb_lower_1h=float(bb_lower_1h or 0.0),
+                bb_middle_1h=float(bb_middle_1h or 0.0),
+                bb_upper_4h=float(bb_upper_4h or 0.0),
+                bb_lower_4h=float(bb_lower_4h or 0.0),
+                bb_middle_4h=float(bb_middle_4h or 0.0),
+                rsi_1h=rsi_val if rsi_val is not None else 50.0,
+                rsi_4h=rsi_4h,
+                bb_middle_slope_1h=bb_middle_slope_1h,
+                weight=weight_vwap,
+                direction=trade_direction,
+                signal_type_1h=signal_type_1h or "",
+            )
+            # 保留 score_vwap 字段名兼容性
+            score_vwap = score_boll_rsi
             score += score_vwap
 
             if entry_type_15m in ['flip_bullish', 'flip_bearish']:
@@ -4039,7 +5262,23 @@ class MACDStrategyV2Engine:
             )
             score += score_boll_position
 
-            score_vwap = 0.0
+            # BOLL+RSI 共振评分（替换原VWAP评分，状态机路径也使用）
+            score_boll_rsi_sm, boll_rsi_resonance_type_sm, boll_rsi_detail_sm = self._calc_boll_rsi_resonance_score(
+                close_price=float(close_price or 0.0),
+                bb_upper_1h=float(bb_upper_1h or 0.0),
+                bb_lower_1h=float(bb_lower_1h or 0.0),
+                bb_middle_1h=float(bb_middle_1h or 0.0),
+                bb_upper_4h=float(bb_upper_4h or 0.0),
+                bb_lower_4h=float(bb_lower_4h or 0.0),
+                bb_middle_4h=float(bb_middle_4h or 0.0),
+                rsi_1h=rsi_val if rsi_val is not None else 50.0,
+                rsi_4h=rsi_4h,
+                bb_middle_slope_1h=bb_middle_slope_1h,
+                weight=weight_vwap,
+                direction=trade_direction,
+                signal_type_1h=signal_type_1h or "",
+            )
+            score_vwap = score_boll_rsi_sm
             score += score_vwap
 
             score_15m = 0.0
@@ -4101,6 +5340,8 @@ class MACDStrategyV2Engine:
             score_vwap=score_vwap,
             score_15m=score_15m,
             score_volume=score_vol,
+            boll_rsi_resonance_type=boll_rsi_resonance_type if not state_machine_enabled else boll_rsi_resonance_type_sm,
+            boll_rsi_detail=boll_rsi_detail if not state_machine_enabled else boll_rsi_detail_sm,
             pocket_scoring_override_label=pocket_scoring_weights["override_label"],
             pocket_scoring_override=pocket_scoring_weights["raw_override"],
             pocket_weight_1h_direction=weight_1h_direction,
@@ -4471,6 +5712,46 @@ class MACDStrategyV2Engine:
                         ),
                     ),
                 )
+        # Pocket RSI确认
+        if bool(pocket_entry_requirements["raw_override"].get("require_rsi_ok", False)):
+            if trade_direction == 'long' and rsi_val < 50:
+                return self._neutral_signal(
+                    reason="pocket_rsi_block",
+                    score=score,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                        pocket_rsi_val=rsi_val,
+                        pocket_rsi_direction=trade_direction,
+                    ),
+                )
+            elif trade_direction == 'short' and rsi_val > 50:
+                return self._neutral_signal(
+                    reason="pocket_rsi_block",
+                    score=score,
+                    signal_type_1h=signal_type_1h,
+                    entry_type_15m=entry_type_15m,
+                    entry_score_15m=entry_score_15m,
+                    vwap_score=vwap_score,
+                    vwap_deviation=vwap_deviation,
+                    ema_multiplier=ema_multiplier,
+                    ema_structure_status=ema_status,
+                    enhancement_score=enhancement_score,
+                    is_4h_enhanced=is_4h_enhanced,
+                    details=self._build_debug_details(
+                        **debug_details,
+                        pocket_rsi_val=rsi_val,
+                        pocket_rsi_direction=trade_direction,
+                    ),
+                )
         if score < threshold:
             return self._neutral_signal(
                 reason=f'信号评分低于阈值: {score:.2f} < {threshold:.2f}',
@@ -4502,6 +5783,147 @@ class MACDStrategyV2Engine:
         )
         
         # ========== Step 10: 返回结果 ==========
+        # 应用RSI评分惩罚
+        score = max(0.0, score * (1.0 - rsi_score_penalty))
+
+        # ── 双套件分析（Step 10.5）──
+        suite_result_data = {}
+        selected_suite = ""
+        regime = ""
+        suite_score = 0.0
+        rsi_gate_pass = True
+        divergence_data = {}
+
+        # 强制初始化三共振组件 (不依赖 suite_selector)
+        if self._resonance_scorer is None and self.config.enable_dual_suite:
+            # 简化的三共振初始化,不依赖 suite_selector
+            try:
+                from src.indicators.boll_structure_analyzer import BOLLStructureAnalyzer
+                from src.indicators.rsi_analyzer import RSIAnalyzer
+                from src.fund_flow.resonance_scorer import ResonanceScorer
+
+                # BOLL配置
+                boll_cfg_simple = {
+                    'period': self.config.boll_period,
+                    'std_dev': self.config.boll_std_dev,
+                }
+
+                # RSI配置
+                rsi_cfg_simple = {
+                    'period_15m': 7,
+                    'period_1h': self.config.rsi_period,
+                    'period_4h': 21,
+                }
+
+                # 共振配置 (从 _raw_config 读取或使用默认值)
+                if hasattr(self.config, '_raw_config') and self.config._raw_config:
+                    resonance_cfg = self.config._raw_config
+                    print(f"[DEBUG] Using _raw_config for resonance: {type(resonance_cfg)}")
+                else:
+                    resonance_cfg = {
+                        'fund_flow': {
+                            'macd_mtf_strategy_v2': {
+                                'entry_filters': {
+                                    'resonance_scoring': {
+                                        'enabled': True,
+                                        'weights': {
+                                            'macd_base': 0.4,
+                                            'boll_structure': 0.35,
+                                            'rsi_momentum': 0.25,
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    }
+                    print(f"[DEBUG] Using default resonance config")
+
+                print(f"[DEBUG] Initializing BOLLStructureAnalyzer...")
+                self._boll_structure_analyzer = BOLLStructureAnalyzer(boll_cfg_simple)
+                print(f"[DEBUG] Initializing RSIAnalyzer...")
+                self._rsi_analyzer = RSIAnalyzer({'rsi_config': rsi_cfg_simple})
+                print(f"[DEBUG] Initializing ResonanceScorer...")
+                self._resonance_scorer = ResonanceScorer(resonance_cfg)
+                print(f"[DEBUG] ResonanceScorer initialized: {self._resonance_scorer is not None}")
+                print(f"[DEBUG] Resonance weights: {self._resonance_scorer.weights}")
+            except Exception as e:
+                import traceback
+                logger.warning(f"三共振组件初始化失败: {e}")
+                logger.warning(traceback.format_exc())
+                print(f"[ERROR] 三共振组件初始化失败: {e}")
+                traceback.print_exc()
+                self._resonance_scorer = None
+
+        if self.config.enable_dual_suite:
+            if self._suite_selector is None:
+                self._init_suite_selector()
+
+            if self._suite_selector is not None:
+                # 构建 market_data
+                boll_bandwidth_4h = (bb_upper_4h - bb_lower_4h) / bb_middle_4h if bb_middle_4h > 0 else 0.05
+                boll_bandwidth_4h_mean = boll_bandwidth_4h  # 简化：使用当前值（理想情况传入历史均值）
+                macd_hist_4h_val = float(macd_hist_4h[idx_4h]) if idx_4h < len(macd_hist_4h) else 0
+                macd_hist_4h_prev = float(macd_hist_4h[idx_4h - 1]) if idx_4h > 0 and idx_4h - 1 < len(macd_hist_4h) else 0
+                macd_hist_1h_val = float(macd_hist_1h[idx_1h]) if idx_1h < len(macd_hist_1h) else 0
+                atr_pct_1h = atr_1h / close_price if close_price > 0 else 0.01
+
+                market_data = {
+                    "adx_1h": adx_1h,
+                    "atr_pct_1h": atr_pct_1h,
+                    "boll_upper_4h": bb_upper_4h,
+                    "boll_lower_4h": bb_lower_4h,
+                    "boll_mid_4h": bb_middle_4h,
+                    "boll_bandwidth_4h": boll_bandwidth_4h,
+                    "boll_bandwidth_4h_mean": boll_bandwidth_4h_mean,
+                    "macd_histogram_4h": macd_hist_4h_val,
+                    "macd_histogram_4h_prev": macd_hist_4h_prev,
+                    "macd_histogram_1h": macd_hist_1h_val,
+                    "vwap_score": vwap_score,
+                    "volume_ratio": volume_ratio,
+                    "current_price": close_price,
+                    "rsi_1h": rsi_val,
+                    "rsi_4h": rsi_4h,
+                    "rsi_15m": rsi_15m,
+                    "rsi_slope_1h": rsi_slope_1h,
+                }
+
+                suite_analysis = self._suite_selector.select_and_analyze(
+                    symbol="",
+                    direction=trade_direction,
+                    signal_type_1h=signal_type_1h or "",
+                    market_data=market_data,
+                )
+
+                selected_suite = suite_analysis.get("selected_suite", "")
+                regime = suite_analysis.get("regime", "")
+                suite_score = suite_analysis.get("entry_score", 0.0)
+                block_reason = suite_analysis.get("block_reason")
+
+                sr = suite_analysis.get("suite_result") or {}
+                rsi_gate_pass = sr.get("rsi_gate_pass", True)
+                divergence_data = sr.get("divergence", {})
+
+                if not suite_analysis.get("final_gate_pass", False):
+                    return self._neutral_signal(
+                        reason=f"suite_gate:{block_reason}",
+                        score=score,
+                        signal_type_1h=signal_type_1h,
+                        vwap_score=vwap_score,
+                        vwap_deviation=vwap_deviation,
+                        vwap_state=vwap_state,
+                        ema_multiplier=ema_multiplier,
+                        ema_structure_status=ema_status,
+                        details=self._build_debug_details(
+                            **debug_details,
+                            selected_suite=selected_suite,
+                            regime=regime,
+                            suite_score=suite_score,
+                        ),
+                    )
+
+                # 融合评分: MACD 基础分 × 0.7 + 套件分 × 0.3
+                score = score * 0.7 + suite_score * 0.3
+
         final_score = min(score, 1.0)
         
         final_stage_path = self._normalize_stage_path(debug_details.get("stage_path"))
@@ -4577,8 +5999,15 @@ class MACDStrategyV2Engine:
             'stop_loss_pct': stop_pct,
             'stop_details': stop_details,
         }
-        
-        return MACDSignalV2(
+
+        # 将 BOLL 数据添加到 details 中供三共振分析使用
+        self._last_analysis['close_price'] = close_price
+        self._last_analysis['bb_middle_4h'] = bb_middle_4h
+        self._last_analysis['bb_upper_4h'] = bb_upper_4h
+        self._last_analysis['bb_lower_4h'] = bb_lower_4h
+
+        # 构建基础信号
+        base_signal = MACDSignalV2(
             direction=trade_direction,
             signal_score=max(0.0, final_score * (1.0 - vwap_soft_penalty)),
             signal_type_1h=signal_type_1h,
@@ -4599,9 +6028,35 @@ class MACDStrategyV2Engine:
             stop_loss_pct=stop_pct,
             is_trial_entry=is_trial_entry,
             entry_scale=entry_scale,
-            details=self._last_analysis
+            selected_suite=selected_suite,
+            regime=regime,
+            suite_score=suite_score,
+            rsi_gate_pass=rsi_gate_pass,
+            rsi_4h=rsi_4h,
+            rsi_15m=rsi_15m,
+            rsi_slope_1h=rsi_slope_1h,
+            divergence=divergence_data,
+            details=self._last_analysis,
         )
-    
+
+        # 三共振增强处理（不再仅依赖 enable_dual_suite，通过 _init_resonance_components 延迟初始化）
+        if trade_direction in ("long", "short"):
+            self._init_resonance_components()
+        if self._resonance_scorer is not None and trade_direction in ("long", "short"):
+            try:
+                market_regime_str = regime or "TRENDING_BEAR"
+                enhanced_signal = self.analyze_with_resonance(base_signal, market_regime=market_regime_str)
+                # 更新 details 中的共振信息
+                if hasattr(enhanced_signal, 'details') and enhanced_signal.details:
+                    self._last_analysis["resonance_applied"] = True
+                    self._last_analysis["resonance_score"] = getattr(enhanced_signal, 'signal_score', 0.0)
+                return enhanced_signal
+            except Exception as e:
+                logger.warning(f"三共振增强失败，返回基础信号: {e}")
+                self._last_analysis["resonance_error"] = str(e)
+
+        return base_signal
+
     def get_last_analysis(self) -> Dict:
         """获取最近一次分析结果"""
         return self._last_analysis.copy()

@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from src.fund_flow.decision_engine import FundFlowDecisionEngine
 from src.fund_flow.models import Operation
 
@@ -28,6 +30,14 @@ class _StubMacdV2Engine:
 
     def resolve_symbol_risk_session_scale(self, _symbol, session_scale):
         return session_scale
+
+
+class _StubMacdV2EngineAggressive(_StubMacdV2Engine):
+    def calculate_leverage(self, *_args, **_kwargs):
+        return 4
+
+    def calculate_position_portion(self, **_kwargs):
+        return 0.25
 
 
 class _StubMacdV2ShrinkEngine(_StubMacdV2Engine):
@@ -79,6 +89,7 @@ def _signal(direction: str = "long"):
         entry_scale=1.0,
         is_4h_enhanced=False,
         entry_type_15m="flip_bullish" if direction == "long" else "flip_bearish",
+        entry_score_15m=0.35,
         vwap_score=0.18,
         vwap_deviation=0.004,
         vwap_state="above" if direction == "long" else "below",
@@ -285,3 +296,102 @@ def test_macd_v2_fast_exit_closes_long_when_direction_lock_reverses():
     assert decision.operation == Operation.CLOSE
     assert "fast_exit" in decision.reason
     assert decision.metadata["fast_exit_reason"] == "direction_lock_reversed"
+
+
+def test_macd_v2_short_pocket_management_override_applies_tp_plan_and_leverage_floor():
+    cfg = _cfg()
+    cfg["fund_flow"]["min_leverage"] = 2
+    cfg["fund_flow"]["default_leverage"] = 3
+    cfg["fund_flow"]["max_leverage"] = 4
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "pocket_management_overrides": {
+            "green_bar_growing|short_retest_reject": {
+                "leverage_floor": 4,
+                "tp_pct": 0.05,
+                "take_profit_pct_levels": [0.01, 0.016, 0.028],
+                "take_profit_reduce_pct_levels": [0.2, 0.25, 0.15],
+                "time_exit_minutes": 10,
+                "time_exit_min_profit_pct": 0.0005,
+            }
+        }
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    signal = _signal("short")
+    signal.signal_type_1h = "green_bar_growing"
+    signal.entry_type_15m = "green_bar_growing"
+    signal.vwap_state = "short_retest_reject"
+    engine.macd_v2_engine = _StubMacdV2Engine(signal)
+    flow_context = _context()
+    flow_context["cvd_ratio"] = -0.10
+    flow_context["oi_delta_ratio"] = -0.02
+    flow_context["depth_ratio"] = 0.97
+    flow_context["imbalance"] = -0.04
+    flow_context["cvd_momentum"] = -0.03
+    flow_context["timeframes"]["15m"]["cvd_ratio"] = -0.10
+    flow_context["timeframes"]["15m"]["depth_ratio"] = 0.97
+    flow_context["timeframes"]["15m"]["imbalance"] = -0.04
+    flow_context["timeframes"]["15m"]["cvd_momentum"] = -0.03
+    flow_context["timeframes"]["1h"]["oi_delta_ratio"] = -0.02
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=98.5,
+        market_flow_context=flow_context,
+        regime_info={"regime": "TREND", "direction": "SHORT_ONLY", "adx": 28.0, "atr_pct": 0.01},
+    )
+
+    assert decision.operation == Operation.SELL
+    assert decision.leverage == 4
+    assert decision.take_profit_price == pytest.approx(98.5 * 0.95, rel=1e-9)
+    assert decision.metadata["pocket_management_override"]["time_exit_minutes"] == 10
+    assert decision.metadata["tp_levels"] == [
+        {"price": 98.5 * 0.99, "reduce_pct": 0.2},
+        {"price": 98.5 * 0.984, "reduce_pct": 0.25},
+        {"price": 98.5 * 0.972, "reduce_pct": 0.15},
+    ]
+
+
+def test_macd_v2_short_pocket_management_override_can_cap_leverage_and_position():
+    cfg = _cfg()
+    cfg["fund_flow"]["min_leverage"] = 2
+    cfg["fund_flow"]["default_leverage"] = 3
+    cfg["fund_flow"]["max_leverage"] = 4
+    cfg["fund_flow"]["macd_mtf_strategy_v2"] = {
+        "pocket_management_overrides": {
+            "green_bar_growing|short_below_session_above_structure": {
+                "leverage_cap": 2,
+                "position_scale": 0.9,
+                "max_target_portion": 0.15,
+            }
+        }
+    }
+    engine = FundFlowDecisionEngine(cfg)
+    signal = _signal("short")
+    signal.signal_type_1h = "green_bar_growing"
+    signal.entry_type_15m = "green_bar_growing"
+    signal.vwap_state = "short_below_session_above_structure"
+    engine.macd_v2_engine = _StubMacdV2EngineAggressive(signal)
+    flow_context = _context()
+    flow_context["cvd_ratio"] = -0.10
+    flow_context["oi_delta_ratio"] = -0.02
+    flow_context["depth_ratio"] = 0.97
+    flow_context["imbalance"] = -0.04
+    flow_context["cvd_momentum"] = -0.03
+    flow_context["timeframes"]["15m"]["cvd_ratio"] = -0.10
+    flow_context["timeframes"]["15m"]["depth_ratio"] = 0.97
+    flow_context["timeframes"]["15m"]["imbalance"] = -0.04
+    flow_context["timeframes"]["15m"]["cvd_momentum"] = -0.03
+    flow_context["timeframes"]["1h"]["oi_delta_ratio"] = -0.02
+
+    decision = engine._decide_macd_v2_strategy(
+        symbol="BTCUSDT",
+        portfolio={"positions": {}},
+        price=98.5,
+        market_flow_context=flow_context,
+        regime_info={"regime": "TREND", "direction": "SHORT_ONLY", "adx": 28.0, "atr_pct": 0.01},
+    )
+
+    assert decision.operation == Operation.SELL
+    assert decision.leverage == 2
+    assert decision.target_portion_of_balance == pytest.approx(0.15, rel=1e-9)

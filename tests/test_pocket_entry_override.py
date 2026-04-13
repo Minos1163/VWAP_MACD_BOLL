@@ -1,7 +1,21 @@
+import json
+from pathlib import Path
+
 import pytest
 
 from src.fund_flow.macd_strategy_v2 import check_pocket_entry_override
 from src.fund_flow.decision_engine import get_vwap_structure_position_scale
+
+
+CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "trading_config_fund_flow.json"
+
+
+def _load_main_macd_v2_config():
+    with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+        config = json.load(fh)
+    strategy_cfg = config["fund_flow"]["macd_mtf_strategy_v2"]
+    assert isinstance(strategy_cfg, dict), "main MACD V2 config block not found"
+    return strategy_cfg
 
 
 E2_OVERRIDES = {
@@ -130,6 +144,175 @@ def test_no_override_always_passes():
     )
     assert passed
     assert "NO_OVERRIDE" in reason
+
+
+def test_disabled_override_blocks_immediately():
+    passed, reason = check_pocket_entry_override(
+        signal_type="green_bar_shrinking",
+        vwap_state="short_retest_reject",
+        is_trial_entry=False,
+        signal_score=0.95,
+        vwap_score=0.20,
+        entry_score=0.60,
+        bar_1h_direction="BEARISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides={
+            "green_bar_shrinking|short_retest_reject": {
+                "disabled": True,
+            }
+        },
+    )
+    assert not passed
+    assert "DISABLED" in reason
+
+
+def test_main_config_raises_red_bar_growing_threshold_to_min_signal_floor():
+    strategy_cfg = _load_main_macd_v2_config()
+    thresholds = strategy_cfg["entry_thresholds"]
+
+    assert thresholds["red_bar_growing"] == pytest.approx(1.20)
+    assert thresholds["green_bar_growing"] == pytest.approx(1.20)
+
+
+def test_main_config_disables_red_bar_growing_short_under_structure_wait_reject():
+    strategy_cfg = _load_main_macd_v2_config()
+    overrides = strategy_cfg["entry_filters"]["pocket_entry_overrides"]
+
+    assert overrides["red_bar_growing|short_under_structure_wait_reject"]["disabled"] is True
+
+
+def test_main_config_disables_red_bar_growing_short_above_both():
+    strategy_cfg = _load_main_macd_v2_config()
+    overrides = strategy_cfg["entry_filters"]["pocket_entry_overrides"]
+
+    assert overrides["red_bar_growing|short_above_both"]["disabled"] is True
+
+
+def test_main_config_retains_only_strict_red_bar_growing_short_dual_pressure():
+    strategy_cfg = _load_main_macd_v2_config()
+    override = strategy_cfg["entry_filters"]["pocket_entry_overrides"]["red_bar_growing|short_dual_pressure"]
+
+    assert override["allow_neutral_1h_confirmation"] is False
+    assert override["require_strict_1h_confirmation"] is True
+    assert override["strict_1h_direction"] == "bearish"
+    assert override["disallow_trial_entry"] is True
+    assert override["require_cvd_ok"] is True
+    assert override["require_cvd_momentum_ok"] is True
+    assert override["min_signal_score"] == pytest.approx(0.90)
+    assert override["min_vwap_score"] == pytest.approx(0.16)
+    assert override["min_entry_score"] == pytest.approx(0.35)
+
+
+def test_main_config_short_dual_pressure_blocks_trial_entry():
+    strategy_cfg = _load_main_macd_v2_config()
+    passed, reason = check_pocket_entry_override(
+        signal_type="red_bar_growing",
+        vwap_state="short_dual_pressure",
+        is_trial_entry=True,
+        signal_score=0.95,
+        vwap_score=0.20,
+        entry_score=0.40,
+        bar_1h_direction="BEARISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides=strategy_cfg["entry_filters"]["pocket_entry_overrides"],
+    )
+
+    assert not passed
+    assert "TRIAL_DISALLOWED" in reason
+
+
+def test_main_config_disables_green_bar_growing_long_above_structure_wait_reclaim():
+    strategy_cfg = _load_main_macd_v2_config()
+    overrides = strategy_cfg["entry_filters"]["pocket_entry_overrides"]
+
+    assert overrides["green_bar_growing|long_above_structure_wait_reclaim"]["disabled"] is True
+
+
+def test_main_config_disabled_green_bar_long_above_structure_blocks_immediately():
+    strategy_cfg = _load_main_macd_v2_config()
+    passed, reason = check_pocket_entry_override(
+        signal_type="green_bar_growing",
+        vwap_state="long_above_structure_wait_reclaim",
+        is_trial_entry=False,
+        signal_score=0.95,
+        vwap_score=0.20,
+        entry_score=0.40,
+        bar_1h_direction="BULLISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides=strategy_cfg["entry_filters"]["pocket_entry_overrides"],
+    )
+
+    assert not passed
+    assert "DISABLED" in reason
+
+
+def test_main_config_disables_green_bar_growing_long_below_both():
+    strategy_cfg = _load_main_macd_v2_config()
+    overrides = strategy_cfg["entry_filters"]["pocket_entry_overrides"]
+
+    assert overrides["green_bar_growing|long_below_both"]["disabled"] is True
+
+
+def test_main_config_green_bar_long_dual_support_is_strict_non_trial():
+    strategy_cfg = _load_main_macd_v2_config()
+    override = strategy_cfg["entry_filters"]["pocket_entry_overrides"]["green_bar_growing|long_dual_support"]
+
+    assert override["allow_neutral_1h_confirmation"] is False
+    assert override["require_strict_1h_confirmation"] is True
+    assert override["disallow_trial_entry"] is True
+    assert override["min_signal_score"] == pytest.approx(0.90)
+    assert override["min_vwap_score"] == pytest.approx(0.12)
+    assert override["min_entry_score"] == pytest.approx(0.35)
+    assert override["require_cvd_ok"] is True
+    assert override["require_cvd_momentum_ok"] is True
+
+
+def test_main_config_green_bar_long_dual_support_blocks_trial_entry():
+    strategy_cfg = _load_main_macd_v2_config()
+    passed, reason = check_pocket_entry_override(
+        signal_type="green_bar_growing",
+        vwap_state="long_dual_support",
+        is_trial_entry=True,
+        signal_score=0.95,
+        vwap_score=0.20,
+        entry_score=0.40,
+        bar_1h_direction="BULLISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides=strategy_cfg["entry_filters"]["pocket_entry_overrides"],
+    )
+
+    assert not passed
+    assert "TRIAL_DISALLOWED" in reason
+
+
+def test_main_config_disables_red_bar_growing_short_retest_reject():
+    strategy_cfg = _load_main_macd_v2_config()
+    overrides = strategy_cfg["entry_filters"]["pocket_entry_overrides"]
+
+    assert overrides["red_bar_growing|short_retest_reject"]["disabled"] is True
+
+
+def test_main_config_disabled_red_bar_short_retest_reject_blocks_immediately():
+    strategy_cfg = _load_main_macd_v2_config()
+    passed, reason = check_pocket_entry_override(
+        signal_type="red_bar_growing",
+        vwap_state="short_retest_reject",
+        is_trial_entry=False,
+        signal_score=0.95,
+        vwap_score=0.20,
+        entry_score=0.40,
+        bar_1h_direction="BEARISH",
+        flow_cvd_ok=True,
+        micro_cvd_momentum_ok=True,
+        pocket_entry_overrides=strategy_cfg["entry_filters"]["pocket_entry_overrides"],
+    )
+
+    assert not passed
+    assert "DISABLED" in reason
 
 
 def test_vwap_structure_scale_long_dual_support():

@@ -488,6 +488,10 @@ class MarketDataManager:
                 "macd_hist_series": _series_tail(hist_series),
                 "ema30_slope": ema30_slope_value,
                 "ema30_slope_pct": (ema30_slope_value / ema_mid_value) if abs(ema_mid_value) > 1e-9 else 0.0,
+                "rsi": calculate_rsi(close, period=14) or 50.0,
+                "rsi_7": calculate_rsi(close, period=7) or 50.0,
+                "rsi_21": calculate_rsi(close, period=21) or 50.0,
+                "bb_width_pct": (bb_upper - bb_lower) / bb_middle if bb_middle > 0 else 0.0,
             }
 
             # 归一化辅助函数

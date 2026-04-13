@@ -240,6 +240,268 @@ def test_flip_bullish_trial_score_window_blocks_out_of_window_scores() -> None:
     assert "flip_bullish_trial_score_window" in reason
 
 
+def test_red_bar_shrinking_global_disable_blocks_signal_family() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            weight_1h_direction=0.2,
+            weight_4h_direction=0.0,
+            weight_4h_enhancement=0.0,
+            weight_vwap=0.0,
+            weight_15m_entry=0.0,
+            weight_volume=0.0,
+            min_signal_score=0.1,
+            min_entry_score=0.1,
+            red_bar_shrinking_min_signal_score=0.1,
+            red_bar_growing_min_signal_score=0.1,
+            flip_bullish_min_signal_score=0.1,
+            min_vwap_score_for_entry=0.0,
+            overheat_growing_penalty=0.0,
+            disable_red_bar_shrinking_entries=True,
+            disable_flip_bullish_entries=False,
+            disable_green_bar_growing_entries=False,
+            primary_direction_timeframe="1h",
+        )
+    )
+
+    signal = engine.analyze(
+        macd_hist_15m=np.array([0.01, 0.02, 0.03, 0.04]),
+        macd_hist_1h=np.array([0.40, 0.30, 0.20, 0.10]),
+        macd_hist_4h=np.array([0.10, 0.10, 0.10, 0.10]),
+        idx_15m=3,
+        idx_1h=3,
+        idx_4h=3,
+        volume_ratio=1.0,
+        vwap=100.0,
+        structural_vwap=100.0,
+        close_price=100.0,
+        bb_middle_1h=100.0,
+        bb_upper_1h=110.0,
+        bb_lower_1h=90.0,
+        bb_middle_4h=100.0,
+        bb_upper_4h=110.0,
+        bb_lower_4h=90.0,
+        bb_middle_15m=100.0,
+        bb_upper_15m=103.0,
+        bb_lower_15m=97.0,
+        close_15m=100.0,
+        adx_1h=20.0,
+        adx_4h=20.0,
+        atr_1h=1.0,
+    )
+
+    assert signal.direction == "neutral"
+    assert signal.signal_type_1h == "red_bar_shrinking"
+    assert signal.details["reason"] == "red_bar_shrinking_disabled"
+    assert signal.details["reject_reason_code"] == "red_bar_shrinking_disabled"
+
+
+def test_market_quadrant_classification_uses_4h_macd_and_1h_boll_mid() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config())
+
+    assert engine._classify_market_quadrant(0.2, 101.0, 100.0) == "I"
+    assert engine._classify_market_quadrant(0.2, 99.0, 100.0) == "II"
+    assert engine._classify_market_quadrant(-0.2, 99.0, 100.0) == "III"
+    assert engine._classify_market_quadrant(-0.2, 101.0, 100.0) == "IV"
+
+
+def test_boll_position_score_prefers_midline_reclaim_over_upper_band_chase() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config(weight_boll_position=0.25))
+
+    near_mid = engine._calc_boll_position_score(
+        close_price=100.8,
+        bb_upper=110.0,
+        bb_lower=90.0,
+        bb_middle=100.0,
+        direction="long",
+    )
+    near_upper = engine._calc_boll_position_score(
+        close_price=109.5,
+        bb_upper=110.0,
+        bb_lower=90.0,
+        bb_middle=100.0,
+        direction="long",
+    )
+    below_mid = engine._calc_boll_position_score(
+        close_price=98.0,
+        bb_upper=110.0,
+        bb_lower=90.0,
+        bb_middle=100.0,
+        direction="long",
+    )
+
+    assert near_mid == pytest.approx(0.25, rel=1e-6)
+    assert near_upper < near_mid
+    assert below_mid == pytest.approx(0.0, rel=1e-6)
+
+
+def test_flip_bullish_bottom_structure_allows_recent_zero_cross_after_convergence() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config())
+
+    ok, bars = engine._check_flip_bullish_bottom_structure(
+        macd_line_current=-0.05,
+        macd_line_series=np.array([-0.20, -0.15, -0.10, -0.08, -0.05]),
+    )
+    assert ok is True
+    assert bars >= 3
+
+    crossing_ok, crossing_bars = engine._check_flip_bullish_bottom_structure(
+        macd_line_current=0.02,
+        macd_line_series=np.array([-0.20, -0.15, -0.10, 0.02, 0.03]),
+    )
+    assert crossing_ok is True
+    assert crossing_bars >= 2
+
+    bad_ok, bad_bars = engine._check_flip_bullish_bottom_structure(
+        macd_line_current=0.02,
+        macd_line_series=np.array([-0.20, -0.15, -0.16, 0.02, 0.03]),
+    )
+    assert bad_ok is False
+    assert bad_bars < 2
+
+
+def test_flip_bearish_vwap_context_allows_favorable_only_in_quadrant_iii() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config(flip_bearish_retest_reject_min_vwap_score=0.18))
+
+    ok, reasons, details = engine.check_flip_bearish_vwap_context(
+        signal_type_1h="flip_bearish",
+        market_quadrant="III",
+        vwap_state="short_dual_pressure",
+        vwap_execution_state="favorable",
+        vwap_score=0.05,
+        structural_vwap=0.0,
+        session_deviation=-0.01,
+        structural_deviation=-0.01,
+    )
+    assert ok is True
+    assert reasons == []
+    assert "favorable" in details["flip_bearish_allowed_vwap_states"]
+
+    ok, reasons, _details = engine.check_flip_bearish_vwap_context(
+        signal_type_1h="flip_bearish",
+        market_quadrant="IV",
+        vwap_state="short_dual_pressure",
+        vwap_execution_state="favorable",
+        vwap_score=0.05,
+        structural_vwap=100.0,
+        session_deviation=-0.01,
+        structural_deviation=-0.01,
+    )
+    assert ok is False
+    assert any("vwap_state=short_dual_pressure" in reason for reason in reasons)
+
+
+def test_state_machine_gates_green_bar_growing_below_boll_mid_even_when_4h_home_is_long() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            weight_1h_direction=0.25,
+            weight_4h_direction=0.35,
+            weight_boll_position=0.25,
+            weight_vwap=0.05,
+            weight_15m_entry=0.0,
+            weight_volume=0.10,
+            min_signal_score=0.1,
+            min_entry_score=0.1,
+            green_bar_growing_score_window_enabled=False,
+            red_bar_growing_min_signal_score=0.1,
+            flip_bullish_min_signal_score=0.1,
+            min_vwap_score_for_entry=0.0,
+            overheat_growing_penalty=0.0,
+            disable_flip_bullish_entries=False,
+            disable_green_bar_growing_entries=False,
+            require_macd_home_advantage=True,
+            disable_red_bar_shrinking_entries=True,
+            disable_green_bar_shrinking_entries=True,
+            primary_direction_timeframe="4h",
+        )
+    )
+
+    signal = engine.analyze(
+        macd_hist_15m=np.array([0.01, 0.02, 0.03, 0.04]),
+        macd_hist_1h=np.array([0.05, 0.08, 0.10, 0.12]),
+        macd_hist_4h=np.array([0.10, 0.12, 0.15, 0.18]),
+        idx_15m=3,
+        idx_1h=3,
+        idx_4h=3,
+        volume_ratio=1.2,
+        vwap=100.0,
+        structural_vwap=100.0,
+        close_price=99.0,
+        bb_middle_1h=100.0,
+        bb_upper_1h=110.0,
+        bb_lower_1h=90.0,
+        bb_middle_4h=99.0,
+        bb_upper_4h=109.0,
+        bb_lower_4h=89.0,
+        bb_middle_15m=100.0,
+        bb_upper_15m=103.0,
+        bb_lower_15m=97.0,
+        close_15m=99.0,
+        close_1h_series=np.array([98.0, 98.5, 99.0, 99.5, 99.0]),
+        close_4h_series=np.array([95.0, 96.0, 97.0, 98.0, 99.0]),
+        adx_1h=22.0,
+        adx_4h=25.0,
+        atr_1h=1.0,
+        macd_line_1h=0.08,
+        macd_line_4h=0.20,
+    )
+
+    assert signal.direction == "neutral"
+    assert signal.details["reject_reason_code"] == "quadrant_signal_block"
+    assert signal.details["market_quadrant"] == "II"
+
+
+def test_state_machine_assigns_tier1_to_quadrant_i_flip_bullish_with_favorable_vwap() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config())
+
+    tier = engine._resolve_entry_tier(
+        market_quadrant="I",
+        signal_type_1h="flip_bullish",
+        vwap_execution_state="favorable",
+    )
+    assert tier == "tier1"
+
+    fallback_tier = engine._resolve_entry_tier(
+        market_quadrant="II",
+        signal_type_1h="flip_bullish",
+        vwap_execution_state="discount_reclaim_ok",
+    )
+    assert fallback_tier == "tier2"
+
+    blocked_growing = engine._resolve_entry_tier(
+        market_quadrant="I",
+        signal_type_1h="green_bar_growing",
+        vwap_execution_state="favorable",
+    )
+    assert blocked_growing == "blocked"
+
+
+def test_entry_tier_maps_directly_to_leverage_and_target_portion() -> None:
+    engine = MACDStrategyV2Engine(MACDStrategyV2Config())
+
+    assert engine.calculate_leverage(0.2, entry_tier="tier1") == 5
+    assert engine.calculate_leverage(0.2, entry_tier="tier2") == 4
+    assert engine.calculate_leverage(0.2, entry_tier="tier3") == 3
+
+    assert engine.calculate_position_portion(
+        score=0.2,
+        base_default_portion=0.22,
+        base_max_symbol_position_portion=0.5,
+        entry_tier="tier1",
+    ) == pytest.approx(0.30, rel=1e-6)
+    assert engine.calculate_position_portion(
+        score=0.2,
+        base_default_portion=0.22,
+        base_max_symbol_position_portion=0.5,
+        entry_tier="tier2",
+    ) == pytest.approx(0.25, rel=1e-6)
+    assert engine.calculate_position_portion(
+        score=0.2,
+        base_default_portion=0.22,
+        base_max_symbol_position_portion=0.5,
+        entry_tier="tier3",
+    ) == pytest.approx(0.20, rel=1e-6)
+
+
 def test_green_bar_growing_score_window_blocks_extreme_scores() -> None:
     engine = MACDStrategyV2Engine(
         MACDStrategyV2Config(

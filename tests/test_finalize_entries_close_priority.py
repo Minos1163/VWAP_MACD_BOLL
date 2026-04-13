@@ -252,6 +252,45 @@ def test_finalize_entries_ai_review_log_only_keeps_candidate():
     assert review_md.get("allow_ai_entry") is False
 
 
+def test_finalize_entries_skips_open_candidate_with_blocked_entry_tier():
+    bot = _make_bot(active_symbols={})
+    bot.position_data = SimpleNamespace(get_all_positions=lambda: {})
+    context = {
+        "pending_new_entries": [
+            {
+                "symbol": "XRPUSDT",
+                "score": 0.61,
+                "max_active_symbols": 3,
+                "decision": _decision_with_md(
+                    "XRPUSDT",
+                    FundFlowOperation.BUY,
+                    {
+                        "entry_tier": "blocked",
+                        "signal_type_1h": "green_bar_growing",
+                        "vwap_state": "long_above_structure_wait_reclaim",
+                    },
+                ),
+                "position": None,
+                "current_price": 2.0,
+                "trigger_context": {},
+                "portfolio": {},
+                "account_summary": {"available_balance": 1000.0},
+            }
+        ],
+        "block_new_entries_due_to_protection_gap": False,
+        "protection_gap_symbols": [],
+        "max_active_symbols": 3,
+        "account_summary": {"available_balance": 1000.0},
+        "ai_gate_enabled": False,
+        "ai_review_cfg": {},
+        "ai_review_mode": "disabled",
+    }
+
+    bot._finalize_entries(context)
+
+    assert bot._executed == []
+
+
 def test_finalize_entries_blocks_new_candidate_when_position_snapshot_already_hits_capacity():
     bot = _make_bot(active_symbols={})
     bot._position_snapshot_by_symbol = lambda *_args, **_kwargs: {}
@@ -287,6 +326,285 @@ def test_finalize_entries_blocks_new_candidate_when_position_snapshot_already_hi
     bot._finalize_entries(context)
 
     assert bot._executed == []
+
+
+def test_select_open_candidates_with_replacement_prefers_worst_tier3_position():
+    bot = _make_bot(active_symbols={})
+    candidate = {
+        "symbol": "BTCUSDT",
+        "score": 0.96,
+        "max_active_symbols": 2,
+        "decision": _decision_with_md(
+            "BTCUSDT",
+            FundFlowOperation.BUY,
+            {
+                "entry_tier": "tier1",
+                "signal_type_1h": "red_bar_growing",
+                "vwap_state": "long_reclaim_confirmed",
+                "test_score": 0.96,
+            },
+        ),
+    }
+
+    selected = bot.select_open_candidates_with_replacement(
+        [candidate],
+        active_positions={
+            "ETHUSDT": {"entry_tier": "tier2", "signal_score": 0.40, "unrealized_pnl_ratio": -0.10},
+            "DOGEUSDT": {"entry_tier": "tier3", "signal_score": 0.55, "unrealized_pnl_ratio": -0.08},
+            "XRPUSDT": {"entry_tier": "tier3", "signal_score": 0.60, "unrealized_pnl_ratio": -0.21},
+        },
+        active_count=2,
+        ai_review_cfg={},
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["capacity_replacement_candidate"] is True
+    assert selected[0]["capacity_replacement_target"]["symbol"] == "XRPUSDT"
+
+
+def test_finalize_entries_executes_capacity_replacement_for_tier1_candidate():
+    bot = _make_bot(active_symbols={})
+    bot._position_snapshot_by_symbol = lambda *_args, **_kwargs: {
+        "DOGEUSDT": {"entry_tier": "tier3", "signal_score": 0.55, "unrealized_pnl_ratio": -0.18},
+        "ETHUSDT": {"entry_tier": "tier2", "signal_score": 0.72, "unrealized_pnl_ratio": 0.03},
+    }
+    context = {
+        "pending_new_entries": [
+            {
+                "symbol": "BTCUSDT",
+                "score": 0.96,
+                "max_active_symbols": 2,
+                "decision": _decision_with_md(
+                    "BTCUSDT",
+                    FundFlowOperation.BUY,
+                    {
+                        "entry_tier": "tier1",
+                        "signal_type_1h": "red_bar_growing",
+                        "vwap_state": "long_reclaim_confirmed",
+                        "test_score": 0.96,
+                    },
+                ),
+                "position": None,
+                "current_price": 100.0,
+                "trigger_context": {},
+                "portfolio": {},
+                "flow_context": {},
+                "account_summary": {"available_balance": 1000.0},
+            },
+        ],
+        "position_snapshot": {
+            "DOGEUSDT": {"side": "LONG"},
+            "ETHUSDT": {"side": "LONG"},
+        },
+        "block_new_entries_due_to_protection_gap": False,
+        "protection_gap_symbols": [],
+        "max_active_symbols": 2,
+        "account_summary": {"available_balance": 1000.0},
+        "ai_gate_enabled": False,
+        "ai_review_cfg": {},
+        "ai_review_mode": "disabled",
+    }
+
+    bot._finalize_entries(context)
+
+    assert len(bot._executed) == 2
+    assert bot._executed[0]["symbol"] == "DOGEUSDT"
+    assert bot._executed[0]["decision"].operation == FundFlowOperation.CLOSE
+    assert bot._executed[1]["symbol"] == "BTCUSDT"
+    assert bot._executed[1]["decision"].operation == FundFlowOperation.BUY
+    assert bot._executed[1]["decision"].metadata["capacity_replacement_candidate"] is True
+    assert bot._executed[1]["decision"].metadata["capacity_replacement_target"]["symbol"] == "DOGEUSDT"
+
+
+def test_finalize_entries_priority_bonus_can_push_short_retest_reject_ahead_in_sort():
+    bot = _make_bot(active_symbols={})
+    bot.position_data = SimpleNamespace(get_all_positions=lambda: {})
+    bot._ai_review_mode_supports_flat_candidates = lambda _mode: False
+    context = {
+        "pending_new_entries": [
+            {
+                "symbol": "AAAUSDT",
+                "score": 0.90,
+                "max_active_symbols": 5,
+                "decision": _decision_with_md(
+                    "AAAUSDT",
+                    FundFlowOperation.BUY,
+                    {
+                        "test_score": 0.90,
+                        "signal_type_1h": "flip_bullish",
+                        "vwap_state": "long_reclaim_confirmed",
+                    },
+                ),
+                "position": None,
+                "current_price": 1.0,
+                "trigger_context": {},
+                "portfolio": {},
+                "account_summary": {"available_balance": 1000.0},
+            },
+            {
+                "symbol": "BBBUSDT",
+                "score": 0.86,
+                "max_active_symbols": 5,
+                "decision": _decision_with_md(
+                    "BBBUSDT",
+                    FundFlowOperation.SELL,
+                    {
+                        "test_score": 0.86,
+                        "signal_type_1h": "green_bar_growing",
+                        "vwap_state": "short_retest_reject",
+                    },
+                ),
+                "position": None,
+                "current_price": 1.0,
+                "trigger_context": {},
+                "portfolio": {},
+                "account_summary": {"available_balance": 1000.0},
+            },
+        ],
+        "block_new_entries_due_to_protection_gap": False,
+        "protection_gap_symbols": [],
+        "max_active_symbols": 5,
+        "account_summary": {"available_balance": 1000.0},
+        "ai_gate_enabled": False,
+        "ai_review_cfg": {
+            "shortlist_priority_overrides": {
+                "green_bar_growing|short_retest_reject": 0.10
+            }
+        },
+        "ai_review_mode": "disabled",
+    }
+
+    bot._finalize_entries(context)
+
+    assert len(bot._executed) == 2
+    assert bot._executed[0]["symbol"] == "BBBUSDT"
+
+
+def test_finalize_entries_symbol_priority_bonus_can_break_tie_in_capacity_sort():
+    bot = _make_bot(active_symbols={})
+    bot.position_data = SimpleNamespace(get_all_positions=lambda: {})
+    bot._ai_review_mode_supports_flat_candidates = lambda _mode: False
+    context = {
+        "pending_new_entries": [
+            {
+                "symbol": "AAAUSDT",
+                "score": 0.90,
+                "max_active_symbols": 5,
+                "decision": _decision_with_md(
+                    "AAAUSDT",
+                    FundFlowOperation.SELL,
+                    {
+                        "test_score": 0.90,
+                        "signal_type_1h": "green_bar_growing",
+                        "vwap_state": "short_retest_reject",
+                    },
+                ),
+                "position": None,
+                "current_price": 1.0,
+                "trigger_context": {},
+                "portfolio": {},
+                "account_summary": {"available_balance": 1000.0},
+            },
+            {
+                "symbol": "BBBUSDT",
+                "score": 0.90,
+                "max_active_symbols": 5,
+                "decision": _decision_with_md(
+                    "BBBUSDT",
+                    FundFlowOperation.SELL,
+                    {
+                        "test_score": 0.90,
+                        "signal_type_1h": "green_bar_growing",
+                        "vwap_state": "short_retest_reject",
+                    },
+                ),
+                "position": None,
+                "current_price": 1.0,
+                "trigger_context": {},
+                "portfolio": {},
+                "account_summary": {"available_balance": 1000.0},
+            },
+        ],
+        "block_new_entries_due_to_protection_gap": False,
+        "protection_gap_symbols": [],
+        "max_active_symbols": 5,
+        "account_summary": {"available_balance": 1000.0},
+        "ai_gate_enabled": False,
+        "ai_review_cfg": {
+            "shortlist_symbol_priority_overrides": {
+                "BBBUSDT": 0.05
+            }
+        },
+        "ai_review_mode": "disabled",
+    }
+
+    bot._finalize_entries(context)
+
+    assert len(bot._executed) == 2
+    assert bot._executed[0]["symbol"] == "BBBUSDT"
+
+
+def test_finalize_entries_respects_capacity_group_cap_for_same_pocket():
+    bot = _make_bot(active_symbols={})
+    bot.position_data = SimpleNamespace(get_all_positions=lambda: {})
+    bot._ai_review_mode_supports_flat_candidates = lambda _mode: False
+    base_item = {
+        "max_active_symbols": 5,
+        "position": None,
+        "current_price": 1.0,
+        "trigger_context": {},
+        "portfolio": {},
+        "account_summary": {"available_balance": 1000.0},
+    }
+    context = {
+        "pending_new_entries": [
+            {
+                **base_item,
+                "symbol": "AAAUSDT",
+                "score": 0.93,
+                "decision": _decision_with_md(
+                    "AAAUSDT",
+                    FundFlowOperation.SELL,
+                    {"test_score": 0.93, "signal_type_1h": "green_bar_growing", "vwap_state": "short_retest_reject"},
+                ),
+            },
+            {
+                **base_item,
+                "symbol": "BBBUSDT",
+                "score": 0.92,
+                "decision": _decision_with_md(
+                    "BBBUSDT",
+                    FundFlowOperation.SELL,
+                    {"test_score": 0.92, "signal_type_1h": "green_bar_growing", "vwap_state": "short_retest_reject"},
+                ),
+            },
+            {
+                **base_item,
+                "symbol": "CCCUSDT",
+                "score": 0.91,
+                "decision": _decision_with_md(
+                    "CCCUSDT",
+                    FundFlowOperation.SELL,
+                    {"test_score": 0.91, "signal_type_1h": "green_bar_growing", "vwap_state": "short_retest_reject"},
+                ),
+            },
+        ],
+        "block_new_entries_due_to_protection_gap": False,
+        "protection_gap_symbols": [],
+        "max_active_symbols": 5,
+        "account_summary": {"available_balance": 1000.0},
+        "ai_gate_enabled": False,
+        "ai_review_cfg": {
+            "capacity_group_caps": {
+                "green_bar_growing|short_retest_reject": 2
+            }
+        },
+        "ai_review_mode": "disabled",
+    }
+
+    bot._finalize_entries(context)
+
+    assert [item["symbol"] for item in bot._executed] == ["AAAUSDT", "BBBUSDT"]
 
 
 def test_ai_entry_guard_blocks_weak_same_side_add():
