@@ -647,7 +647,7 @@ class FundFlowDecisionEngine:
                 weight_4h_direction=self._to_float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction")), 0.55),
                 weight_4h_enhancement=self._to_float(weights_cfg.get("weight_4h_enhancement"), 0.10),
                 weight_boll_position=self._to_float(weights_cfg.get("weight_boll_position"), 0.0),
-                weight_vwap=self._to_float(weights_cfg.get("weight_vwap"), 0.20),
+                weight_vwap=self._to_float(weights_cfg.get("weight_vwap"), 0.0),
                 weight_15m_entry=self._to_float(weights_cfg.get("weight_15m_entry"), 0.05),
                 weight_volume=self._to_float(weights_cfg.get("weight_volume"), 0.20),
                 # 入场阈值
@@ -2387,7 +2387,7 @@ class FundFlowDecisionEngine:
             tf_1h.get("oi_delta_ratio", market_flow_context.get("oi_delta_ratio")),
             0.0,
         )
-        vwap_ok = (price >= structural_vwap) if is_long else (price <= structural_vwap)
+        vwap_ok = True  # VWAP位置检查已禁用（weight_vwap=0）
         flow_checks = {
             "cvd_ok": cvd_ratio * sign > -0.05,
             "oi_ok": oi_delta_ratio * sign >= 0.0,
@@ -5249,8 +5249,7 @@ class FundFlowDecisionEngine:
                     "passed": bool(_pocket_passed),
                     "reason": _pocket_reason,
                 }
-                if not _pocket_passed:
-                    return FundFlowDecision(
+                if not _pocket_passed:                    return FundFlowDecision(
                         operation=Operation.HOLD,
                         symbol=symbol,
                         reason=_pocket_reason,
@@ -5506,8 +5505,7 @@ class FundFlowDecisionEngine:
                     "passed": bool(_pocket_passed),
                     "reason": _pocket_reason,
                 }
-                if not _pocket_passed:
-                    return FundFlowDecision(
+                if not _pocket_passed:                    return FundFlowDecision(
                         operation=Operation.HOLD,
                         symbol=symbol,
                         reason=_pocket_reason,

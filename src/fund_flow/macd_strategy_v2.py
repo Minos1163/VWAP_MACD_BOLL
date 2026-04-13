@@ -182,7 +182,7 @@ class MACDStrategyV2Config:
     # VWAP参数
     vwap_deviation_optimal: float = 0.005  # 最优偏离区间 ±0.5%
     vwap_deviation_warning: float = 0.015  # 警告偏离 ±1.5%
-    vwap_deviation_hard_block: float = 0.030  # 硬性否决偏离 ±3.0%
+    vwap_deviation_hard_block: float = 999.0  # 硬性否决偏离 ±3.0%
     structural_vwap_mode: str = "anchored_daily"
     structural_vwap_rolling_window: int = 20
     vwap_retest_tolerance: float = 0.003
@@ -192,7 +192,7 @@ class MACDStrategyV2Config:
     weight_4h_direction: float = 0.20  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
     weight_boll_position: float = 0.0
-    weight_vwap: float = 0.20  # VWAP评分权重
+    weight_vwap: float = 0.0  # VWAP评分权重
     weight_15m_entry: float = 0.05  # 15M入场时机评分权重（软确认）
     weight_volume: float = 0.15  # 成交量确认评分权重
     
@@ -324,7 +324,7 @@ class MACDStrategyV2Config:
     overheat_growing_penalty: float = 0.12
     overheat_ema_multiplier_threshold: float = 1.2
     overheat_vwap_score_threshold: float = 0.10
-    min_vwap_score_for_entry: float = 0.10  # VWAP全局过滤
+    min_vwap_score_for_entry: float = 0.0  # VWAP全局过滤
     
     # 止损配置
     use_dynamic_stop: bool = True
@@ -634,7 +634,7 @@ def build_macd_v2_config_from_runtime(
         weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.55))),
         weight_4h_enhancement=float(weights_cfg.get("weight_4h_enhancement", 0.10)),
         weight_boll_position=float(weights_cfg.get("weight_boll_position", 0.0)),
-        weight_vwap=float(weights_cfg.get("weight_vwap", 0.20)),
+        weight_vwap=float(weights_cfg.get("weight_vwap", 0.0)),
         weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.05)),
         weight_volume=float(weights_cfg.get("weight_volume", 0.20)),
         min_entry_score=float(thresholds_cfg.get("min_entry_score", 0.25)),
@@ -4165,8 +4165,8 @@ class MACDStrategyV2Engine:
             vwap_veto=vwap_veto.value if vwap_veto else VetoType.NONE.value,
         )
         
-        # VWAP硬性否决
-        if vwap_veto == VetoType.VWAP_HARD_BLOCK:
+        # VWAP硬性否决 — 已禁用VWAP门槛，跳过hard block
+        if False and vwap_veto == VetoType.VWAP_HARD_BLOCK:
             return self._neutral_signal(
                 reason='vwap_hard_block',
                 veto_type=vwap_veto,
@@ -5043,7 +5043,7 @@ class MACDStrategyV2Engine:
             vwap_state=vwap_state,
         )
         min_vwap_score_for_entry = float(pocket_entry_requirements["min_vwap_score_for_entry"])
-        # P0-A消融：VWAP评分低于阈值时改为软惩罚（降低signal_score），不再硬拒绝
+        # P0-A消融：VWAP评分低于阈值时改为软惩罚 — 已禁用VWAP，min_vwap_score_for_entry=0 时自动跳过
         vwap_soft_penalty = 0.0
         if min_vwap_score_for_entry > 0 and vwap_score < min_vwap_score_for_entry:
             debug_details = self._set_stage(
@@ -5306,13 +5306,12 @@ class MACDStrategyV2Engine:
         if (
             self.config.overheat_growing_penalty > 0
             and ema_multiplier >= self.config.overheat_ema_multiplier_threshold
-            and vwap_score <= self.config.overheat_vwap_score_threshold
             and (growing_signal or growing_entry)
         ):
             overheat_penalty = self.config.overheat_growing_penalty
             score = max(0.0, score - overheat_penalty)
 
-        if bool(self.config.vwap_execution_penalty_only):
+        if bool(self.config.vwap_execution_penalty_only) and self.config.weight_vwap > 0:
             if vwap_execution_state in {"discount_reclaim_too_far", "premium_reject_too_far"}:
                 vwap_soft_penalty = max(vwap_soft_penalty, min(0.30, abs(vwap_deviation) * 0.50 + 0.05))
             elif vwap_execution_state not in {"favorable", "discount_reclaim_ok", "premium_reject_ok"}:
@@ -5426,9 +5425,9 @@ class MACDStrategyV2Engine:
                 ),
             )
         
-        # ========== Step 7: 组合否决检查（改为软惩罚） ==========
-        # V6: 成交量 + VWAP 双低 — 改为软惩罚而非硬拒绝
-        if score_vol < 0.05 and vwap_score <= 0.10:
+        # ========== Step 7: 组合否决检查（改为软惩罚） ========== 
+        # V6: 成交量 + VWAP 双低 — 已禁用VWAP，跳过此检查
+        if False and score_vol < 0.05 and vwap_score <= 0.10:
             vwap_soft_penalty = max(vwap_soft_penalty, 0.25)
             debug_details = self._set_stage(
                 debug_details,

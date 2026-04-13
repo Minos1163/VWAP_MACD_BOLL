@@ -353,7 +353,7 @@
         "signal_type_1h": "flip_bullish",
         "vwap_state": "long_reclaim_confirmed",
         "min_signal_score": 0.93,
-        "min_vwap_score": 0.14,
+        "min_vwap_score": 0.0,
         "allow_microstructure_fail": true
       }
     ],
@@ -369,7 +369,7 @@
         "signal_type_1h": "flip_bullish",
         "vwap_state": "long_reclaim_confirmed",
         "min_signal_score": 0.95,
-        "min_vwap_score": 0.14
+        "min_vwap_score": 0.0
       }
     ],
     "max_single_trade_nominal_ratio": 0.6,
@@ -386,7 +386,7 @@
       "enabled": false,
       "min_unrealized_pnl_ratio": 0.003,
       "min_signal_score": 0.85,
-      "min_vwap_score": 0.1,
+      "min_vwap_score": 0.0,
       "max_additions": 1,
       "base_add_portion": 0.2,
       "signal_types": [
@@ -590,7 +590,7 @@
         "vwap_retest_tolerance": 0.003,
         "vwap_deviation_optimal": 0.008,
         "vwap_deviation_warning": 0.02,
-        "vwap_deviation_hard_block": 0.05
+        "vwap_deviation_hard_block": 999.0
       },
       "entry_thresholds": {
         "default": 0.55,
@@ -632,27 +632,27 @@
         "preflip_trial_min_shrink_pct_long": 0.45,
         "preflip_trial_min_shrink_pct_short": 0.22,
         "preflip_trial_min_signal_score": 0.8,
-        "preflip_trial_min_vwap_score": 0.08,
+        "preflip_trial_min_vwap_score": 0.0,
         "preflip_trial_entry_scale": 0.2,
         "preflip_trial_max_leverage": 3,
         "enable_trial_short_below_structure_continuation_promotion": true,
         "trial_short_below_structure_promotion_min_signal_score": 0.8,
-        "trial_short_below_structure_promotion_min_vwap_score": 0.08,
+        "trial_short_below_structure_promotion_min_vwap_score": 0.0,
         "trial_short_below_structure_promotion_min_adx_1h": 30.0,
         "trial_short_below_structure_promotion_min_4h_shrink_pct": 0.8,
         "trial_short_below_structure_promotion_min_4h_shrink_bars": 6,
         "enable_stable_bear_continuation": true,
-        "stable_bear_continuation_min_vwap_score": 0.05,
+        "stable_bear_continuation_min_vwap_score": 0.0,
         "stable_bear_continuation_min_adx_1h": 25.0,
         "stable_bear_continuation_min_4h_bars": 1,
         "enable_stable_bull_continuation": true,
-        "stable_bull_continuation_min_vwap_score": 0.08,
+        "stable_bull_continuation_min_vwap_score": 0.0,
         "stable_bull_continuation_min_adx_1h": 25.0,
         "stable_bull_continuation_min_4h_bars": 1,
         "enable_flip_bullish_strict_filter": false,
         "disable_flip_bullish_entries": false,
         "disable_flip_bearish_entries": false,
-        "flip_bullish_min_vwap_score": 0.08,
+        "flip_bullish_min_vwap_score": 0.0,
         "flip_bullish_require_pullback_bounce": true,
         "flip_bullish_require_15m_growing": false,
         "enable_flip_bullish_cvd_context_filter": false,
@@ -662,7 +662,7 @@
         "flip_bearish_normal_boll_min_signal_score": 0.0,
         "flip_bearish_normal_boll_max_leverage": 3,
         "flip_bearish_min_adx_1h": 25.0,
-        "flip_bearish_retest_reject_min_vwap_score": 0.18,
+        "flip_bearish_retest_reject_min_vwap_score": 0.0,
         "flip_bearish_max_bb_middle_slope_1h": 0.0,
         "flip_bearish_max_bb_middle_slope_4h": 0.0005,
         "bb_slope_lookback_1h": 3,
@@ -686,12 +686,12 @@
           "rsi_1h_range_max": 65
         },
         "min_signal_score": 0.50,
-        "min_vwap_score_for_entry": 0.04,
+        "min_vwap_score_for_entry": 0.0,
         "symbol_signal_overrides": [
           {
             "symbol": "ZECUSDT",
             "min_signal_score_override": 0.90,
-            "min_vwap_score_override": 0.14,
+            "min_vwap_score_override": 0.0,
             "green_bar_growing_mode": "enabled_with_strict_threshold"
           },
           {
@@ -705,7 +705,7 @@
           {
             "symbol": "DOGEUSDT",
             "min_signal_score_override": 0.89,
-            "min_vwap_score_override": 0.12,
+            "min_vwap_score_override": 0.0,
             "flip_bullish_mode": "trial_only",
             "green_bar_growing_mode": "enabled_with_strict_threshold"
           },
@@ -725,7 +725,7 @@
           {
             "symbol": "LINKUSDT",
             "min_signal_score_override": 0.90,
-            "min_vwap_score_override": 0.13,
+            "min_vwap_score_override": 0.0,
             "green_bar_growing_mode": "enabled_with_strict_threshold",
             "flip_bullish_mode": "trial_only"
           },
@@ -753,14 +753,14 @@
           {
             "symbol": "ZROUSDT",
             "min_signal_score_override": 0.92,
-            "min_vwap_score_override": 0.15,
+            "min_vwap_score_override": 0.0,
             "green_bar_growing_mode": "enabled_with_strict_threshold",
             "flip_bullish_mode": "trial_only"
           },
           {
             "symbol": "LTCUSDT",
             "min_signal_score_override": 0.90,
-            "min_vwap_score_override": 0.13,
+            "min_vwap_score_override": 0.0,
             "green_bar_growing_mode": "enabled_with_strict_threshold",
             "flip_bullish_mode": "trial_only"
           },
@@ -1049,7 +1049,7 @@
             "require_strict_1h_confirmation": true,
             "disallow_trial_entry": true,
             "min_signal_score": 0.50,
-            "min_vwap_score": 0.10,
+            "min_vwap_score": 0.0,
             "min_entry_score": 0.30,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true
@@ -1060,7 +1060,7 @@
             "require_strict_1h_confirmation": true,
             "disallow_trial_entry": true,
             "min_signal_score": 0.84,
-            "min_vwap_score": 0.10,
+            "min_vwap_score": 0.0,
             "min_entry_score": 0.30,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true,
@@ -1073,7 +1073,7 @@
           "green_bar_growing|short_dual_pressure": {
             "label": "sdp_a_strict_gate",
             "min_signal_score": 0.50,
-            "min_vwap_score": 0.12,
+            "min_vwap_score": 0.0,
             "require_cvd_ok": true,
             "require_strict_1h_confirmation": true,
             "require_rsi_ok": true
@@ -1085,7 +1085,7 @@
             "strict_1h_direction": "bearish",
             "disallow_trial_entry": true,
             "min_signal_score": 0.84,
-            "min_vwap_score": 0.14,
+            "min_vwap_score": 0.0,
             "min_entry_score": 0.30,
             "require_cvd_ok": true,
             "require_cvd_momentum_ok": true
@@ -1109,14 +1109,14 @@
           "green_bar_growing|short_under_structure_wait_reject": {
             "label": "lowfreq_disable_suwr",
             "min_signal_score": 0.84,
-            "min_vwap_score": 0.12,
+            "min_vwap_score": 0.0,
             "require_strict_1h_confirmation": true,
             "require_rsi_ok": true
           },
           "green_bar_growing|short_below_session_above_structure": {
             "label": "lowfreq_disable_sbas",
             "min_signal_score": 0.84,
-            "min_vwap_score": 0.12,
+            "min_vwap_score": 0.0,
             "require_strict_1h_confirmation": true,
             "require_rsi_ok": true
           },
@@ -1170,8 +1170,8 @@
       "penalty_config": {
         "overheat_growing_penalty": 0.12,
         "overheat_boll_multiplier_threshold": 1.2,
-        "overheat_vwap_score_threshold": 0.1,
-        "min_vwap_score_for_entry": 0.04
+        "overheat_vwap_score_threshold": 0.0,
+        "min_vwap_score_for_entry": 0.0
       },
       "stop_loss_config": {
         "use_dynamic_stop": true,
@@ -1195,7 +1195,7 @@
         "enabled": false,
         "min_funding_rate": 0.0005,
         "max_oi_delta_ratio": 0.0,
-        "min_vwap_deviation": 0.005
+        "min_vwap_deviation": 0.0
       },
       "leverage_config": {
         "score_0.75_plus": 5,
