@@ -345,6 +345,227 @@ def test_check_stops_uses_position_specific_breakeven_override() -> None:
     assert engine.positions["SOLUSDT"]["stop_price"] == pytest.approx(100.3, rel=1e-9)
 
 
+def test_q4_rsi_lead_hold_skips_breakeven_and_tp_before_4h_exit_turn() -> None:
+    config = BacktestConfig(
+        symbols=["ETHUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=True,
+        breakeven_trigger_pnl_ratio=0.008,
+        breakeven_lock_ratio=0.004,
+    )
+    strategy_config = MACDStrategyV2Config(
+        enable_q4_rsi_lead_preflip_long=True,
+        enable_q4_rsi_lead_preflip_hold=True,
+        q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold=70.0,
+        q4_rsi_lead_preflip_hold_rsi_4h_pullback=1.0,
+    )
+    engine = BacktestEngine(config, strategy_config, runtime_config={})
+    engine.positions["ETHUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 1600.0,
+        "position_value": 800.0,
+        "margin": 800.0,
+        "initial_margin": 800.0,
+        "remaining_fraction": 1.0,
+        "leverage": 2,
+        "stop_price": 98.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [
+            {"price": 101.5, "reduce_pct": 0.25, "filled": False},
+        ],
+        "entry_time": pd.Timestamp("2026-03-09 13:30:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "red_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 0.35,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "vwap_disabled",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+        "q4_rsi_lead_preflip_hold_active": True,
+        "q4_rsi_lead_preflip_hold_peak_rsi_4h": 59.0,
+        "q4_rsi_lead_preflip_hold_exit_armed": False,
+        "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold": 70.0,
+        "q4_rsi_lead_preflip_hold_rsi_4h_pullback": 1.0,
+    }
+    signal = _signal(direction="long", signal_type_1h="red_bar_growing", vwap_state="vwap_disabled")
+    signal.rsi_4h = 64.0
+    signal.details = {
+        "q4_rsi_lead_preflip_passed": True,
+    }
+    analysis = {
+        "signal": signal,
+        "row_15m": pd.Series({"open": 101.8, "high": 102.2, "low": 100.5, "close": 101.1, "atr": 0.3}),
+        "price": 101.1,
+        "time": pd.Timestamp("2026-03-09 13:45:00"),
+    }
+
+    closed = engine.check_stops("ETHUSDT", analysis)
+
+    assert closed is False
+    assert "ETHUSDT" in engine.positions
+    assert engine.positions["ETHUSDT"]["stop_price"] == pytest.approx(98.0, rel=1e-9)
+    assert engine.positions["ETHUSDT"]["take_profit_levels"][0]["filled"] is False
+    assert engine.positions["ETHUSDT"]["q4_rsi_lead_preflip_hold_peak_rsi_4h"] == pytest.approx(64.0, rel=1e-9)
+
+
+def test_q4_rsi_lead_hold_exits_on_4h_rsi_pullback_after_threshold() -> None:
+    config = BacktestConfig(
+        symbols=["ETHUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=True,
+        breakeven_trigger_pnl_ratio=0.008,
+        breakeven_lock_ratio=0.004,
+    )
+    strategy_config = MACDStrategyV2Config(
+        enable_q4_rsi_lead_preflip_long=True,
+        enable_q4_rsi_lead_preflip_hold=True,
+        q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold=70.0,
+        q4_rsi_lead_preflip_hold_rsi_4h_pullback=1.0,
+    )
+    engine = BacktestEngine(config, strategy_config, runtime_config={})
+    engine.positions["ETHUSDT"] = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 1600.0,
+        "position_value": 800.0,
+        "margin": 800.0,
+        "initial_margin": 800.0,
+        "remaining_fraction": 1.0,
+        "leverage": 2,
+        "stop_price": 98.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [],
+        "entry_time": pd.Timestamp("2026-03-09 13:30:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "red_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 0.35,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "vwap_disabled",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+        "q4_rsi_lead_preflip_hold_active": True,
+        "q4_rsi_lead_preflip_hold_peak_rsi_4h": 72.4,
+        "q4_rsi_lead_preflip_hold_exit_armed": True,
+        "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold": 70.0,
+        "q4_rsi_lead_preflip_hold_rsi_4h_pullback": 1.0,
+    }
+    signal = _signal(direction="long", signal_type_1h="red_bar_growing", vwap_state="vwap_disabled")
+    signal.rsi_4h = 70.9
+    signal.details = {
+        "q4_rsi_lead_preflip_passed": True,
+    }
+    analysis = {
+        "signal": signal,
+        "row_15m": pd.Series({"open": 108.0, "high": 108.5, "low": 107.4, "close": 108.1, "atr": 0.4}),
+        "price": 108.1,
+        "time": pd.Timestamp("2026-03-17 04:00:00"),
+    }
+
+    closed = engine.check_stops("ETHUSDT", analysis)
+
+    assert closed is True
+    assert "ETHUSDT" not in engine.positions
+    assert engine.trades[-1]["reason"] == "q4_rsi_lead_4h_rsi_turn_exit"
+
+
+def test_q4_rsi_lead_hold_exit_metric_rsi_is_faster_than_rsi21() -> None:
+    config = BacktestConfig(
+        symbols=["ETHUSDT"],
+        initial_capital=10000.0,
+        default_stop_loss_pct=0.02,
+        default_take_profit_pct=0.04,
+        breakeven_enabled=True,
+        breakeven_trigger_pnl_ratio=0.008,
+        breakeven_lock_ratio=0.004,
+    )
+    strategy_config = MACDStrategyV2Config(
+        enable_q4_rsi_lead_preflip_long=True,
+        enable_q4_rsi_lead_preflip_hold=True,
+        q4_rsi_lead_preflip_hold_exit_metric="rsi",
+        q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold=70.0,
+        q4_rsi_lead_preflip_hold_rsi_4h_pullback=1.0,
+    )
+    engine = BacktestEngine(config, strategy_config, runtime_config={})
+    base_pos = {
+        "side": "long",
+        "entry_price": 100.0,
+        "entry_notional": 1600.0,
+        "position_value": 800.0,
+        "margin": 800.0,
+        "initial_margin": 800.0,
+        "remaining_fraction": 1.0,
+        "leverage": 2,
+        "stop_price": 98.0,
+        "take_profit": 104.0,
+        "take_profit_levels": [],
+        "entry_time": pd.Timestamp("2026-03-09 13:30:00"),
+        "signal_score": 0.91,
+        "signal_type_1h": "red_bar_growing",
+        "is_trial_entry": False,
+        "entry_scale": 0.35,
+        "session_position_scale": 1.0,
+        "vwap_score": 0.16,
+        "vwap_state": "vwap_disabled",
+        "vwap_location_score": 0.7,
+        "ema_multiplier": 1.0,
+        "ema_status": "normal",
+        "realized_pnl_accum": 0.0,
+        "q4_rsi_lead_preflip_hold_active": True,
+        "q4_rsi_lead_preflip_hold_peak_rsi_4h": 71.8,
+        "q4_rsi_lead_preflip_hold_exit_armed": True,
+        "q4_rsi_lead_preflip_hold_exit_metric": "rsi",
+        "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold": 70.0,
+        "q4_rsi_lead_preflip_hold_rsi_4h_pullback": 1.0,
+    }
+    engine.positions["ETHUSDT"] = dict(base_pos)
+    signal = _signal(direction="long", signal_type_1h="red_bar_growing", vwap_state="vwap_disabled")
+    signal.details = {"q4_rsi_lead_preflip_passed": True}
+    analysis = {
+        "signal": signal,
+        "row_4h": pd.Series({"rsi": 63.2, "rsi_21": 71.1}),
+        "row_15m": pd.Series({"open": 103.0, "high": 103.2, "low": 102.8, "close": 103.1, "atr": 0.2}),
+        "price": 103.1,
+        "time": pd.Timestamp("2026-03-10 16:00:00"),
+    }
+
+    closed = engine.check_stops("ETHUSDT", analysis)
+
+    assert closed is True
+    assert engine.trades[-1]["reason"] == "q4_rsi_lead_4h_rsi_turn_exit"
+
+    strategy_config_slow = MACDStrategyV2Config(
+        enable_q4_rsi_lead_preflip_long=True,
+        enable_q4_rsi_lead_preflip_hold=True,
+        q4_rsi_lead_preflip_hold_exit_metric="rsi_21",
+        q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold=70.0,
+        q4_rsi_lead_preflip_hold_rsi_4h_pullback=1.0,
+    )
+    engine_slow = BacktestEngine(config, strategy_config_slow, runtime_config={})
+    slow_pos = dict(base_pos)
+    slow_pos["q4_rsi_lead_preflip_hold_exit_metric"] = "rsi_21"
+    engine_slow.positions["ETHUSDT"] = slow_pos
+
+    closed_slow = engine_slow.check_stops("ETHUSDT", analysis)
+
+    assert closed_slow is False
+    assert "ETHUSDT" in engine_slow.positions
+    assert engine_slow.positions["ETHUSDT"]["q4_rsi_lead_preflip_hold_exit_metric"] == "rsi_21"
+    assert engine_slow.positions["ETHUSDT"]["q4_rsi_lead_preflip_hold_current_exit_value"] == pytest.approx(71.1, rel=1e-9)
+
+
 def test_check_stops_applies_oscillation_trailing_profile() -> None:
     runtime_cfg = {
         "fund_flow": {

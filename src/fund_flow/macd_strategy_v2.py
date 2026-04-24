@@ -192,7 +192,8 @@ class MACDStrategyV2Config:
     weight_4h_direction: float = 0.20  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
     weight_boll_position: float = 0.0
-    weight_vwap: float = 0.0  # VWAP评分权重
+    weight_boll_rsi_resonance: float = 0.0  # BOLL+RSI 共振评分权重
+    weight_vwap: float = 0.0  # 兼容旧配置键；实际评分维度已迁移到 weight_boll_rsi_resonance
     weight_15m_entry: float = 0.05  # 15M入场时机评分权重（软确认）
     weight_volume: float = 0.15  # 成交量确认评分权重
     
@@ -276,6 +277,22 @@ class MACDStrategyV2Config:
     preflip_trial_min_vwap_score: float = 0.06
     preflip_trial_entry_scale: float = 0.35
     preflip_trial_max_leverage: int = 2
+    enable_q4_rsi_lead_preflip_long: bool = False
+    q4_rsi_lead_preflip_min_4h_shrink_pct: float = 0.75
+    q4_rsi_lead_preflip_rsi_1h_min: float = 50.0
+    q4_rsi_lead_preflip_rsi_4h_min: float = 50.0
+    q4_rsi_lead_preflip_rsi_4h_near_buffer: float = 2.0
+    q4_rsi_lead_preflip_bonus_score: float = 0.18
+    q4_rsi_lead_preflip_entry_scale: float = 0.35
+    q4_rsi_lead_preflip_strict_eth_only: bool = True
+    q4_rsi_lead_preflip_allowed_symbols: List[str] = field(default_factory=lambda: ["ETHUSDT"])
+    q4_rsi_lead_preflip_allowed_categories: List[str] = field(default_factory=list)
+    q4_rsi_lead_preflip_min_atr_pct_1h: float = 0.0
+    q4_rsi_lead_preflip_max_atr_pct_1h: float = 1.0
+    enable_q4_rsi_lead_preflip_hold: bool = False
+    q4_rsi_lead_preflip_hold_exit_metric: str = "rsi_21"
+    q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold: float = 70.0
+    q4_rsi_lead_preflip_hold_rsi_4h_pullback: float = 1.0
     enable_trial_short_below_structure_continuation_promotion: bool = False
     trial_short_below_structure_promotion_min_signal_score: float = 0.82
     trial_short_below_structure_promotion_min_vwap_score: float = 0.075
@@ -324,7 +341,8 @@ class MACDStrategyV2Config:
     overheat_growing_penalty: float = 0.12
     overheat_ema_multiplier_threshold: float = 1.2
     overheat_vwap_score_threshold: float = 0.10
-    min_vwap_score_for_entry: float = 0.0  # VWAP全局过滤
+    min_vwap_score_for_entry: float = 0.10  # VWAP全局过滤
+    disable_vwap_thresholds: bool = False
     
     # 止损配置
     use_dynamic_stop: bool = True
@@ -634,6 +652,9 @@ def build_macd_v2_config_from_runtime(
         weight_4h_direction=float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction", 0.55))),
         weight_4h_enhancement=float(weights_cfg.get("weight_4h_enhancement", 0.10)),
         weight_boll_position=float(weights_cfg.get("weight_boll_position", 0.0)),
+        weight_boll_rsi_resonance=float(
+            weights_cfg.get("weight_boll_rsi_resonance", weights_cfg.get("weight_vwap", 0.0))
+        ),
         weight_vwap=float(weights_cfg.get("weight_vwap", 0.0)),
         weight_15m_entry=float(weights_cfg.get("weight_15m_entry", 0.05)),
         weight_volume=float(weights_cfg.get("weight_volume", 0.20)),
@@ -739,6 +760,36 @@ def build_macd_v2_config_from_runtime(
         preflip_trial_min_vwap_score=float(filter_cfg.get("preflip_trial_min_vwap_score", 0.06)),
         preflip_trial_entry_scale=float(filter_cfg.get("preflip_trial_entry_scale", 0.35)),
         preflip_trial_max_leverage=int(float(filter_cfg.get("preflip_trial_max_leverage", 2))),
+        enable_q4_rsi_lead_preflip_long=bool(filter_cfg.get("enable_q4_rsi_lead_preflip_long", False)),
+        q4_rsi_lead_preflip_min_4h_shrink_pct=float(filter_cfg.get("q4_rsi_lead_preflip_min_4h_shrink_pct", 0.75)),
+        q4_rsi_lead_preflip_rsi_1h_min=float(filter_cfg.get("q4_rsi_lead_preflip_rsi_1h_min", 50.0)),
+        q4_rsi_lead_preflip_rsi_4h_min=float(filter_cfg.get("q4_rsi_lead_preflip_rsi_4h_min", 50.0)),
+        q4_rsi_lead_preflip_rsi_4h_near_buffer=float(filter_cfg.get("q4_rsi_lead_preflip_rsi_4h_near_buffer", 2.0)),
+        q4_rsi_lead_preflip_bonus_score=float(filter_cfg.get("q4_rsi_lead_preflip_bonus_score", 0.18)),
+        q4_rsi_lead_preflip_entry_scale=float(filter_cfg.get("q4_rsi_lead_preflip_entry_scale", 0.35)),
+        q4_rsi_lead_preflip_strict_eth_only=bool(filter_cfg.get("q4_rsi_lead_preflip_strict_eth_only", True)),
+        q4_rsi_lead_preflip_allowed_symbols=[
+            str(x).strip().upper()
+            for x in (filter_cfg.get("q4_rsi_lead_preflip_allowed_symbols", ["ETHUSDT"]) or [])
+            if str(x).strip()
+        ] if isinstance(filter_cfg.get("q4_rsi_lead_preflip_allowed_symbols", ["ETHUSDT"]), list) else ["ETHUSDT"],
+        q4_rsi_lead_preflip_allowed_categories=[
+            str(x).strip().lower()
+            for x in (filter_cfg.get("q4_rsi_lead_preflip_allowed_categories", []) or [])
+            if str(x).strip()
+        ] if isinstance(filter_cfg.get("q4_rsi_lead_preflip_allowed_categories"), list) else [],
+        q4_rsi_lead_preflip_min_atr_pct_1h=float(filter_cfg.get("q4_rsi_lead_preflip_min_atr_pct_1h", 0.0)),
+        q4_rsi_lead_preflip_max_atr_pct_1h=float(filter_cfg.get("q4_rsi_lead_preflip_max_atr_pct_1h", 1.0)),
+        enable_q4_rsi_lead_preflip_hold=bool(filter_cfg.get("enable_q4_rsi_lead_preflip_hold", False)),
+        q4_rsi_lead_preflip_hold_exit_metric=str(
+            filter_cfg.get("q4_rsi_lead_preflip_hold_exit_metric", "rsi_21") or "rsi_21"
+        ).strip().lower(),
+        q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold=float(
+            filter_cfg.get("q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold", 70.0)
+        ),
+        q4_rsi_lead_preflip_hold_rsi_4h_pullback=float(
+            filter_cfg.get("q4_rsi_lead_preflip_hold_rsi_4h_pullback", 1.0)
+        ),
         enable_trial_short_below_structure_continuation_promotion=bool(
             filter_cfg.get("enable_trial_short_below_structure_continuation_promotion", False)
         ),
@@ -790,6 +841,7 @@ def build_macd_v2_config_from_runtime(
         ),
         overheat_vwap_score_threshold=float(penalty_cfg.get("overheat_vwap_score_threshold", 0.10)),
         min_vwap_score_for_entry=float(filter_cfg.get("min_vwap_score_for_entry", penalty_cfg.get("min_vwap_score_for_entry", 0.12))),
+        disable_vwap_thresholds=bool(filter_cfg.get("disable_vwap_thresholds", False)),
         use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
         ema_stop_atr_multiplier=float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier", 0.5))),
         max_stop_loss_pct=float(stop_cfg.get("max_stop_loss_pct", 0.025)),
@@ -986,6 +1038,7 @@ class MACDStrategyV2Engine:
                 "weight_rsi_4h": 0.10,
                 "weight_rsi_1h": 0.20,
                 "weight_rsi_divergence": 0.05,
+                "weight_boll_rsi_resonance": self.resolve_boll_rsi_resonance_weight(),
                 "weight_vwap": self.config.weight_vwap,
                 "weight_volume": self.config.weight_volume,
             }
@@ -994,6 +1047,7 @@ class MACDStrategyV2Engine:
                 "weight_1h_direction": self.config.weight_1h_direction,
                 "weight_boll_position": self.config.weight_boll_position if self.config.weight_boll_position > 0 else 0.25,
                 "weight_boll_bandwidth": 0.05,
+                "weight_boll_rsi_resonance": self.resolve_boll_rsi_resonance_weight(),
                 "weight_vwap": self.config.weight_vwap,
                 "weight_volume": self.config.weight_volume,
             }
@@ -1496,6 +1550,116 @@ class MACDStrategyV2Engine:
                 break
         return bars >= 2, bars
 
+    def _evaluate_q4_rsi_lead_preflip_long(
+        self,
+        *,
+        market_quadrant: str,
+        trade_direction: Optional[str],
+        signal_type_1h: Optional[str],
+        macd_line_4h: float,
+        macd_4h_shrink_pct: float,
+        macd_hist_4h: Optional[float] = None,
+        close_price: float,
+        bb_middle_1h: float,
+        rsi_1h: float,
+        rsi_4h: float,
+        atr_pct_1h: float = 0.0,
+        symbol: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        result = {
+            "q4_rsi_lead_preflip_active": False,
+            "q4_rsi_lead_preflip_passed": False,
+            "q4_rsi_lead_preflip_reason": "disabled",
+            "q4_rsi_lead_preflip_bonus_score": 0.0,
+            "q4_rsi_lead_preflip_entry_scale": 1.0,
+            "q4_rsi_lead_preflip_symbol": self._normalize_symbol(symbol),
+            "q4_rsi_lead_preflip_allowed_symbols": self._q4_rsi_lead_preflip_allowed_symbols(),
+            "q4_rsi_lead_preflip_allowed_categories": self._q4_rsi_lead_preflip_allowed_categories(),
+            "q4_rsi_lead_preflip_symbol_gate_pass": False,
+            "q4_rsi_lead_preflip_symbol_gate_reason": "disabled",
+            "q4_rsi_lead_preflip_atr_pct_1h": float(atr_pct_1h or 0.0),
+        }
+        if not bool(self.config.enable_q4_rsi_lead_preflip_long):
+            return result
+
+        result["q4_rsi_lead_preflip_active"] = True
+        result["q4_rsi_lead_preflip_entry_scale"] = float(self.config.q4_rsi_lead_preflip_entry_scale)
+        symbol_allowed, gate_reason = self._check_q4_rsi_lead_preflip_symbol_allowed(symbol, atr_pct_1h=atr_pct_1h)
+        if not symbol_allowed:
+            result["q4_rsi_lead_preflip_reason"] = "symbol_not_allowed"
+            result["q4_rsi_lead_preflip_symbol_gate_reason"] = gate_reason
+            return result
+        result["q4_rsi_lead_preflip_symbol_gate_pass"] = True
+        result["q4_rsi_lead_preflip_symbol_gate_reason"] = gate_reason
+
+        if str(signal_type_1h or "").strip().lower() != "red_bar_growing":
+            result["q4_rsi_lead_preflip_reason"] = "signal_type_not_red_bar_growing"
+            return result
+        if str(market_quadrant or "").strip().upper() != "IV":
+            result["q4_rsi_lead_preflip_reason"] = "quadrant_not_iv"
+            return result
+        if float(macd_line_4h or 0.0) >= 0:
+            result["q4_rsi_lead_preflip_reason"] = "macd_line_4h_not_negative"
+            return result
+        hist_positive = float(macd_hist_4h or 0.0) >= 0.0
+        if (
+            not hist_positive
+            and float(macd_4h_shrink_pct or 0.0) < float(self.config.q4_rsi_lead_preflip_min_4h_shrink_pct)
+        ):
+            result["q4_rsi_lead_preflip_reason"] = "insufficient_4h_shrink"
+            return result
+        if float(close_price or 0.0) < float(bb_middle_1h or 0.0):
+            result["q4_rsi_lead_preflip_reason"] = "price_below_1h_midline"
+            return result
+        if float(rsi_1h or 0.0) < float(self.config.q4_rsi_lead_preflip_rsi_1h_min):
+            result["q4_rsi_lead_preflip_reason"] = "rsi_1h_below_min"
+            return result
+
+        rsi_4h_floor = float(self.config.q4_rsi_lead_preflip_rsi_4h_min) - float(
+            self.config.q4_rsi_lead_preflip_rsi_4h_near_buffer
+        )
+        if float(rsi_4h or 0.0) < rsi_4h_floor:
+            result["q4_rsi_lead_preflip_reason"] = "rsi_4h_not_near_50"
+            return result
+
+        rsi_1h_component = self._clamp(
+            (float(rsi_1h or 0.0) - float(self.config.q4_rsi_lead_preflip_rsi_1h_min)) / 10.0,
+            0.0,
+            1.0,
+        )
+        rsi_4h_component = self._clamp(
+            (float(rsi_4h or 0.0) - rsi_4h_floor)
+            / max(float(self.config.q4_rsi_lead_preflip_rsi_4h_near_buffer), 1.0),
+            0.0,
+            1.0,
+        )
+        # Q4 -> Q1 预翻转的专属共振分数：RSI 领先 + 重新站上 1H BOLL 中轨
+        boll_reclaim_component = 1.0
+        raw_score = self._clamp(
+            0.40 * rsi_1h_component
+            + 0.30 * rsi_4h_component
+            + 0.30 * boll_reclaim_component,
+            0.0,
+            1.0,
+        )
+        bonus_score = min(float(self.config.q4_rsi_lead_preflip_bonus_score), raw_score * float(self.config.q4_rsi_lead_preflip_bonus_score))
+
+        result.update(
+            q4_rsi_lead_preflip_passed=True,
+            q4_rsi_lead_preflip_reason="passed",
+            q4_rsi_lead_preflip_bonus_score=bonus_score,
+            q4_rsi_lead_preflip_raw_score=raw_score,
+            q4_rsi_lead_preflip_boll_reclaim_score=boll_reclaim_component,
+            q4_rsi_lead_preflip_rsi_1h=float(rsi_1h or 0.0),
+            q4_rsi_lead_preflip_rsi_4h=float(rsi_4h or 0.0),
+            q4_rsi_lead_preflip_macd_4h_shrink_pct=float(macd_4h_shrink_pct or 0.0),
+            q4_rsi_lead_preflip_macd_line_4h=float(macd_line_4h or 0.0),
+            q4_rsi_lead_preflip_macd_hist_4h=float(macd_hist_4h or 0.0),
+            q4_rsi_lead_preflip_hist_4h_positive=hist_positive,
+            q4_rsi_lead_preflip_bb_middle_1h=float(bb_middle_1h or 0.0),
+        )
+        return result
+
     @staticmethod
     def _resolve_vwap_execution_state(
         *,
@@ -1581,14 +1745,16 @@ class MACDStrategyV2Engine:
         if is_trial_entry:
             threshold = float(self.config.preflip_trial_min_signal_score)
 
-        min_vwap_score = max(
+        min_vwap_score = 0.0 if self._vwap_thresholds_disabled() else max(
             0.0,
             float(self.config.preflip_trial_min_vwap_score if is_trial_entry else self.config.min_vwap_score_for_entry),
         )
 
         effective = {
             "signal_score_threshold": float(pocket_override.get("min_signal_score", threshold)),
-            "min_vwap_score_for_entry": float(pocket_override.get("min_vwap_score", min_vwap_score)),
+            "min_vwap_score_for_entry": 0.0 if self._vwap_thresholds_disabled() else float(
+                pocket_override.get("min_vwap_score", min_vwap_score)
+            ),
             "min_entry_score": (
                 float(pocket_override["min_entry_score"])
                 if "min_entry_score" in pocket_override and pocket_override.get("min_entry_score") is not None
@@ -1610,6 +1776,14 @@ class MACDStrategyV2Engine:
         }
         return effective
 
+    def _vwap_thresholds_disabled(self) -> bool:
+        return bool(self.config.disable_vwap_thresholds)
+
+    def resolve_boll_rsi_resonance_weight(self) -> float:
+        if float(self.config.weight_boll_rsi_resonance or 0.0) > 0:
+            return float(self.config.weight_boll_rsi_resonance)
+        return float(self.config.weight_vwap or 0.0)
+
     def resolve_pocket_scoring_weights(
         self,
         *,
@@ -1626,6 +1800,12 @@ class MACDStrategyV2Engine:
             ),
             "weight_4h_enhancement": float(
                 pocket_override.get("weight_4h_enhancement", self.config.weight_4h_enhancement)
+            ),
+            "weight_boll_rsi_resonance": float(
+                pocket_override.get(
+                    "weight_boll_rsi_resonance",
+                    pocket_override.get("weight_vwap", self.resolve_boll_rsi_resonance_weight()),
+                )
             ),
             "weight_vwap": float(
                 pocket_override.get("weight_vwap", self.config.weight_vwap)
@@ -1878,6 +2058,64 @@ class MACDStrategyV2Engine:
     @staticmethod
     def _normalize_symbol(symbol: object) -> str:
         return str(symbol or "").strip().upper()
+
+    def _q4_rsi_lead_preflip_allowed_symbols(self) -> List[str]:
+        return [
+            self._normalize_symbol(item)
+            for item in (self.config.q4_rsi_lead_preflip_allowed_symbols or [])
+            if self._normalize_symbol(item)
+        ]
+
+    def _q4_rsi_lead_preflip_allowed_categories(self) -> List[str]:
+        return [
+            str(item or "").strip().lower()
+            for item in (self.config.q4_rsi_lead_preflip_allowed_categories or [])
+            if str(item or "").strip()
+        ]
+
+    def _is_major_large_cap_symbol(self, symbol: object) -> bool:
+        symbol_up = self._normalize_symbol(symbol)
+        if not symbol_up:
+            return False
+        return not self.is_watchlist_symbol(symbol_up)
+
+    def _check_q4_rsi_lead_preflip_symbol_allowed(
+        self,
+        symbol: object,
+        atr_pct_1h: float = 0.0,
+    ) -> Tuple[bool, str]:
+        symbol_up = self._normalize_symbol(symbol)
+        if not symbol_up:
+            return False, "missing_symbol"
+        if bool(self.config.q4_rsi_lead_preflip_strict_eth_only):
+            return (symbol_up == "ETHUSDT"), (
+                "passed" if symbol_up == "ETHUSDT" else f"strict_eth_only: symbol={symbol_up}"
+            )
+        allowed_symbols = self._q4_rsi_lead_preflip_allowed_symbols()
+        if allowed_symbols:
+            return (symbol_up in allowed_symbols), (
+                "passed" if symbol_up in allowed_symbols else f"symbol={symbol_up} not in whitelist={allowed_symbols}"
+            )
+
+        categories = self._q4_rsi_lead_preflip_allowed_categories()
+        if categories:
+            category_pass = False
+            if "major_large_cap" in categories and self._is_major_large_cap_symbol(symbol_up):
+                category_pass = True
+            if not category_pass:
+                return False, f"symbol={symbol_up} not in categories={categories}"
+
+        atr_pct = max(0.0, float(atr_pct_1h or 0.0))
+        min_atr = max(0.0, float(self.config.q4_rsi_lead_preflip_min_atr_pct_1h or 0.0))
+        max_atr = max(min_atr, float(self.config.q4_rsi_lead_preflip_max_atr_pct_1h or 1.0))
+        if atr_pct < min_atr or atr_pct > max_atr:
+            return False, f"atr_pct_1h={atr_pct:.4f} outside [{min_atr:.4f}, {max_atr:.4f}]"
+
+        return True, "passed"
+
+    def is_q4_rsi_lead_preflip_symbol_allowed(self, symbol: object, atr_pct_1h: float = 0.0) -> bool:
+        allowed, _reason = self._check_q4_rsi_lead_preflip_symbol_allowed(symbol, atr_pct_1h=atr_pct_1h)
+        return allowed
 
     def is_watchlist_symbol(self, symbol: object) -> bool:
         symbol_up = self._normalize_symbol(symbol)
@@ -2210,7 +2448,7 @@ class MACDStrategyV2Engine:
 
         if side == "short":
             enabled = bool(self.config.enable_stable_bear_continuation)
-            min_vwap_score = float(self.config.stable_bear_continuation_min_vwap_score)
+            min_vwap_score = 0.0 if self._vwap_thresholds_disabled() else float(self.config.stable_bear_continuation_min_vwap_score)
             min_adx_1h = float(self.config.stable_bear_continuation_min_adx_1h)
             min_4h_bars = max(1, int(self.config.stable_bear_continuation_min_4h_bars))
             hist_bars = int(stable_trend_context.get("negative_bars", 0) or 0)
@@ -2222,7 +2460,7 @@ class MACDStrategyV2Engine:
             allowed_entry_types = {"green_bar_growing"}
         else:
             enabled = bool(self.config.enable_stable_bull_continuation)
-            min_vwap_score = float(self.config.stable_bull_continuation_min_vwap_score)
+            min_vwap_score = 0.0 if self._vwap_thresholds_disabled() else float(self.config.stable_bull_continuation_min_vwap_score)
             min_adx_1h = float(self.config.stable_bull_continuation_min_adx_1h)
             min_4h_bars = max(1, int(self.config.stable_bull_continuation_min_4h_bars))
             hist_bars = int(stable_trend_context.get("positive_bars", 0) or 0)
@@ -2304,7 +2542,7 @@ class MACDStrategyV2Engine:
         shrink_pct = max(0.0, float(shrink_4h_context.get("shrink_pct", 0.0) or 0.0))
         shrink_bars = max(0, int(shrink_4h_context.get("shrink_bars", 0) or 0))
         min_signal_score = float(self.config.trial_short_below_structure_promotion_min_signal_score)
-        min_vwap_score = float(self.config.trial_short_below_structure_promotion_min_vwap_score)
+        min_vwap_score = 0.0 if self._vwap_thresholds_disabled() else float(self.config.trial_short_below_structure_promotion_min_vwap_score)
         min_adx_1h = float(self.config.trial_short_below_structure_promotion_min_adx_1h)
         min_shrink_pct = float(self.config.trial_short_below_structure_promotion_min_4h_shrink_pct)
         min_shrink_bars = max(1, int(self.config.trial_short_below_structure_promotion_min_4h_shrink_bars))
@@ -3120,6 +3358,14 @@ class MACDStrategyV2Engine:
     ) -> Tuple[bool, List[str], Dict[str, Any]]:
         if signal_type_1h != 'flip_bearish':
             return True, [], {}
+        if self._vwap_thresholds_disabled():
+            return True, [], {
+                "vwap_thresholds_disabled": True,
+                "market_quadrant": str(market_quadrant or "").strip().upper(),
+                "vwap_state": vwap_state,
+                "vwap_execution_state": vwap_execution_state,
+                "vwap_score": vwap_score,
+            }
 
         reasons: List[str] = []
         quadrant = str(market_quadrant or "").strip().upper()
@@ -3166,6 +3412,15 @@ class MACDStrategyV2Engine:
     ) -> Tuple[bool, List[str], Dict[str, Any]]:
         if signal_type_1h != 'flip_bullish':
             return True, [], {}
+        if self._vwap_thresholds_disabled():
+            return True, [], {
+                "vwap_thresholds_disabled": True,
+                "vwap_state": vwap_state,
+                "vwap_score": vwap_score,
+                "structural_vwap": structural_vwap,
+                "session_vwap_deviation": session_deviation,
+                "structural_vwap_deviation": structural_deviation,
+            }
 
         reasons: List[str] = []
         allowed_states = {"long_reclaim_confirmed"}
@@ -3565,6 +3820,23 @@ class MACDStrategyV2Engine:
             'rsi_slope_1h': rsi_result.rsi_slope_1h,
             'gate_pass': rsi_result.gate_pass,
         }
+        q4_rsi_floor = float(self.config.q4_rsi_lead_preflip_rsi_4h_min) - float(
+            self.config.q4_rsi_lead_preflip_rsi_4h_near_buffer
+        )
+        q4_whitelist_bypass = (
+            bool(self.config.enable_q4_rsi_lead_preflip_long)
+            and self.is_q4_rsi_lead_preflip_symbol_allowed(details.get("symbol"))
+            and str(signal.signal_type_1h or "").strip().lower() == "red_bar_growing"
+            and str(direction or "").strip().lower() == "long"
+            and float(signal.signal_score or 0.0) >= 0.64
+            and str(details.get("market_quadrant", "") or "").strip().upper() == "IV"
+            and float(rsi_result.rsi_1h or 0.0) >= float(self.config.q4_rsi_lead_preflip_rsi_1h_min)
+            and float(rsi_result.rsi_4h or 0.0) >= q4_rsi_floor
+            and (
+                float(details.get("macd_4h_hist_current", 0.0) or 0.0) >= 0.0
+                or float(details.get("macd_4h_shrink_pct", 0.0) or 0.0) >= float(self.config.q4_rsi_lead_preflip_min_4h_shrink_pct)
+            )
+        )
         whitelist_result = check_signal_family_whitelist(
             signal_type=signal.signal_type_1h or "",
             direction=direction,
@@ -3572,10 +3844,12 @@ class MACDStrategyV2Engine:
             rsi_result=rsi_dict,
             market_regime=market_regime,
         )
-        if not whitelist_result["allowed"]:
+        if not whitelist_result["allowed"] and not q4_whitelist_bypass:
             return self._neutral_signal(
                 reason=f"whitelist_fail:{whitelist_result['reason']}",
             )
+        if q4_whitelist_bypass:
+            details["q4_rsi_lead_preflip_whitelist_bypass"] = True
 
         # 专属共振门控（P0: 解锁信号族的精确保护，此处有完整 BOLL/RSI 数据）
         macd_hist_4h_val = float(details.get('macd_4h_hist_current', 0) or 0)
@@ -3599,9 +3873,12 @@ class MACDStrategyV2Engine:
                 macd_hist_4h_current=macd_hist_4h_val,
             )
             if not guard_ok:
-                return self._neutral_signal(
-                    reason=guard_reason,
-                )
+                if q4_whitelist_bypass:
+                    details["q4_rsi_lead_preflip_guard_bypass"] = True
+                else:
+                    return self._neutral_signal(
+                        reason=guard_reason,
+                    )
 
         # 三共振评分
         resonance_result = self._resonance_scorer.compute(
@@ -3613,9 +3890,15 @@ class MACDStrategyV2Engine:
         )
 
         if not resonance_result["gate_pass"]:
-            return self._neutral_signal(
-                reason=f"resonance_fail:{resonance_result['reason']}",
-            )
+            if q4_whitelist_bypass:
+                details["q4_rsi_lead_preflip_resonance_bypass"] = True
+                resonance_result = dict(resonance_result)
+                resonance_result["gate_pass"] = True
+                resonance_result["resonance_score"] = float(signal.signal_score)
+            else:
+                return self._neutral_signal(
+                    reason=f"resonance_fail:{resonance_result['reason']}",
+                )
 
         # 更新 signal 的评分和元数据
         resonance_score = resonance_result["resonance_score"]
@@ -3759,6 +4042,7 @@ class MACDStrategyV2Engine:
         # 空头质量过滤参数（V3专家组建议）
         funding_rate: float = 0.0,
         oi_delta_ratio: float = 0.0,
+        symbol: Optional[str] = None,
         # RSI数据
         rsi_val: float = 50.0,
         # RSI 多时间框架数据（双套件模式）
@@ -3772,6 +4056,7 @@ class MACDStrategyV2Engine:
         debug_details = self._build_debug_details(
             strategy="macd_mtf_strategy_v2",
             stage="1h_direction",
+            symbol=self._normalize_symbol(symbol),
             close_price=close_price,
             close_15m=close_15m,
             vwap=vwap,
@@ -3951,6 +4236,22 @@ class MACDStrategyV2Engine:
             entry_scale=entry_scale,
         )
         signal_type_1h = str(details_1h.get("signal_type") or "").strip().lower()
+        q4_rsi_lead_preflip_eval = self._evaluate_q4_rsi_lead_preflip_long(
+            market_quadrant=market_quadrant,
+            trade_direction=trade_direction,
+            signal_type_1h=signal_type_1h,
+            symbol=symbol,
+            macd_line_4h=float(macd_line_4h or 0.0),
+            macd_4h_shrink_pct=float(shrink_4h_context["shrink_pct"]),
+            macd_hist_4h=float(details_4h.get("hist_current", macd_hist_4h[idx_4h] if idx_4h < len(macd_hist_4h) else 0.0)),
+            close_price=float(close_price or 0.0),
+            bb_middle_1h=float(bb_middle_1h or 0.0),
+            rsi_1h=float(rsi_val if rsi_val is not None else 50.0),
+            rsi_4h=float(rsi_4h if rsi_4h is not None else 50.0),
+            atr_pct_1h=float(atr_1h / close_price) if float(close_price or 0.0) > 0 else 0.0,
+        )
+        q4_rsi_lead_preflip_passed = bool(q4_rsi_lead_preflip_eval.get("q4_rsi_lead_preflip_passed", False))
+        debug_details.update(**q4_rsi_lead_preflip_eval)
         state_machine_enabled = bool(
             self.config.require_macd_home_advantage
             or self.config.weight_boll_position > 0
@@ -4028,6 +4329,26 @@ class MACDStrategyV2Engine:
             if trade_direction == "short" and market_quadrant == "IV" and vwap_execution_state != "premium_reject_ok":
                 trade_direction = None
                 state_machine_reason = "quadrant_vwap_execution_block"
+        if trade_direction is None and q4_rsi_lead_preflip_passed:
+            trade_direction = "long"
+            is_trial_entry = True
+            entry_scale = min(entry_scale, float(q4_rsi_lead_preflip_eval.get("q4_rsi_lead_preflip_entry_scale", 1.0)))
+            vwap_execution_state = self._resolve_vwap_execution_state(
+                direction=trade_direction,
+                close_price=float(close_price or 0.0),
+                vwap=float(vwap or 0.0),
+                max_gap=0.01,
+            )
+            debug_details = self._set_stage(
+                debug_details,
+                "q4_rsi_lead_preflip_direction_override",
+                q4_rsi_lead_preflip_direction_override=True,
+                trade_direction=trade_direction,
+                is_trial_entry=is_trial_entry,
+                entry_scale=entry_scale,
+                vwap_execution_state=vwap_execution_state,
+            )
+            state_machine_reason = ""
         if trade_direction is None:
             return self._neutral_signal(
                 reason=state_machine_reason or direction_reject_reason or "主方向无明确结论",
@@ -4308,7 +4629,7 @@ class MACDStrategyV2Engine:
                     rsi_veto = True
 
                 # RSI评分惩罚：对growing家族，RSI不配合时降分
-                signal_type_name = details_1h.get('signal_type', '')
+                signal_type_name = details_1h.get('signal_type') or ''
                 if self.config.rsi_require_ok_for_growing and 'growing' in signal_type_name:
                     if trade_direction == 'long' and rsi_val < 50:
                         rsi_score_penalty = 0.15
@@ -4407,6 +4728,8 @@ class MACDStrategyV2Engine:
 
         signal_type_1h = details_1h.get('signal_type', '')
         entry_refine_15m = details_15m.get("ema_15m_refine")
+        if q4_rsi_lead_preflip_passed:
+            entry_scale = min(entry_scale, float(q4_rsi_lead_preflip_eval.get("q4_rsi_lead_preflip_entry_scale", 1.0)))
         if self.config.disable_green_bar_growing_entries and signal_type_1h == 'green_bar_growing':
             debug_details = self._set_stage(
                 debug_details,
@@ -4492,26 +4815,34 @@ class MACDStrategyV2Engine:
                 macd_hist_4h_current=macd_hist_4h_val,
             )
             if not guard_ok:
-                debug_details = self._set_stage(
-                    debug_details,
-                    "red_bar_growing_long_guard",
-                    rbg_long_guard_reason=guard_reason,
-                )
-                return self._neutral_signal(
-                    reason=guard_reason,
-                    signal_type_1h=signal_type_1h,
-                    entry_type_15m=entry_type_15m,
-                    entry_score_15m=entry_score_15m,
-                    vwap_score=vwap_score,
-                    vwap_deviation=vwap_deviation,
-                    ema_multiplier=ema_multiplier,
-                    ema_structure_status=ema_status,
-                    enhancement_score=enhancement_score,
-                    is_4h_enhanced=is_4h_enhanced,
-                    details=self._build_debug_details(
-                        **debug_details,
-                    ),
-                )
+                if q4_rsi_lead_preflip_passed:
+                    debug_details = self._set_stage(
+                        debug_details,
+                        "q4_rsi_lead_preflip_long",
+                        q4_rsi_lead_preflip_guard_bypass=True,
+                    )
+                else:
+                    debug_details = self._set_stage(
+                        debug_details,
+                        "red_bar_growing_long_guard",
+                        rbg_long_guard_reason=guard_reason,
+                    )
+                    return self._neutral_signal(
+                        reason=guard_reason,
+                        signal_type_1h=signal_type_1h,
+                        entry_type_15m=entry_type_15m,
+                        entry_score_15m=entry_score_15m,
+                        vwap_score=vwap_score,
+                        vwap_deviation=vwap_deviation,
+                        ema_multiplier=ema_multiplier,
+                        ema_structure_status=ema_status,
+                        enhancement_score=enhancement_score,
+                        is_4h_enhanced=is_4h_enhanced,
+                        entry_scale=entry_scale,
+                        details=self._build_debug_details(
+                            **debug_details,
+                        ),
+                    )
         if signal_type_1h == 'flip_bullish':
             bullish_vwap_ok, bullish_vwap_reasons, bullish_vwap_details = self.check_flip_bullish_vwap_context(
                 signal_type_1h=signal_type_1h,
@@ -5125,7 +5456,9 @@ class MACDStrategyV2Engine:
         weight_4h_direction = float(pocket_scoring_weights["weight_4h_direction"])
         weight_4h_enhancement = float(pocket_scoring_weights["weight_4h_enhancement"])
         weight_boll_position = float(self.config.weight_boll_position)
-        weight_vwap = float(pocket_scoring_weights["weight_vwap"])
+        weight_boll_rsi_resonance = float(
+            pocket_scoring_weights.get("weight_boll_rsi_resonance", self.config.weight_boll_rsi_resonance)
+        )
         weight_15m_entry = float(pocket_scoring_weights["weight_15m_entry"])
         weight_volume = float(pocket_scoring_weights["weight_volume"])
         
@@ -5134,6 +5467,7 @@ class MACDStrategyV2Engine:
         score_1h = 0.0
         score_1h_source = "no_direction_credit"
         score_boll_position = 0.0
+        score_boll_rsi_resonance = 0.0
         boll_rsi_resonance_type = "none"
         boll_rsi_resonance_type_sm = "none"
         boll_rsi_detail = {}
@@ -5220,13 +5554,12 @@ class MACDStrategyV2Engine:
                 rsi_1h=rsi_val if rsi_val is not None else 50.0,
                 rsi_4h=rsi_4h,
                 bb_middle_slope_1h=bb_middle_slope_1h,
-                weight=weight_vwap,
+                weight=weight_boll_rsi_resonance,
                 direction=trade_direction,
                 signal_type_1h=signal_type_1h or "",
             )
-            # 保留 score_vwap 字段名兼容性
-            score_vwap = score_boll_rsi
-            score += score_vwap
+            score_boll_rsi_resonance = score_boll_rsi
+            score += score_boll_rsi_resonance
 
             if entry_type_15m in ['flip_bullish', 'flip_bearish']:
                 score_15m = weight_15m_entry
@@ -5287,12 +5620,12 @@ class MACDStrategyV2Engine:
                 rsi_1h=rsi_val if rsi_val is not None else 50.0,
                 rsi_4h=rsi_4h,
                 bb_middle_slope_1h=bb_middle_slope_1h,
-                weight=weight_vwap,
+                weight=weight_boll_rsi_resonance,
                 direction=trade_direction,
                 signal_type_1h=signal_type_1h or "",
             )
-            score_vwap = score_boll_rsi_sm
-            score += score_vwap
+            score_boll_rsi_resonance = score_boll_rsi_sm
+            score += score_boll_rsi_resonance
 
             score_15m = 0.0
             score += score_15m
@@ -5336,6 +5669,11 @@ class MACDStrategyV2Engine:
             vwap_execution_state=vwap_execution_state,
         )
 
+        score_q4_rsi_lead_preflip = 0.0
+        if q4_rsi_lead_preflip_passed:
+            score_q4_rsi_lead_preflip = float(q4_rsi_lead_preflip_eval.get("q4_rsi_lead_preflip_bonus_score", 0.0))
+            score += score_q4_rsi_lead_preflip
+
         debug_details = self._set_stage(
             debug_details,
             "score_aggregation",
@@ -5349,9 +5687,11 @@ class MACDStrategyV2Engine:
             score_4h_enhancement_base=score_4h_enhancement_base,
             score_4h_enhancement=score_4h_enhancement,
             score_boll_position=score_boll_position,
-            score_vwap=score_vwap,
+            score_boll_rsi_resonance=score_boll_rsi_resonance,
+            score_vwap=score_boll_rsi_resonance,
             score_15m=score_15m,
             score_volume=score_vol,
+            score_q4_rsi_lead_preflip=score_q4_rsi_lead_preflip,
             boll_rsi_resonance_type=boll_rsi_resonance_type if not state_machine_enabled else boll_rsi_resonance_type_sm,
             boll_rsi_detail=boll_rsi_detail if not state_machine_enabled else boll_rsi_detail_sm,
             pocket_scoring_override_label=pocket_scoring_weights["override_label"],
@@ -5360,7 +5700,8 @@ class MACDStrategyV2Engine:
             pocket_weight_4h_direction=weight_4h_direction,
             pocket_weight_4h_enhancement=weight_4h_enhancement,
             pocket_weight_boll_position=weight_boll_position,
-            pocket_weight_vwap=weight_vwap,
+            pocket_weight_boll_rsi_resonance=weight_boll_rsi_resonance,
+            pocket_weight_vwap=self.config.weight_vwap,
             pocket_weight_15m_entry=weight_15m_entry,
             pocket_weight_volume=weight_volume,
             overheat_penalty=overheat_penalty,
@@ -5946,6 +6287,7 @@ class MACDStrategyV2Engine:
             'stage_path': final_stage_path,
             'stage_path_text': " > ".join(final_stage_path),
             'primary_timeframe': primary_mode,
+            'symbol': self._normalize_symbol(symbol),
             'trade_direction': trade_direction,
             'direction_1h': direction_1h,
             'signal_type_1h': signal_type_1h,
@@ -5968,6 +6310,8 @@ class MACDStrategyV2Engine:
             'enhancement_score': enhancement_score,
             'entry_type_15m': entry_type_15m,
             'entry_score_15m': entry_score_15m,
+            'macd_4h_hist_current': details_4h.get("hist_current"),
+            'macd_4h_hist_prev': details_4h.get("hist_prev"),
             'macd_4h_shrink_pct': shrink_4h_context["shrink_pct"],
             'macd_4h_shrink_bars': shrink_4h_context["shrink_bars"],
             'shrink_exit_direction': shrink_4h_context["exit_direction"],
@@ -5995,9 +6339,12 @@ class MACDStrategyV2Engine:
             'score_4h_enhancement_base': score_4h_enhancement_base,
             'score_4h_enhancement': score_4h_enhancement,
             'score_boll_position': score_boll_position,
-            'score_vwap': score_vwap,
+            'score_boll_rsi_resonance': score_boll_rsi_resonance,
+            'score_vwap': score_boll_rsi_resonance,
             'score_15m': score_15m,
             'score_volume': score_vol,
+            'score_q4_rsi_lead_preflip': score_q4_rsi_lead_preflip,
+            **q4_rsi_lead_preflip_eval,
             'overheat_penalty': overheat_penalty,
             'legacy_4h_boost': legacy_4h_boost,
             'effective_4h_score': effective_4h_score,

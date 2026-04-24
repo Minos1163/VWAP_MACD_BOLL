@@ -4832,6 +4832,7 @@ class FundFlowDecisionEngine:
             atr_1h=atr_1h,
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
+            symbol=symbol,
             rsi_val=self._to_float(tf_1h.get("rsi"), 50.0),
             rsi_4h=self._to_float(tf_4h.get("rsi"), 50.0),
             rsi_15m=self._to_float(tf_15m.get("rsi"), 50.0),

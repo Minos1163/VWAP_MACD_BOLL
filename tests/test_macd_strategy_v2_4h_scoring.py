@@ -20,10 +20,12 @@ def test_config_defaults_reflect_iteration1_ablation_targets() -> None:
     assert cfg.preflip_trial_min_signal_score == pytest.approx(0.70, rel=1e-6)
     assert cfg.min_vwap_score_for_entry == pytest.approx(0.10, rel=1e-6)
     assert cfg.stable_bear_continuation_min_vwap_score == pytest.approx(0.07, rel=1e-6)
-    assert cfg.min_signal_score == pytest.approx(0.83, rel=1e-6)
-    assert cfg.red_bar_growing_min_signal_score == pytest.approx(0.845, rel=1e-6)
-    assert cfg.flip_bearish_min_signal_score == pytest.approx(0.825, rel=1e-6)
-    assert cfg.flip_bullish_min_signal_score == pytest.approx(0.825, rel=1e-6)
+    assert cfg.q4_rsi_lead_preflip_allowed_symbols == ["ETHUSDT"]
+    assert cfg.q4_rsi_lead_preflip_strict_eth_only is True
+    assert cfg.min_signal_score == pytest.approx(0.80, rel=1e-6)
+    assert cfg.red_bar_growing_min_signal_score == pytest.approx(0.92, rel=1e-6)
+    assert cfg.flip_bearish_min_signal_score == pytest.approx(0.80, rel=1e-6)
+    assert cfg.flip_bullish_min_signal_score == pytest.approx(0.80, rel=1e-6)
     assert cfg.stable_bear_continuation_min_signal_score == pytest.approx(0.80, rel=1e-6)
     assert cfg.stable_bull_continuation_min_signal_score == pytest.approx(0.80, rel=1e-6)
 
@@ -212,6 +214,42 @@ def test_flip_bullish_vwap_context_requires_long_reclaim_confirmed() -> None:
     )
     assert ok is True
     assert reasons == []
+
+
+def test_flip_vwap_context_filters_are_disabled_when_thresholds_removed() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            disable_vwap_thresholds=True,
+            flip_bullish_min_vwap_score=0.25,
+            flip_bearish_retest_reject_min_vwap_score=0.25,
+        )
+    )
+
+    bullish_ok, bullish_reasons, bullish_details = engine.check_flip_bullish_vwap_context(
+        signal_type_1h="flip_bullish",
+        vwap_state="vwap_disabled",
+        vwap_score=0.0,
+        structural_vwap=0.0,
+        session_deviation=0.0,
+        structural_deviation=0.0,
+    )
+    assert bullish_ok is True
+    assert bullish_reasons == []
+    assert bullish_details["vwap_thresholds_disabled"] is True
+
+    bearish_ok, bearish_reasons, bearish_details = engine.check_flip_bearish_vwap_context(
+        signal_type_1h="flip_bearish",
+        market_quadrant="II",
+        vwap_state="vwap_disabled",
+        vwap_execution_state="unknown",
+        vwap_score=0.0,
+        structural_vwap=0.0,
+        session_deviation=0.0,
+        structural_deviation=0.0,
+    )
+    assert bearish_ok is True
+    assert bearish_reasons == []
+    assert bearish_details["vwap_thresholds_disabled"] is True
 
 
 def test_flip_bullish_trial_score_window_blocks_out_of_window_scores() -> None:
@@ -674,7 +712,10 @@ def test_analyze_uses_pocket_specific_scoring_weights_for_long_dual_support() ->
     assert override_signal.vwap_state == "long_dual_support"
     assert override_signal.details["score_4h"] < baseline_signal.details["score_4h"]
     assert override_signal.details["score_1h"] > baseline_signal.details["score_1h"]
-    assert override_signal.details["score_vwap"] > baseline_signal.details["score_vwap"]
+    assert override_signal.details["score_boll_rsi_resonance"] > baseline_signal.details["score_boll_rsi_resonance"]
+    assert override_signal.details["score_vwap"] == pytest.approx(
+        override_signal.details["score_boll_rsi_resonance"], rel=1e-6
+    )
     assert override_signal.details["score_15m"] > baseline_signal.details["score_15m"]
     assert override_signal.details["score_volume"] < baseline_signal.details["score_volume"]
 
@@ -1017,6 +1058,216 @@ def test_preflip_trial_entry_allows_4h_green_shrinking_long() -> None:
     assert signal.entry_scale == pytest.approx(0.35, rel=1e-6)
 
 
+def test_q4_rsi_lead_preflip_long_can_bypass_negative_4h_hist_guard() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            enable_q4_rsi_lead_preflip_long=True,
+            q4_rsi_lead_preflip_bonus_score=0.18,
+            q4_rsi_lead_preflip_entry_scale=0.35,
+            q4_rsi_lead_preflip_min_4h_shrink_pct=0.75,
+            q4_rsi_lead_preflip_rsi_1h_min=50.0,
+            q4_rsi_lead_preflip_rsi_4h_min=50.0,
+            q4_rsi_lead_preflip_rsi_4h_near_buffer=2.0,
+        )
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction="long",
+        signal_type_1h="red_bar_growing",
+        symbol="ETHUSDT",
+        macd_line_4h=-0.20,
+        macd_4h_shrink_pct=0.82,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        rsi_1h=61.0,
+        rsi_4h=50.5,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is True
+    assert result["q4_rsi_lead_preflip_reason"] == "passed"
+    assert result["q4_rsi_lead_preflip_symbol_gate_pass"] is True
+    assert result["q4_rsi_lead_preflip_bonus_score"] == pytest.approx(0.18, rel=1e-6)
+    assert result["q4_rsi_lead_preflip_entry_scale"] == pytest.approx(0.35, rel=1e-6)
+    assert result["q4_rsi_lead_preflip_raw_score"] > 0.0
+
+
+def test_q4_rsi_lead_preflip_long_still_requires_reclaim_above_1h_midline() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(enable_q4_rsi_lead_preflip_long=True)
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction="long",
+        signal_type_1h="red_bar_growing",
+        symbol="ETHUSDT",
+        macd_line_4h=-0.20,
+        macd_4h_shrink_pct=0.82,
+        close_price=99.0,
+        bb_middle_1h=100.0,
+        rsi_1h=61.0,
+        rsi_4h=50.5,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is False
+    assert result["q4_rsi_lead_preflip_reason"] == "price_below_1h_midline"
+
+
+def test_q4_rsi_lead_preflip_long_accepts_positive_4h_hist_without_preset_long_direction() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            enable_q4_rsi_lead_preflip_long=True,
+            q4_rsi_lead_preflip_bonus_score=0.18,
+            q4_rsi_lead_preflip_entry_scale=0.35,
+            q4_rsi_lead_preflip_min_4h_shrink_pct=0.75,
+            q4_rsi_lead_preflip_rsi_1h_min=50.0,
+            q4_rsi_lead_preflip_rsi_4h_min=50.0,
+            q4_rsi_lead_preflip_rsi_4h_near_buffer=15.0,
+        )
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction=None,
+        signal_type_1h="red_bar_growing",
+        symbol="ETHUSDT",
+        macd_line_4h=-10.0,
+        macd_4h_shrink_pct=0.10,
+        macd_hist_4h=0.11,
+        close_price=1977.31,
+        bb_middle_1h=1952.0445,
+        rsi_1h=62.39569523512433,
+        rsi_4h=36.08136386016742,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is True
+    assert result["q4_rsi_lead_preflip_reason"] == "passed"
+    assert result["q4_rsi_lead_preflip_hist_4h_positive"] is True
+
+
+def test_q4_rsi_lead_preflip_long_blocks_non_whitelist_symbol() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            enable_q4_rsi_lead_preflip_long=True,
+            q4_rsi_lead_preflip_allowed_symbols=["ETHUSDT"],
+        )
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction="long",
+        signal_type_1h="red_bar_growing",
+        symbol="SOLUSDT",
+        macd_line_4h=-0.20,
+        macd_4h_shrink_pct=0.82,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        rsi_1h=61.0,
+        rsi_4h=50.5,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is False
+    assert result["q4_rsi_lead_preflip_reason"] == "symbol_not_allowed"
+    assert result["q4_rsi_lead_preflip_symbol"] == "SOLUSDT"
+    assert result["q4_rsi_lead_preflip_symbol_gate_pass"] is False
+
+
+def test_q4_rsi_lead_preflip_long_allows_major_large_cap_symbol_with_dynamic_admission() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            enable_q4_rsi_lead_preflip_long=True,
+            q4_rsi_lead_preflip_strict_eth_only=False,
+            q4_rsi_lead_preflip_allowed_symbols=[],
+            q4_rsi_lead_preflip_allowed_categories=["major_large_cap"],
+            q4_rsi_lead_preflip_min_atr_pct_1h=0.005,
+            q4_rsi_lead_preflip_max_atr_pct_1h=0.050,
+            symbol_risk_watchlist_symbols=["LINKUSDT"],
+        )
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction="long",
+        signal_type_1h="red_bar_growing",
+        symbol="SOLUSDT",
+        macd_line_4h=-0.20,
+        macd_4h_shrink_pct=0.82,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        rsi_1h=61.0,
+        rsi_4h=50.5,
+        atr_pct_1h=0.020,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is True
+    assert result["q4_rsi_lead_preflip_reason"] == "passed"
+    assert result["q4_rsi_lead_preflip_symbol_gate_pass"] is True
+
+
+def test_q4_rsi_lead_preflip_long_dynamic_admission_blocks_watchlist_symbol() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            enable_q4_rsi_lead_preflip_long=True,
+            q4_rsi_lead_preflip_strict_eth_only=False,
+            q4_rsi_lead_preflip_allowed_symbols=[],
+            q4_rsi_lead_preflip_allowed_categories=["major_large_cap"],
+            q4_rsi_lead_preflip_min_atr_pct_1h=0.005,
+            q4_rsi_lead_preflip_max_atr_pct_1h=0.050,
+            symbol_risk_watchlist_symbols=["LINKUSDT"],
+        )
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction="long",
+        signal_type_1h="red_bar_growing",
+        symbol="LINKUSDT",
+        macd_line_4h=-0.20,
+        macd_4h_shrink_pct=0.82,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        rsi_1h=61.0,
+        rsi_4h=50.5,
+        atr_pct_1h=0.020,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is False
+    assert result["q4_rsi_lead_preflip_reason"] == "symbol_not_allowed"
+    assert "categories" in result["q4_rsi_lead_preflip_symbol_gate_reason"]
+
+
+def test_q4_rsi_lead_preflip_long_dynamic_admission_blocks_atr_out_of_range() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            enable_q4_rsi_lead_preflip_long=True,
+            q4_rsi_lead_preflip_strict_eth_only=False,
+            q4_rsi_lead_preflip_allowed_symbols=[],
+            q4_rsi_lead_preflip_allowed_categories=["major_large_cap"],
+            q4_rsi_lead_preflip_min_atr_pct_1h=0.010,
+            q4_rsi_lead_preflip_max_atr_pct_1h=0.030,
+        )
+    )
+
+    result = engine._evaluate_q4_rsi_lead_preflip_long(
+        market_quadrant="IV",
+        trade_direction="long",
+        signal_type_1h="red_bar_growing",
+        symbol="BTCUSDT",
+        macd_line_4h=-0.20,
+        macd_4h_shrink_pct=0.82,
+        close_price=101.0,
+        bb_middle_1h=100.0,
+        rsi_1h=61.0,
+        rsi_4h=50.5,
+        atr_pct_1h=0.005,
+    )
+
+    assert result["q4_rsi_lead_preflip_passed"] is False
+    assert result["q4_rsi_lead_preflip_reason"] == "symbol_not_allowed"
+    assert "atr_pct_1h" in result["q4_rsi_lead_preflip_symbol_gate_reason"]
+
+
 def test_long_whitelist_config_blocks_non_whitelist_long_combos() -> None:
     cfg = MACDStrategyV2Config(
         long_entry_mode="whitelist_only",
@@ -1062,6 +1313,51 @@ def test_build_macd_v2_config_from_runtime_loads_long_whitelist_controls() -> No
     assert config.long_whitelist_signal_types == ["green_bar_growing"]
     assert config.long_whitelist_vwap_states == ["long_dual_support"]
     assert config.long_whitelist_pockets == ["flip_bullish|long_reclaim_confirmed"]
+
+
+def test_build_macd_v2_config_from_runtime_loads_q4_symbol_whitelist() -> None:
+    runtime_cfg = {
+        "fund_flow": {
+            "macd_mtf_strategy_v2": {
+                "entry_filters": {
+                    "enable_q4_rsi_lead_preflip_long": True,
+                    "q4_rsi_lead_preflip_allowed_symbols": ["ETHUSDT", "BTCUSDT"],
+                }
+            }
+        }
+    }
+
+    config = build_macd_v2_config_from_runtime(runtime_cfg)
+
+    assert config.enable_q4_rsi_lead_preflip_long is True
+    assert config.q4_rsi_lead_preflip_allowed_symbols == ["ETHUSDT", "BTCUSDT"]
+
+
+def test_build_macd_v2_config_from_runtime_loads_dynamic_q4_admission_and_resonance_weight() -> None:
+    runtime_cfg = {
+        "fund_flow": {
+            "macd_mtf_strategy_v2": {
+                "scoring_weights": {
+                    "weight_boll_rsi_resonance": 0.18,
+                },
+                "entry_filters": {
+                    "enable_q4_rsi_lead_preflip_long": True,
+                    "q4_rsi_lead_preflip_strict_eth_only": False,
+                    "q4_rsi_lead_preflip_allowed_categories": ["major_large_cap"],
+                    "q4_rsi_lead_preflip_min_atr_pct_1h": 0.01,
+                    "q4_rsi_lead_preflip_max_atr_pct_1h": 0.03,
+                },
+            }
+        }
+    }
+
+    config = build_macd_v2_config_from_runtime(runtime_cfg)
+
+    assert config.weight_boll_rsi_resonance == pytest.approx(0.18, rel=1e-6)
+    assert config.q4_rsi_lead_preflip_strict_eth_only is False
+    assert config.q4_rsi_lead_preflip_allowed_categories == ["major_large_cap"]
+    assert config.q4_rsi_lead_preflip_min_atr_pct_1h == pytest.approx(0.01, rel=1e-6)
+    assert config.q4_rsi_lead_preflip_max_atr_pct_1h == pytest.approx(0.03, rel=1e-6)
 
 
 def test_flip_bullish_cvd_context_filter_blocks_preflip_trial_entry() -> None:
@@ -1831,6 +2127,32 @@ def test_resolve_pocket_entry_requirements_applies_trial_and_override_rules() ->
     assert requirements["allow_neutral_1h_confirmation"] is False
     assert requirements["disallow_trial_entry"] is True
     assert requirements["require_strict_1h_confirmation"] is True
+
+
+def test_resolve_pocket_entry_requirements_zeroes_vwap_floor_when_thresholds_removed() -> None:
+    engine = MACDStrategyV2Engine(
+        MACDStrategyV2Config(
+            disable_vwap_thresholds=True,
+            min_signal_score=0.83,
+            preflip_trial_min_signal_score=0.70,
+            min_vwap_score_for_entry=0.10,
+            preflip_trial_min_vwap_score=0.06,
+        )
+    )
+
+    base = engine.resolve_pocket_entry_requirements(
+        signal_type_1h="red_bar_growing",
+        vwap_state="long_dual_support",
+        is_trial_entry=False,
+    )
+    trial = engine.resolve_pocket_entry_requirements(
+        signal_type_1h="red_bar_growing",
+        vwap_state="long_dual_support",
+        is_trial_entry=True,
+    )
+
+    assert base["min_vwap_score_for_entry"] == pytest.approx(0.0, rel=1e-6)
+    assert trial["min_vwap_score_for_entry"] == pytest.approx(0.0, rel=1e-6)
 
 
 def test_resolve_pocket_entry_requirements_supports_disabled_flag() -> None:

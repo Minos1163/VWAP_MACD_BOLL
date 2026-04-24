@@ -558,6 +558,7 @@
         "weight_boll_position": 0.25,
         "weight_boll_bandwidth": 0.10,
         "weight_rsi_momentum": 0.15,
+        "weight_boll_rsi_resonance": 0.0,
         "weight_vwap": 0.0,
         "weight_15m_entry": 0.05,
         "weight_volume": 0.15
@@ -635,6 +636,24 @@
         "preflip_trial_min_vwap_score": 0.0,
         "preflip_trial_entry_scale": 0.2,
         "preflip_trial_max_leverage": 3,
+        "enable_q4_rsi_lead_preflip_long": true,
+        "q4_rsi_lead_preflip_min_4h_shrink_pct": 0.75,
+        "q4_rsi_lead_preflip_rsi_1h_min": 50.0,
+        "q4_rsi_lead_preflip_rsi_4h_min": 50.0,
+        "q4_rsi_lead_preflip_rsi_4h_near_buffer": 15.0,
+        "q4_rsi_lead_preflip_bonus_score": 0.18,
+        "q4_rsi_lead_preflip_entry_scale": 0.35,
+        "q4_rsi_lead_preflip_strict_eth_only": false,
+        "q4_rsi_lead_preflip_allowed_symbols": [],
+        "q4_rsi_lead_preflip_allowed_categories": [
+          "major_large_cap"
+        ],
+        "q4_rsi_lead_preflip_min_atr_pct_1h": 0.005,
+        "q4_rsi_lead_preflip_max_atr_pct_1h": 0.050,
+        "enable_q4_rsi_lead_preflip_hold": true,
+        "q4_rsi_lead_preflip_hold_exit_metric": "rsi_21",
+        "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold": 70.0,
+        "q4_rsi_lead_preflip_hold_rsi_4h_pullback": 3.0,
         "enable_trial_short_below_structure_continuation_promotion": true,
         "trial_short_below_structure_promotion_min_signal_score": 0.8,
         "trial_short_below_structure_promotion_min_vwap_score": 0.0,
@@ -687,6 +706,7 @@
         },
         "min_signal_score": 0.50,
         "min_vwap_score_for_entry": 0.0,
+        "disable_vwap_thresholds": true,
         "symbol_signal_overrides": [
           {
             "symbol": "ZECUSDT",

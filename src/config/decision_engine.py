@@ -3242,6 +3242,7 @@ class FundFlowDecisionEngine:
             atr_1h=atr_1h,
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
+            symbol=symbol,
         )
         
         # 构建元数据

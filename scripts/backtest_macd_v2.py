@@ -47,6 +47,37 @@ from src.utils.passive_fill import classify_passive_limit_fill, direct_ioc_fill_
 
 # ==================== 配置 ====================
 
+Q4_GATE_EXPORT_FIELDS = (
+    "score_q4_rsi_lead_preflip",
+    "q4_rsi_lead_preflip_active",
+    "q4_rsi_lead_preflip_passed",
+    "q4_rsi_lead_preflip_reason",
+    "q4_rsi_lead_preflip_bonus_score",
+    "q4_rsi_lead_preflip_entry_scale",
+    "q4_rsi_lead_preflip_symbol",
+    "q4_rsi_lead_preflip_allowed_symbols",
+    "q4_rsi_lead_preflip_symbol_gate_pass",
+    "q4_rsi_lead_preflip_symbol_gate_reason",
+    "q4_rsi_lead_preflip_raw_score",
+    "q4_rsi_lead_preflip_boll_reclaim_score",
+    "q4_rsi_lead_preflip_rsi_1h",
+    "q4_rsi_lead_preflip_rsi_4h",
+    "q4_rsi_lead_preflip_macd_4h_shrink_pct",
+    "q4_rsi_lead_preflip_macd_line_4h",
+    "q4_rsi_lead_preflip_macd_hist_4h",
+    "q4_rsi_lead_preflip_hist_4h_positive",
+    "q4_rsi_lead_preflip_bb_middle_1h",
+    "q4_rsi_lead_preflip_hold_active",
+    "q4_rsi_lead_preflip_hold_peak_rsi_4h",
+    "q4_rsi_lead_preflip_hold_exit_armed",
+    "q4_rsi_lead_preflip_hold_exit_ready",
+    "q4_rsi_lead_preflip_hold_exit_reason",
+    "q4_rsi_lead_preflip_hold_exit_metric",
+    "q4_rsi_lead_preflip_hold_current_exit_value",
+    "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold",
+    "q4_rsi_lead_preflip_hold_rsi_4h_pullback",
+)
+
 @dataclass
 class BacktestConfig:
     """回测配置"""
@@ -1856,6 +1887,7 @@ class BacktestEngine:
             atr_1h=row_1h['atr'],
             funding_rate=funding_rate,
             oi_delta_ratio=oi_delta_ratio,
+            symbol=symbol,
             rsi_val=float(row_1h['rsi']) if 'rsi' in row_1h.index else 50.0,
             rsi_4h=float(row_4h['rsi_21'] if 'rsi_21' in row_4h.index else row_4h.get('rsi', 50.0)),
             rsi_15m=float(row_15m['rsi_7'] if 'rsi_7' in row_15m.index else row_15m.get('rsi', 50.0)),
@@ -2035,6 +2067,16 @@ class BacktestEngine:
             signal.signal_type_1h,
             signal.vwap_state,
         )
+        signal_details = signal.details if isinstance(signal.details, dict) else {}
+        q4_hold_active = bool(
+            self.strategy_config.enable_q4_rsi_lead_preflip_hold
+            and signal_details.get("q4_rsi_lead_preflip_passed", False)
+        )
+        q4_hold_peak_rsi_4h = float(
+            getattr(signal, "rsi_4h", 0.0)
+            or signal_details.get("q4_rsi_lead_preflip_rsi_4h", 0.0)
+            or 0.0
+        )
         effective_symbol_session_scale = strategy_engine.resolve_symbol_risk_session_scale(
             symbol,
             session_position_scale,
@@ -2054,7 +2096,7 @@ class BacktestEngine:
             is_trial_entry=bool(signal.is_trial_entry),
             entry_scale=float(signal.entry_scale or 1.0),
             session_scale=session_position_scale,
-            signal_details=signal.details if isinstance(signal.details, dict) else {},
+            signal_details=signal_details,
         )
         # VWAP结构覆盖：杠杆上限
         max_lev_override = vwap_structure_override.get("max_leverage_override")
@@ -2218,6 +2260,25 @@ class BacktestEngine:
             'entry_degradation_path': [],
             'timed_campaign_force_fill': bool((signal.details or {}).get('timed_campaign_active', False)),
             'timed_campaign_hold_until_exit': bool((signal.details or {}).get('timed_campaign_active', False)),
+            **{field: signal_details.get(field) for field in Q4_GATE_EXPORT_FIELDS},
+            'q4_rsi_lead_preflip_hold_active': q4_hold_active,
+            'q4_rsi_lead_preflip_hold_peak_rsi_4h': q4_hold_peak_rsi_4h,
+            'q4_rsi_lead_preflip_hold_exit_armed': bool(
+                q4_hold_active
+                and q4_hold_peak_rsi_4h >= float(self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold)
+            ),
+            'q4_rsi_lead_preflip_hold_exit_ready': False,
+            'q4_rsi_lead_preflip_hold_exit_reason': "",
+            'q4_rsi_lead_preflip_hold_exit_metric': str(
+                self.strategy_config.q4_rsi_lead_preflip_hold_exit_metric or "rsi_21"
+            ),
+            'q4_rsi_lead_preflip_hold_current_exit_value': q4_hold_peak_rsi_4h,
+            'q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold': float(
+                self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold
+            ),
+            'q4_rsi_lead_preflip_hold_rsi_4h_pullback': float(
+                self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_pullback
+            ),
         }
     
     def close_position(
@@ -2338,6 +2399,7 @@ class BacktestEngine:
             'entry_fill_direct_ioc_reason': str(pos.get('entry_fill_direct_ioc_reason', '')),
             'dynamic_position_mult': float(pos.get('dynamic_position_mult', 1.0)),
             'remaining_margin_after': remaining_margin,
+            **{field: pos.get(field) for field in Q4_GATE_EXPORT_FIELDS},
         })
 
         total_trade_pnl = realized_pnl_accum + pnl
@@ -2442,6 +2504,7 @@ class BacktestEngine:
             'trailing_stop': None,
             'realized_pnl_accum': 0.0,
             'timed_campaign_hold_until_exit': bool(order.get('timed_campaign_hold_until_exit', False)),
+            **{field: order.get(field) for field in Q4_GATE_EXPORT_FIELDS},
         }
         self.pending_orders.pop(symbol, None)
         self._mark_symbol_timed_campaign_filled(symbol, str(order.get('side', '')))
@@ -2670,6 +2733,67 @@ class BacktestEngine:
             if isinstance(level, dict) and bool(level.get('filled'))
         )
         return completed_levels >= required_levels
+
+    def _evaluate_q4_rsi_lead_hold_state(self, pos: dict, analysis: dict, signal: MACDSignalV2) -> dict:
+        if not bool(pos.get("q4_rsi_lead_preflip_hold_active", False)):
+            return {
+                "active": False,
+                "protecting": False,
+                "exit_ready": False,
+            }
+
+        row_4h = analysis.get("row_4h")
+        current_rsi_4h = 0.0
+        exit_metric = str(pos.get("q4_rsi_lead_preflip_hold_exit_metric", "rsi_21") or "rsi_21").strip().lower()
+        if exit_metric not in {"rsi", "rsi_21"}:
+            exit_metric = "rsi_21"
+        if isinstance(row_4h, pd.Series):
+            current_rsi_4h = float(row_4h.get(exit_metric, row_4h.get("rsi_21", row_4h.get("rsi", 0.0))) or 0.0)
+        elif isinstance(row_4h, dict):
+            current_rsi_4h = float(row_4h.get(exit_metric, row_4h.get("rsi_21", row_4h.get("rsi", 0.0))) or 0.0)
+        if current_rsi_4h <= 0:
+            current_rsi_4h = float(
+                getattr(signal, "rsi_4h", 0.0)
+                or (signal.details or {}).get("q4_rsi_lead_preflip_rsi_4h", 0.0)
+                or pos.get("q4_rsi_lead_preflip_hold_peak_rsi_4h", 0.0)
+                or 0.0
+            )
+        peak_rsi_4h = max(
+            float(pos.get("q4_rsi_lead_preflip_hold_peak_rsi_4h", current_rsi_4h) or current_rsi_4h),
+            current_rsi_4h,
+        )
+        exit_threshold = float(
+            pos.get(
+                "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold",
+                self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold,
+            )
+            or self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold
+        )
+        pullback = max(
+            0.0,
+            float(
+                pos.get(
+                    "q4_rsi_lead_preflip_hold_rsi_4h_pullback",
+                    self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_pullback,
+                )
+                or self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_pullback
+            ),
+        )
+        exit_armed = bool(pos.get("q4_rsi_lead_preflip_hold_exit_armed", False)) or peak_rsi_4h >= exit_threshold
+        exit_ready = bool(exit_armed and current_rsi_4h <= (peak_rsi_4h - pullback))
+
+        pos["q4_rsi_lead_preflip_hold_peak_rsi_4h"] = peak_rsi_4h
+        pos["q4_rsi_lead_preflip_hold_exit_armed"] = exit_armed
+        pos["q4_rsi_lead_preflip_hold_exit_ready"] = exit_ready
+        pos["q4_rsi_lead_preflip_hold_exit_reason"] = "rsi_4h_pullback" if exit_ready else ""
+        pos["q4_rsi_lead_preflip_hold_exit_metric"] = exit_metric
+        pos["q4_rsi_lead_preflip_hold_current_exit_value"] = current_rsi_4h
+
+        return {
+            "active": True,
+            "protecting": not exit_ready,
+            "exit_ready": exit_ready,
+        }
     
     def check_stops(self, symbol: str, analysis: dict) -> bool:
         """用同一根15m的OHLC近似 intrabar 触发，返回是否已平仓"""
@@ -2688,6 +2812,8 @@ class BacktestEngine:
         low_price = float(row['low'])
         timed_campaign_hold = bool(pos.get('timed_campaign_hold_until_exit', False))
         timed_campaign_exit_window_active = self._symbol_timed_campaign_exit_window_active(symbol, time)
+        q4_hold_state = self._evaluate_q4_rsi_lead_hold_state(pos, analysis, signal)
+        q4_hold_protecting = bool(q4_hold_state["protecting"])
 
         # 计算当前盈亏比例
         if pos['side'] == 'long':
@@ -2696,7 +2822,7 @@ class BacktestEngine:
             pnl_pct = (pos['entry_price'] - price) / pos['entry_price']
         
         # 保本止损：与实盘配置对齐
-        if self.config.breakeven_enabled and not timed_campaign_hold:
+        if self.config.breakeven_enabled and not timed_campaign_hold and not q4_hold_protecting:
             breakeven_trigger = self._resolve_effective_breakeven_trigger(pos)
             breakeven_lock = float(pos.get('breakeven_lock_ratio', self.config.breakeven_lock_ratio))
             if pos['side'] == 'long':
@@ -2716,7 +2842,7 @@ class BacktestEngine:
 
         trailing_profile = self._resolve_trailing_profile(pos)
         activation_pnl_ratio = float(trailing_profile.get("activation_pnl_ratio", 0.0) or 0.0)
-        if activation_pnl_ratio > 0 and self._runner_only_trailing_ready(pos) and not timed_campaign_hold:
+        if activation_pnl_ratio > 0 and self._runner_only_trailing_ready(pos) and not timed_campaign_hold and not q4_hold_protecting:
             if pos['side'] == 'long':
                 best_pnl_pct = (high_price - pos['entry_price']) / pos['entry_price']
             else:
@@ -2771,6 +2897,10 @@ class BacktestEngine:
                 else:
                     hit_levels.sort(key=lambda item: float(item.get('price', 0.0)), reverse=True)
 
+        if q4_hold_protecting:
+            hit_levels = []
+            target_hit = False
+
         same_bar_tp_priority_mode = str(getattr(self.config, "same_bar_tp_priority_mode", "stop_first") or "stop_first").lower()
         if stop_hit and hit_levels and same_bar_tp_priority_mode == "tp1_before_stop":
             first_level = hit_levels[0]
@@ -2802,6 +2932,10 @@ class BacktestEngine:
             if target_hit:
                 reason = "stop_loss_intrabar_both_hit"
             self.close_position(symbol, exit_price, time, reason)
+            return True
+
+        if q4_hold_state["exit_ready"]:
+            self.close_position(symbol, price, time, "q4_rsi_lead_4h_rsi_turn_exit")
             return True
 
         if timed_campaign_hold and not timed_campaign_exit_window_active:
@@ -2836,6 +2970,7 @@ class BacktestEngine:
         shrink_exit_ready = bool((signal.details or {}).get('shrink_exit_ready', False))
         if (
             self.strategy_config.enable_4h_shrink_exit
+            and not q4_hold_protecting
             and shrink_exit_ready
             and shrink_exit_direction == pos['side']
         ):
@@ -2869,6 +3004,7 @@ class BacktestEngine:
         # 反向有效信号触发离场，但不在同一根K线立即反手
         if (
             not timed_campaign_hold
+            and not q4_hold_protecting
             and
             signal.direction in ('long', 'short')
             and signal.signal_score >= self._signal_threshold(signal)
@@ -2878,7 +3014,7 @@ class BacktestEngine:
             return True
         
         # 最大持仓时间限制（默认关闭，避免偏离实盘）
-        if self.config.max_hold_hours > 0 and 'entry_time' in pos and not timed_campaign_hold:
+        if self.config.max_hold_hours > 0 and 'entry_time' in pos and not timed_campaign_hold and not q4_hold_protecting:
             hold_time = time - pos['entry_time']
             # 时间戳可能是Timedelta或数值
             if hasattr(hold_time, 'total_seconds'):
