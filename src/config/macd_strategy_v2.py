@@ -75,7 +75,7 @@ class MACDStrategyV2Config:
     weight_1h_direction: float = 0.35  # 兼容旧配置键：未显式提供 weight_4h_direction 时作为回退
     weight_4h_direction: float = 0.35  # 4H主趋势评分权重
     weight_4h_enhancement: float = 0.00  # 4H附加增强权重（默认关闭，避免重复计分）
-    weight_vwap: float = 0.15  # VWAP评分权重
+    weight_vwap: float = 0.0  # 已退役，保留仅为兼容旧配置
     weight_15m_entry: float = 0.10  # 15M入场时机评分权重
     weight_volume: float = 0.15  # 成交量确认评分权重
     
@@ -91,7 +91,7 @@ class MACDStrategyV2Config:
     enable_flip_bullish_strict_filter: bool = True
     disable_flip_bullish_entries: bool = False
     disable_flip_bullish_trial_entries: bool = False
-    flip_bullish_min_vwap_score: float = 0.12
+    flip_bullish_min_vwap_score: float = 0.0
     flip_bullish_require_pullback_bounce: bool = True
     flip_bullish_require_15m_growing: bool = True
     enable_flip_bullish_cvd_context_filter: bool = False
@@ -124,23 +124,23 @@ class MACDStrategyV2Config:
     preflip_trial_min_shrink_pct_long: float = 0.75
     preflip_trial_min_shrink_pct_short: float = 0.30
     preflip_trial_min_signal_score: float = 0.78
-    preflip_trial_min_vwap_score: float = 0.06
+    preflip_trial_min_vwap_score: float = 0.0
     preflip_trial_entry_scale: float = 0.35
     preflip_trial_max_leverage: int = 2
     enable_trial_short_below_structure_continuation_promotion: bool = False
     trial_short_below_structure_promotion_min_signal_score: float = 0.82
-    trial_short_below_structure_promotion_min_vwap_score: float = 0.075
+    trial_short_below_structure_promotion_min_vwap_score: float = 0.0
     trial_short_below_structure_promotion_min_adx_1h: float = 25.0
     trial_short_below_structure_promotion_min_4h_shrink_pct: float = 0.80
     trial_short_below_structure_promotion_min_4h_shrink_bars: int = 6
     enable_stable_bear_continuation: bool = True
     stable_bear_continuation_min_signal_score: float = 0.82
-    stable_bear_continuation_min_vwap_score: float = 0.10
+    stable_bear_continuation_min_vwap_score: float = 0.0
     stable_bear_continuation_min_adx_1h: float = 20.0
     stable_bear_continuation_min_4h_bars: int = 2
     enable_stable_bull_continuation: bool = False
     stable_bull_continuation_min_signal_score: float = 0.82
-    stable_bull_continuation_min_vwap_score: float = 0.10
+    stable_bull_continuation_min_vwap_score: float = 0.0
     stable_bull_continuation_min_adx_1h: float = 20.0
     stable_bull_continuation_min_4h_bars: int = 2
     enable_stable_continuation_slow_4h_shrink_exit: bool = True
@@ -570,29 +570,7 @@ class MACDStrategyV2Engine:
         signal_type_1h: Optional[str] = None,
         vwap_state: Optional[str] = None,
     ) -> float:
-        apply_states = {
-            str(item or "").strip().lower()
-            for item in (self.config.vwap_score_tier_apply_to_states or [])
-            if str(item or "").strip()
-        }
-        signal_state = str(signal_type_1h or "").strip().lower()
-        vwap_state_norm = str(vwap_state or "").strip().lower()
-        if apply_states and signal_state not in apply_states and vwap_state_norm not in apply_states:
-            return 1.0
-
-        score = float(vwap_score or 0.0)
-        for raw_tier in self.config.vwap_score_position_tiers or []:
-            if not isinstance(raw_tier, dict):
-                continue
-            tier_min = float(raw_tier.get("min", 0.0) or 0.0)
-            tier_max = float(raw_tier.get("max", 1.0) or 1.0)
-            if tier_max <= tier_min:
-                continue
-            is_last = abs(tier_max - 1.0) < 1e-12 or tier_max >= 0.999999
-            in_tier = (tier_min <= score <= tier_max) if is_last else (tier_min <= score < tier_max)
-            if not in_tier:
-                continue
-            return self._clamp(float(raw_tier.get("position_mult", 1.0) or 1.0), 0.05, 1.5)
+        # VWAP 相关仓位调整已下线，统一返回 1.0。
         return 1.0
 
     @classmethod
@@ -1355,6 +1333,18 @@ class MACDStrategyV2Engine:
         - veto_type: 是否触发否决
         - details: 位置状态与连续评分细节
         """
+        deviation = (price - vwap) / vwap if vwap > 0 else 0.0
+        return 0.0, VetoType.NONE, {
+            "state": "vwap_disabled",
+            "location_score": 0.0,
+            "entry_edge": 0.0,
+            "directional_extension": 0.0,
+            "session_vwap": vwap,
+            "structural_vwap": structural_vwap or 0.0,
+            "session_deviation": deviation,
+            "structural_deviation": 0.0,
+        }
+
         structural_vwap_value = float(structural_vwap) if structural_vwap is not None else 0.0
         if structural_vwap_value <= 0.0:
             structural_vwap_value = self._series_value(structural_vwap_series, default=0.0)
@@ -1697,33 +1687,14 @@ class MACDStrategyV2Engine:
     ) -> Tuple[bool, List[str], Dict[str, Any]]:
         if signal_type_1h != 'flip_bearish':
             return True, [], {}
-
-        reasons: List[str] = []
-        allowed_states = {"short_retest_reject", "short_dual_pressure"}
-        if structural_vwap <= 0:
-            reasons.append("structural_vwap_missing")
-        if vwap_state not in allowed_states:
-            reasons.append(f"vwap_state={vwap_state}")
-        retest_reject_min_vwap_score = max(0.0, self.config.flip_bearish_retest_reject_min_vwap_score)
-        if (
-            vwap_state == "short_retest_reject"
-            and retest_reject_min_vwap_score > 0
-            and vwap_score < retest_reject_min_vwap_score
-        ):
-            reasons.append(
-                f"short_retest_reject_vwap_score={vwap_score:.2f}<{retest_reject_min_vwap_score:.2f}"
-            )
-
-        details = {
-            "flip_bearish_allowed_vwap_states": sorted(allowed_states),
+        return True, [], {
+            "vwap_thresholds_disabled": True,
             "vwap_state": vwap_state,
             "vwap_score": vwap_score,
-            "flip_bearish_retest_reject_min_vwap_score": retest_reject_min_vwap_score,
             "structural_vwap": structural_vwap,
             "session_vwap_deviation": session_deviation,
             "structural_vwap_deviation": structural_deviation,
         }
-        return len(reasons) == 0, reasons, details
 
     # ==================== BOLL 结构层（新增） ====================
     
@@ -2702,34 +2673,12 @@ class MACDStrategyV2Engine:
                 flip_bearish_structure_skipped=True,
             )
 
-        min_vwap_score_for_entry = max(
-            0.0,
-            self.config.preflip_trial_min_vwap_score if is_trial_entry else self.config.min_vwap_score_for_entry,
+        debug_details = self._set_stage(
+            debug_details,
+            "vwap_score_filter",
+            vwap_thresholds_disabled=True,
+            min_vwap_score_for_entry=0.0,
         )
-        if min_vwap_score_for_entry > 0 and vwap_score < min_vwap_score_for_entry:
-            debug_details = self._set_stage(
-                debug_details,
-                "vwap_score_filter",
-                min_vwap_score_for_entry=min_vwap_score_for_entry,
-            )
-            return self._neutral_signal(
-                reason=f'vwap_hard_block({vwap_score:.2f}<{min_vwap_score_for_entry:.2f})',
-                score=0.0,
-                veto_type=VetoType.VWAP_SCORE_FILTER,
-                veto_reason="VWAP评分低于入场阈值",
-                signal_type_1h=signal_type_1h,
-                entry_type_15m=entry_type_15m,
-                entry_score_15m=entry_score_15m,
-                vwap_score=vwap_score,
-                vwap_deviation=vwap_deviation,
-                ema_multiplier=ema_multiplier,
-                ema_structure_status=ema_status,
-                enhancement_score=enhancement_score,
-                is_4h_enhanced=is_4h_enhanced,
-                details=self._build_debug_details(
-                    **debug_details,
-                ),
-            )
 
         if strict_1h_filters_enabled and signal_type_1h == 'red_bar_growing' and trade_direction == 'long':
             if ema_status == 'against':
@@ -2753,31 +2702,11 @@ class MACDStrategyV2Engine:
                         **debug_details,
                     ),
                 )
-            if vwap_deviation < -self.config.vwap_deviation_hard_block:
-                debug_details = self._set_stage(
-                    debug_details,
-                    "red_bar_long_filter",
-                    red_bar_long_filter_reason="vwap_dev_too_low",
-                )
-                return self._neutral_signal(
-                    reason=(
-                        f'red_bar_long_blocked('
-                        f'vwap_dev={vwap_deviation * 100:.1f}%<'
-                        f'-{self.config.vwap_deviation_hard_block * 100:.1f}%)'
-                    ),
-                    signal_type_1h=signal_type_1h,
-                    entry_type_15m=entry_type_15m,
-                    entry_score_15m=entry_score_15m,
-                    vwap_score=vwap_score,
-                    vwap_deviation=vwap_deviation,
-                    ema_multiplier=ema_multiplier,
-                    ema_structure_status=ema_status,
-                    enhancement_score=enhancement_score,
-                    is_4h_enhanced=is_4h_enhanced,
-                    details=self._build_debug_details(
-                        **debug_details,
-                    ),
-                )
+            debug_details = self._set_stage(
+                debug_details,
+                "red_bar_long_filter",
+                red_bar_long_filter_reason="vwap_telemetry_only",
+            )
         
         # ========== Step 6: 综合评分 ==========
         score = 0.0

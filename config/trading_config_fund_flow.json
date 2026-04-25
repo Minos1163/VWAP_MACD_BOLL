@@ -640,7 +640,7 @@
         "q4_rsi_lead_preflip_min_4h_shrink_pct": 0.75,
         "q4_rsi_lead_preflip_rsi_1h_min": 50.0,
         "q4_rsi_lead_preflip_rsi_4h_min": 50.0,
-        "q4_rsi_lead_preflip_rsi_4h_near_buffer": 15.0,
+        "q4_rsi_lead_preflip_rsi_4h_near_buffer": 20.0,
         "q4_rsi_lead_preflip_bonus_score": 0.18,
         "q4_rsi_lead_preflip_entry_scale": 0.35,
         "q4_rsi_lead_preflip_strict_eth_only": false,
@@ -648,8 +648,10 @@
         "q4_rsi_lead_preflip_allowed_categories": [
           "major_large_cap"
         ],
-        "q4_rsi_lead_preflip_min_atr_pct_1h": 0.005,
-        "q4_rsi_lead_preflip_max_atr_pct_1h": 0.050,
+        "q4_rsi_lead_preflip_min_atr_pct_1h": 0.003,
+        "q4_rsi_lead_preflip_max_atr_pct_1h": 0.070,
+        "q4_rsi_lead_preflip_min_signal_score_override": 0.44,
+        "rsi_gate_q4_exempt": true,
         "enable_q4_rsi_lead_preflip_hold": true,
         "q4_rsi_lead_preflip_hold_exit_metric": "rsi_21",
         "q4_rsi_lead_preflip_hold_rsi_4h_exit_threshold": 70.0,
@@ -1350,7 +1352,7 @@
             "target_portion": 0.28
           },
           {
-            "score_min": 0.68,
+            "score_min": 0.59,
             "target_portion": 0.24
           }
         ]

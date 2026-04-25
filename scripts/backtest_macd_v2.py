@@ -59,13 +59,17 @@ Q4_GATE_EXPORT_FIELDS = (
     "q4_rsi_lead_preflip_symbol_gate_pass",
     "q4_rsi_lead_preflip_symbol_gate_reason",
     "q4_rsi_lead_preflip_raw_score",
+    "q4_rsi_lead_preflip_dynamic_multiplier",
     "q4_rsi_lead_preflip_boll_reclaim_score",
     "q4_rsi_lead_preflip_rsi_1h",
     "q4_rsi_lead_preflip_rsi_4h",
+    "q4_rsi_lead_preflip_rsi_gate_exempted",
     "q4_rsi_lead_preflip_macd_4h_shrink_pct",
     "q4_rsi_lead_preflip_macd_line_4h",
     "q4_rsi_lead_preflip_macd_hist_4h",
+    "q4_rsi_lead_preflip_hist_4h_prev",
     "q4_rsi_lead_preflip_hist_4h_positive",
+    "q4_rsi_lead_preflip_hist_4h_narrowing",
     "q4_rsi_lead_preflip_bb_middle_1h",
     "q4_rsi_lead_preflip_hold_active",
     "q4_rsi_lead_preflip_hold_peak_rsi_4h",
@@ -983,6 +987,7 @@ class BacktestEngine:
         self.positions: Dict[str, dict] = {}  # symbol -> position info
         self.pending_orders: Dict[str, dict] = {}
         self.trades: List[dict] = []
+        self.entry_attempt_events: List[dict] = []
         self.equity_curve: List[dict] = []
         self.max_drawdown_value: float = 0.0
         self.max_drawdown_pct: float = 0.0
@@ -1463,11 +1468,50 @@ class BacktestEngine:
         idx = int(np.searchsorted(ts_array, current_key, side='right') - 1)
         return idx if idx >= 0 else -1
 
-    def _cancel_pending_order(self, symbol: str, reason: str = "") -> None:
+    def _record_entry_attempt_event(
+        self,
+        *,
+        symbol: str,
+        event_type: str,
+        event_time: object,
+        reason: str = "",
+        submit_time: object | None = None,
+        signal_direction: str = "",
+        signal_type_1h: str = "",
+        signal_score: float = 0.0,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        event_ts = pd.Timestamp(event_time)
+        submit_ts = pd.Timestamp(submit_time) if submit_time is not None else event_ts
+        payload = {
+            "symbol": str(symbol or "").strip().upper(),
+            "event_type": str(event_type or "").strip().lower(),
+            "event_time": event_ts,
+            "submit_time": submit_ts,
+            "reason": str(reason or ""),
+            "signal_direction": str(signal_direction or ""),
+            "signal_type_1h": str(signal_type_1h or ""),
+            "signal_score": float(signal_score or 0.0),
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+        self.entry_attempt_events.append(payload)
+
+    def _cancel_pending_order(self, symbol: str, reason: str = "", event_time: object | None = None) -> None:
         order = self.pending_orders.pop(symbol, None)
         if not order:
             return
         self.capital += float(order.get('margin', 0.0))
+        self._record_entry_attempt_event(
+            symbol=symbol,
+            event_type="canceled",
+            event_time=event_time or order.get("submit_time") or pd.Timestamp.utcnow(),
+            submit_time=order.get("submit_time"),
+            reason=reason,
+            signal_direction=str(order.get("side", "") or ""),
+            signal_type_1h=str(order.get("signal_type_1h", "") or ""),
+            signal_score=float(order.get("signal_score", 0.0) or 0.0),
+        )
 
     @staticmethod
     def _utc_timestamp(ts: object) -> pd.Timestamp:
@@ -1946,6 +1990,8 @@ class BacktestEngine:
             'row_4h': row_4h,
             'cvd_veto_context': cvd_veto_context,
             'cvd_context': cvd_context,
+            **{field: (signal.details or {}).get(field) for field in Q4_GATE_EXPORT_FIELDS},
+            'q4_rejection_detail': (signal.details or {}).get('q4_rejection_detail'),
         }
     
     def calculate_position_size(
@@ -2046,19 +2092,64 @@ class BacktestEngine:
         
         # 无信号或信号分数不足
         if signal.direction == 'neutral':
+            self._record_entry_attempt_event(
+                symbol=symbol,
+                event_type="skipped",
+                event_time=time,
+                reason="signal_neutral",
+                signal_direction=str(signal.direction),
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                signal_score=float(signal.signal_score or 0.0),
+            )
             return
         
         # 严格检查信号分数阈值
         if signal.signal_score < self._signal_threshold(signal):
+            self._record_entry_attempt_event(
+                symbol=symbol,
+                event_type="skipped",
+                event_time=time,
+                reason="signal_below_threshold",
+                signal_direction=str(signal.direction),
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                signal_score=float(signal.signal_score or 0.0),
+            )
             return
 
         if symbol in self.positions or symbol in self.pending_orders:
+            self._record_entry_attempt_event(
+                symbol=symbol,
+                event_type="skipped",
+                event_time=time,
+                reason="position_or_pending_exists",
+                signal_direction=str(signal.direction),
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                signal_score=float(signal.signal_score or 0.0),
+            )
             return
 
         if self._is_entry_cooldown_active(time):
+            self._record_entry_attempt_event(
+                symbol=symbol,
+                event_type="skipped",
+                event_time=time,
+                reason="entry_cooldown_active",
+                signal_direction=str(signal.direction),
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                signal_score=float(signal.signal_score or 0.0),
+            )
             return
 
         if (len(self.positions) + len(self.pending_orders)) >= self.config.max_positions:
+            self._record_entry_attempt_event(
+                symbol=symbol,
+                event_type="skipped",
+                event_time=time,
+                reason="max_positions_reached",
+                signal_direction=str(signal.direction),
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                signal_score=float(signal.signal_score or 0.0),
+            )
             return
 
         strategy_engine = self._strategy_engine_for_symbol(symbol)
@@ -2082,6 +2173,20 @@ class BacktestEngine:
             session_position_scale,
         )
         vwap_structure_override = self._resolve_vwap_structure_override(signal.vwap_state)
+        position_portion_detail = strategy_engine.describe_position_portion(
+            score=signal.signal_score,
+            base_default_portion=self.config.default_target_portion,
+            base_max_symbol_position_portion=self.config.max_symbol_position_portion,
+            symbol=symbol,
+            signal_type_1h=signal.signal_type_1h,
+            vwap_score=signal.vwap_score,
+            vwap_state=signal.vwap_state,
+            bonus_multiplier=1.0 if self.disable_cvd_decision_logic else float(cvd_context.get('cvd_bonus_multiplier', 1.0)),
+            is_trial_entry=bool(signal.is_trial_entry),
+            entry_scale=float(signal.entry_scale or 1.0),
+            session_scale=session_position_scale,
+            entry_tier=str(signal_details.get("entry_tier", "") or ""),
+        )
         
         # 计算目标保证金与杠杆
         position_value, leverage = self.calculate_position_size(
@@ -2113,6 +2218,31 @@ class BacktestEngine:
         position_value *= dynamic_mult
 
         if position_value <= 0:
+            self._record_entry_attempt_event(
+                symbol=symbol,
+                event_type="skipped",
+                event_time=time,
+                reason="position_value_nonpositive",
+                signal_direction=str(signal.direction),
+                signal_type_1h=str(signal.signal_type_1h or ""),
+                signal_score=float(signal.signal_score or 0.0),
+                extra={
+                    "position_blocked_reason": str(position_portion_detail.get("blocked_reason", "") or ""),
+                    "position_final_portion": float(position_portion_detail.get("final_portion", 0.0) or 0.0),
+                    "position_pre_scale_portion": float(position_portion_detail.get("pre_scale_portion", 0.0) or 0.0),
+                    "position_target_portion": float(position_portion_detail.get("target_portion", 0.0) or 0.0),
+                    "position_max_symbol_portion": float(position_portion_detail.get("max_symbol_position_portion", 0.0) or 0.0),
+                    "position_portion_multiplier": float(position_portion_detail.get("portion_multiplier", 0.0) or 0.0),
+                    "position_vwap_multiplier": float(position_portion_detail.get("vwap_score_multiplier", 1.0) or 1.0),
+                    "position_entry_scale_applied": float(position_portion_detail.get("entry_scale_applied", 1.0) or 1.0),
+                    "position_session_scale_input": float(position_portion_detail.get("session_scale_input", 1.0) or 1.0),
+                    "position_effective_session_scale": float(position_portion_detail.get("effective_session_scale", 1.0) or 1.0),
+                    "position_lowest_score_tier_min": float(position_portion_detail.get("lowest_score_tier_min", 0.0) or 0.0),
+                    "position_matched_score_tier_min": float(position_portion_detail.get("matched_score_tier_min", 0.0) or 0.0),
+                    "position_matched_score_tier_target": float(position_portion_detail.get("matched_score_tier_target", 0.0) or 0.0),
+                    "position_min_open_portion": float(self.config.min_open_portion),
+                },
+            )
             return
         
         # 计算止损价（使用V2.0动态止损）
@@ -2197,6 +2327,15 @@ class BacktestEngine:
             position_value = min(position_value, max_affordable_margin)
             required_margin = position_value
             if required_margin < 100:
+                self._record_entry_attempt_event(
+                    symbol=symbol,
+                    event_type="skipped",
+                    event_time=time,
+                    reason="insufficient_margin",
+                    signal_direction=str(signal.direction),
+                    signal_type_1h=str(signal.signal_type_1h or ""),
+                    signal_score=float(signal.signal_score or 0.0),
+                )
                 return
 
         limit_price = self._resolve_entry_limit_price_from_analysis(analysis)
@@ -2261,6 +2400,7 @@ class BacktestEngine:
             'timed_campaign_force_fill': bool((signal.details or {}).get('timed_campaign_active', False)),
             'timed_campaign_hold_until_exit': bool((signal.details or {}).get('timed_campaign_active', False)),
             **{field: signal_details.get(field) for field in Q4_GATE_EXPORT_FIELDS},
+            'q4_rejection_detail': signal_details.get('q4_rejection_detail'),
             'q4_rsi_lead_preflip_hold_active': q4_hold_active,
             'q4_rsi_lead_preflip_hold_peak_rsi_4h': q4_hold_peak_rsi_4h,
             'q4_rsi_lead_preflip_hold_exit_armed': bool(
@@ -2280,6 +2420,16 @@ class BacktestEngine:
                 self.strategy_config.q4_rsi_lead_preflip_hold_rsi_4h_pullback
             ),
         }
+        self._record_entry_attempt_event(
+            symbol=symbol,
+            event_type="submitted",
+            event_time=time,
+            submit_time=time,
+            reason="order_submitted",
+            signal_direction=str(signal.direction),
+            signal_type_1h=str(signal.signal_type_1h or ""),
+            signal_score=float(signal.signal_score or 0.0),
+        )
     
     def close_position(
         self,
@@ -2425,7 +2575,7 @@ class BacktestEngine:
     ) -> bool:
         entry_fee = float(order['margin']) * float(order['leverage']) * self.config.fee_rate
         if self.capital < entry_fee:
-            self._cancel_pending_order(symbol, reason="insufficient_fee_cash")
+            self._cancel_pending_order(symbol, reason="insufficient_fee_cash", event_time=fill_time)
             return False
 
         self.capital -= entry_fee
@@ -2507,6 +2657,16 @@ class BacktestEngine:
             **{field: order.get(field) for field in Q4_GATE_EXPORT_FIELDS},
         }
         self.pending_orders.pop(symbol, None)
+        self._record_entry_attempt_event(
+            symbol=symbol,
+            event_type="filled",
+            event_time=fill_time,
+            submit_time=order.get("submit_time"),
+            reason=str((fill_details or {}).get("direct_ioc_fill_reason", "") or "order_filled"),
+            signal_direction=str(order.get("side", "") or ""),
+            signal_type_1h=str(order.get("signal_type_1h", "") or ""),
+            signal_score=float(order.get("signal_score", 0.0) or 0.0),
+        )
         self._mark_symbol_timed_campaign_filled(symbol, str(order.get('side', '')))
         return True
 
@@ -2527,7 +2687,7 @@ class BacktestEngine:
             timed_campaign_force_fill = bool(order.get('timed_campaign_force_fill', False))
 
             if symbol in self.positions:
-                self._cancel_pending_order(symbol, reason="position_exists")
+                self._cancel_pending_order(symbol, reason="position_exists", event_time=analysis['time'])
                 continue
 
             if timed_campaign_force_fill:
@@ -2550,16 +2710,16 @@ class BacktestEngine:
 
             if signal.direction == 'neutral' or signal.signal_score < self._signal_threshold(signal):
                 if tif == "IOC":
-                    self._cancel_pending_order(symbol, reason="ioc_no_fill")
+                    self._cancel_pending_order(symbol, reason="ioc_no_fill", event_time=analysis['time'])
                 elif self.config.gtc_expire_bars > 0 and int(order['bars_waited']) >= self.config.gtc_expire_bars:
-                    self._cancel_pending_order(symbol, reason="gtc_signal_expired")
+                    self._cancel_pending_order(symbol, reason="gtc_signal_expired", event_time=analysis['time'])
                 continue
 
             if str(signal.direction) != str(order.get('side')):
                 if tif == "IOC" or bool(getattr(self.config, "gtc_cancel_on_signal_reversal", False)):
-                    self._cancel_pending_order(symbol, reason="signal_reversed")
+                    self._cancel_pending_order(symbol, reason="signal_reversed", event_time=analysis['time'])
                 elif self.config.gtc_expire_bars > 0 and int(order['bars_waited']) >= self.config.gtc_expire_bars:
-                    self._cancel_pending_order(symbol, reason="gtc_signal_reversed_timeout")
+                    self._cancel_pending_order(symbol, reason="gtc_signal_reversed_timeout", event_time=analysis['time'])
                 continue
 
             if tif == "IOC" and self._ioc_would_take_immediately(order, analysis['row_15m']):
@@ -2578,7 +2738,7 @@ class BacktestEngine:
                     )
                     order['time_in_force'] = 'GTC'
                     continue
-                self._cancel_pending_order(symbol, reason="ioc_would_take_immediately")
+                self._cancel_pending_order(symbol, reason="ioc_would_take_immediately", event_time=analysis['time'])
                 continue
 
             fill_price, fill_details = self._entry_fill_decision(order, analysis['row_15m'])
@@ -2590,9 +2750,9 @@ class BacktestEngine:
                 continue
 
             if tif == "IOC":
-                self._cancel_pending_order(symbol, reason="ioc_unfilled")
+                self._cancel_pending_order(symbol, reason="ioc_unfilled", event_time=analysis['time'])
             elif self.config.gtc_expire_bars > 0 and int(order['bars_waited']) >= self.config.gtc_expire_bars:
-                self._cancel_pending_order(symbol, reason="gtc_timeout")
+                self._cancel_pending_order(symbol, reason="gtc_timeout", event_time=analysis['time'])
         return filled_symbols
 
     def _handle_entry_bar_same_bar_after_fill(self, symbol: str, analysis: dict) -> bool:
@@ -3190,8 +3350,8 @@ class BacktestEngine:
             if analyses or self.positions or self.pending_orders:
                 self._record_equity_snapshot(current_time, last_price_map)
 
-        for symbol in list(self.pending_orders.keys()):
-            self._cancel_pending_order(symbol, reason="backtest_end")
+            for symbol in list(self.pending_orders.keys()):
+                self._cancel_pending_order(symbol, reason="backtest_end", event_time=current_time)
 
         for symbol, pos in list(self.positions.items()):
             data = market_data_map.get(symbol)

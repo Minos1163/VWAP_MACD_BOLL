@@ -525,7 +525,7 @@ class FundFlowDecisionEngine:
                 weight_1h_direction=self._to_float(weights_cfg.get("weight_1h_direction"), 0.35),
                 weight_4h_direction=self._to_float(weights_cfg.get("weight_4h_direction", weights_cfg.get("weight_1h_direction")), 0.35),
                 weight_4h_enhancement=self._to_float(weights_cfg.get("weight_4h_enhancement"), 0.10),
-                weight_vwap=self._to_float(weights_cfg.get("weight_vwap"), 0.15),
+                weight_vwap=0.0,
                 weight_15m_entry=self._to_float(weights_cfg.get("weight_15m_entry"), 0.10),
                 weight_volume=self._to_float(weights_cfg.get("weight_volume"), 0.15),
                 # 入场阈值
@@ -538,7 +538,7 @@ class FundFlowDecisionEngine:
                 enable_flip_bullish_strict_filter=bool(filter_cfg.get("enable_flip_bullish_strict_filter", True)),
                 disable_flip_bullish_entries=bool(filter_cfg.get("disable_flip_bullish_entries", False)),
                 disable_flip_bullish_trial_entries=bool(filter_cfg.get("disable_flip_bullish_trial_entries", False)),
-                flip_bullish_min_vwap_score=self._to_float(filter_cfg.get("flip_bullish_min_vwap_score"), 0.12),
+                flip_bullish_min_vwap_score=0.0,
                 flip_bullish_require_pullback_bounce=bool(filter_cfg.get("flip_bullish_require_pullback_bounce", True)),
                 flip_bullish_require_15m_growing=bool(filter_cfg.get("flip_bullish_require_15m_growing", True)),
                 enable_flip_bullish_cvd_context_filter=bool(filter_cfg.get("enable_flip_bullish_cvd_context_filter", False)),
@@ -596,7 +596,7 @@ class FundFlowDecisionEngine:
                 preflip_trial_min_shrink_pct_long=self._to_float(filter_cfg.get("preflip_trial_min_shrink_pct_long"), 0.75),
                 preflip_trial_min_shrink_pct_short=self._to_float(filter_cfg.get("preflip_trial_min_shrink_pct_short"), 0.30),
                 preflip_trial_min_signal_score=self._to_float(filter_cfg.get("preflip_trial_min_signal_score"), 0.78),
-                preflip_trial_min_vwap_score=self._to_float(filter_cfg.get("preflip_trial_min_vwap_score"), 0.06),
+                preflip_trial_min_vwap_score=0.0,
                 preflip_trial_entry_scale=self._to_float(filter_cfg.get("preflip_trial_entry_scale"), 0.35),
                 preflip_trial_max_leverage=int(self._to_float(filter_cfg.get("preflip_trial_max_leverage"), 2)),
                 enable_trial_short_below_structure_continuation_promotion=bool(
@@ -606,10 +606,7 @@ class FundFlowDecisionEngine:
                     filter_cfg.get("trial_short_below_structure_promotion_min_signal_score"),
                     0.82,
                 ),
-                trial_short_below_structure_promotion_min_vwap_score=self._to_float(
-                    filter_cfg.get("trial_short_below_structure_promotion_min_vwap_score"),
-                    0.075,
-                ),
+                trial_short_below_structure_promotion_min_vwap_score=0.0,
                 trial_short_below_structure_promotion_min_adx_1h=self._to_float(
                     filter_cfg.get("trial_short_below_structure_promotion_min_adx_1h"),
                     25.0,
@@ -635,10 +632,7 @@ class FundFlowDecisionEngine:
                     ),
                     0.82,
                 ),
-                stable_bear_continuation_min_vwap_score=self._to_float(
-                    filter_cfg.get("stable_bear_continuation_min_vwap_score"),
-                    0.10,
-                ),
+                stable_bear_continuation_min_vwap_score=0.0,
                 stable_bear_continuation_min_adx_1h=self._to_float(
                     filter_cfg.get("stable_bear_continuation_min_adx_1h"),
                     20.0,
@@ -655,10 +649,7 @@ class FundFlowDecisionEngine:
                     ),
                     0.82,
                 ),
-                stable_bull_continuation_min_vwap_score=self._to_float(
-                    filter_cfg.get("stable_bull_continuation_min_vwap_score"),
-                    0.10,
-                ),
+                stable_bull_continuation_min_vwap_score=0.0,
                 stable_bull_continuation_min_adx_1h=self._to_float(
                     filter_cfg.get("stable_bull_continuation_min_adx_1h"),
                     20.0,
@@ -681,10 +672,7 @@ class FundFlowDecisionEngine:
                 overheat_growing_penalty=self._to_float(penalty_cfg.get("overheat_growing_penalty"), 0.12),
                 overheat_ema_multiplier_threshold=self._to_float(penalty_cfg.get("overheat_boll_multiplier_threshold", penalty_cfg.get("overheat_ema_multiplier_threshold")), 1.2),
                 overheat_vwap_score_threshold=self._to_float(penalty_cfg.get("overheat_vwap_score_threshold"), 0.10),
-                min_vwap_score_for_entry=self._to_float(
-                    filter_cfg.get("min_vwap_score_for_entry", penalty_cfg.get("min_vwap_score_for_entry")),
-                    0.0,
-                ),
+                min_vwap_score_for_entry=0.0,
                 # 止损配置
                 use_dynamic_stop=bool(stop_cfg.get("use_dynamic_stop", True)),
                 ema_stop_atr_multiplier=self._to_float(stop_cfg.get("boll_stop_atr_multiplier", stop_cfg.get("ema_stop_atr_multiplier")), 0.5),
